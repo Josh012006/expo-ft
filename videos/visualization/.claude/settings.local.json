@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ffprobe -v error -select_streams v:0 -show_entries stream=width,height,duration -of default=noprint_wrappers=1 vis.mp4)",
+      "Bash(ffmpeg -y -v error -i vis.mp4 -filter:v \"crop=640:180:0:182\" -c:a copy vis_middle.mp4)",
+      "Bash(ffprobe *)"
+    ]
+  }
+}
