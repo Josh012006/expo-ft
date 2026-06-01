@@ -1,0 +1,296 @@
+# EXPO-FT: Sample-Efficient Reinforcement Learning Finetuning for Vision-Language-Action Models
+
+Code for the paper *"EXPO-FT: Sample-Efficient Reinforcement Learning Finetuning for Vision-Language-Action Models"*
+
+**[Project Website](https://pd-perry.github.io/expo-ft)** | **[arXiv](https://arxiv.org/abs/2605.25477)**
+
+## Setup
+
+The repo has **two independent Python environments**:
+
+- **Server (learner)** — `.venv/` at the repo root, managed by `pyproject.toml` + `uv.lock`. Holds the modern jax / openpi / lerobot stack used for RL training.
+- **Client (actor)** — `client/.venv/`, managed by `client/pyproject.toml` + `client/uv.lock`. Holds DROID's older numpy / mujoco / opencv pins for the real-robot SDK.
+
+Both require **Python 3.11+** and [uv](https://docs.astral.sh/uv/getting-started/installation/):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+### Clone the forks
+
+EXPO-FT depends on two GitHub forks — a [modified OpenPI](https://github.com/pd-perry/openpi/tree/expo_ft) (used by the server) and a [DROID fork](https://github.com/pd-perry/droid) (used by the client). Clone **both before running `uv sync`** — uv installs them as editable local checkouts (see the `[tool.uv.sources]` blocks in `pyproject.toml` and `client/pyproject.toml`), so `uv sync` fails if they aren't present yet. OpenPI lives under `expo_ft/agents/vla/openpi` (used by both envs); DROID lives under `client/droid` (only the client venv needs it).
+
+```bash
+# From the repo root.
+git clone -b expo_ft https://github.com/pd-perry/openpi.git expo_ft/agents/vla/openpi
+git clone https://github.com/pd-perry/droid.git client/droid
+```
+
+### Server (Learner)
+
+Installs all server dependencies — including the local `expo_ft/agents/vla/openpi` checkout (editable) — via uv:
+
+```bash
+# From the repo root.
+uv sync
+```
+
+### Client (Actor)
+
+Installs all client dependencies — including the local `client/droid` checkout (editable) — via uv. The client also installs `openpi-client` from the `expo_ft/agents/vla/openpi` checkout, so that fork must be cloned too (see [Clone the forks](#clone-the-forks)).
+
+System prerequisites (install **before** `uv sync`):
+
+- **ZED SDK** (only if you use ZED cameras). Install from [stereolabs.com](https://www.stereolabs.com/developers/release/) — provides the system libraries that `pyzed` loads at runtime.
+- **Spacemouse HID access** — see the [PySpaceMouse troubleshooting guide](https://github.com/JakubAndrysek/PySpaceMouse/blob/master/troubleshooting.md) for platform-specific setup. On Linux, you need a udev rule.
+
+Install:
+
+```bash
+# From the repo root.
+# 1. Install client dependencies into ./client/.venv.
+cd client && uv sync && cd ..
+
+# 2. (Optional) Install pyzed if you use a ZED camera. Must be a separate step
+#    because the pyzed wheel's numpy>=2.0 metadata over-constrains a binary
+#    that actually works against numpy 1.x, so we bypass uv's resolver.
+bash client/install_pyzed.sh
+```
+
+## Overview and Code Structure
+
+The system uses a **server-client architecture**: the **server (learner)** runs RL training with the VLA policy, while the **client (actor)** runs the DROID real-robot rollout environment and communicates over WebSocket.
+
+```
+train_pi_robo.py                # Server: synchronous RL finetuning loop
+train_pi_robo_async.py          # Server: asynchronous RL finetuning loop (sampler + updater on separate GPUs)
+eval_droid_policy.py            # Server: standalone policy evaluation
+
+client/
+  run_client.py                 # Client: environment rollout server (WebSocket)
+  collect_data.py               # Client: demonstration data collection (spacemouse)
+  envs/                         # Environment wrappers (DROID real robot)
+  real_utils/                   # Success detectors, spacemouse, visualization
+
+configs/
+  task/                         # Task configs
+  model/                        # Algorithm configs: expo_ft_pi_config.py (EXPOLearner), dagger_pi_config.py (BCLearner)
+
+expo_ft/
+  agents/
+    alg/                        # RL algorithms (EXPO-FT, BC, base agent)
+    vla/                        # VLA wrappers (pi0.5 integration)
+  data/                         # Replay buffer, dataset loading, batch processor
+  env/                          # Server-side env utilities (WebSocket client, dataset loading)
+  networks/                     # Neural network components (encoders, critics, MLP)
+  distributions/                # Action distributions (tanh normal)
+  utils/                        # Logging, training utilities, augmentation
+
+scripts/                        # Shell scripts for launching experiments
+  convert_droid_data_to_lerobot.py
+  set_server.sh
+  pick/                         # Complete example script set for the pick task
+```
+
+## Use your own algorithm & VLA
+
+You can plug in your own online fine-tuning algorithm by implementing it in `expo_ft/agents/alg`, following the learner API used by the existing agents such as `EXPOLearner` and `BCLearner`. Custom VLA backends can similarly be added in `expo_ft/agents/vla`, following the wrapper API used by the pi0.5 integration. After adding a new algorithm or VLA, expose it through the corresponding config in `configs/model/` so the training scripts can instantiate it.
+
+## Running Experiments with DROID + pi0.5
+
+### OpenPI Setup
+
+We use a [modified fork of OpenPI](https://github.com/pd-perry/openpi/tree/expo_ft) with support for frozen encoder training (for efficient action sampling) and Cartesian action control for DROID. Cloned into `./expo_ft/agents/vla/openpi` and installed editable during the [server setup](#server-learner) step (see [Clone the forks](#clone-the-forks)). The same checkout provides the SFT pretraining scripts wrapped below.
+
+### DROID Setup
+
+We use a [fork of DROID](https://github.com/pd-perry/droid) for real-robot control. Cloned into `./client/droid` and installed editable during the [client setup](#client-actor) step. For software, hardware setup and calibration, see the [DROID documentation](https://droid-dataset.github.io/droid/).
+
+Configure the hardware-specific values before running the client.
+
+**Client / laptop**
+
+- `client/droid/droid/misc/parameters.py`
+  - `nuc_ip`
+- `configs/task/real_base.py` and any per-task overrides, e.g. `configs/task/light2.py`
+  - `side_camera_id`
+  - `wrist_camera_id`
+
+**NUC**
+
+- NUC DROID install: `droid/misc/parameters.py`
+  - `sudo_password`
+  - `robot_type`
+  - `robot_serial_number`
+- NUC DROID/Polymetis hardware config
+  - `robot_ip`
+
+### Training Setup
+
+1. **Environment class** -- Create an environment class for your task in `client/envs/droid_env.py`. We include our pick environment as a reference; modify it to match your task's observation space, action space, and reset behavior.
+2. **Task config** -- Create a task config in `configs/task/` to specify task-specific parameters (bounds, reset joints, language instruction, etc.). See `configs/task/pick.py` for an example.
+3. **Success detector** -- Define a success detector for your task in `client/real_utils/detector.py` and register it in your environment class's `detect()` method.
+
+### Running the Experiment
+
+All commands below use `scripts/${TASK_NAME}/...`; refer to `scripts/pick/` for a complete working example of the task scripts.
+
+> **Filesystem note:** The example scripts assume the client and server can see the same repo-relative paths. If they run on different filesystems, collect data on the client/robot machine, then copy or sync the collected `data/...` directory to the server/GPU machine before running conversion, norm stats, SFT, RL training, or evaluation. The `dataset_path`, OpenPI assets, SFT checkpoints, and EXPO-FT checkpoints in the server scripts are server-local paths. The client only needs the robot environment code, task config, and network access to the learner; keep any task config or environment changes synced on both machines.
+
+#### 1. Data Collection
+
+Collect demonstration data using a spacemouse. The NUC must be running the DROID server before starting collection:
+
+```bash
+# On the NUC, from the DROID install root 
+python scripts/server/run_server.py
+```
+
+```bash
+# On the client / robot machine.
+bash scripts/${TASK_NAME}/collect_data.sh
+```
+
+Parameters to update in `collect_data.sh`:
+
+- `--save_root` -- output directory for collected episodes
+- `--num_episodes` -- number of demonstrations to collect
+- `--task_config` -- task config for the robot environment
+
+#### 2. Data Conversion
+
+Convert collected data to LeRobot format for pi0.5 finetuning:
+
+```bash
+# On the server / GPU machine.
+bash scripts/${TASK_NAME}/convert_data.sh
+```
+
+Parameters to update in `convert_data.sh`:
+
+- `MAX_EPISODES` -- max number of collected episodes to convert
+- `TASK_CONFIG` -- task config used to interpret the raw DROID data
+- `DATA_DIR` -- source directory containing successful demonstrations
+- `REPO_NAME` -- LeRobot dataset repo/id written into the converted dataset
+
+Only `scripts/pick/` is fully wired in this repo. For a new task, copy that script directory and update the dataset paths, task config, checkpoint paths, and OpenPI asset IDs.
+
+#### 3. Policy Pretraining (SFT)
+
+Before RL finetuning, pretrain the policy with supervised finetuning on the collected demonstrations.
+
+Both scripts are thin wrappers around the OpenPI training entrypoints (`expo_ft/agents/vla/openpi/scripts/compute_norm_stats.py` and `expo_ft/agents/vla/openpi/scripts/train.py`), so they require the OpenPI checkout from [Clone the forks](#clone-the-forks). Run them from the repo root with the server `.venv` active.
+
+**3.1 Calculate normalization statistics** (first time only for a new task):
+
+```bash
+# On the server / GPU machine.
+bash scripts/${TASK_NAME}/calculate_norm.sh
+```
+
+Parameters to update in `calculate_norm.sh`:
+
+- `REPO_ID` -- LeRobot dataset id from the conversion step
+
+> **Fixed-state tasks:** update the state and action standard deviations in
+> the OpenPI config after computing normalization stats. Use the q01/q99 values
+> and set the standard deviation to `1`.
+
+**3.2 Finetune pi0.5**:
+
+```bash
+# On the server / GPU machine.
+bash scripts/${TASK_NAME}/finetune_droid.sh
+```
+
+Parameters to update in `finetune_droid.sh`:
+
+- `DATA_ID` / `REPO_ID` -- dataset id used for the converted LeRobot data
+- `ASSETS_DIR` / `ASSET_ID` -- OpenPI normalization assets from the stats step
+
+The provided pick script runs about 4000 steps, which was sufficient for all tasks we tested.
+
+#### 4. EXPO-FT Finetuning
+
+After pretraining, finetune the policy with EXPO-FT. The server and client communicate over WebSocket. The client (rollout server) runs the environment and the server (learner) runs the RL training loop.
+
+**Start the DROID server on the NUC**:
+
+```bash
+# On the NUC, from the DROID install root (for example client/droid
+# in this checkout, or the NUC's standalone DROID checkout).
+python scripts/server/run_server.py
+```
+
+**Start the client** (on the robot machine):
+
+```bash
+# On the client / robot machine.
+bash scripts/${TASK_NAME}/run_policy.sh
+```
+
+Parameters to update in `run_policy.sh`:
+
+- `--server_host` -- interface the rollout server binds to; `0.0.0.0` accepts remote connections
+- `--server_port` -- rollout server port; keep aligned with the tunnel and learner `client_port`
+- `--config_task_path` -- task config for the rollout environment
+
+**If the server and client are on different machines**, set up an SSH reverse tunnel on the client machine so the server can reach it via `localhost`:
+
+```bash
+# On the client machine, forward port to the server machine
+bash scripts/set_server.sh <server-hostname> 8102 <your-username>
+```
+
+Arguments to update in `set_server.sh`:
+
+- `<server-hostname>` -- GPU training machine reachable over SSH
+- `8102` -- port to forward; keep aligned with `run_policy.sh` and learner `client_port`
+- `<your-username>` -- SSH username on the training machine
+
+**Then start the server** (on the GPU training machine):
+
+```bash
+# On the server / GPU machine.
+bash scripts/${TASK_NAME}/run_server.sh        # synchronous
+bash scripts/${TASK_NAME}/run_server_async.sh   # asynchronous
+```
+
+> **Async training:** Requires ≥ 2 GPUs (1 sampler + ≥ 1 updater). Use it when one episode takes a long time; otherwise synchronous training can yield better results.
+
+Key parameters to configure in `scripts/${TASK_NAME}/run_server.sh` and `scripts/${TASK_NAME}/run_server_async.sh`:
+
+- `dataset_path` -- path to the collected demonstration data
+- `num_data` -- max offline demo episodes to seed into the replay buffer (0 = all)
+- `update_type` / `num_updates` -- for synchronous training, recommend: use episode updates with `env_steps / num_updates` close to 20-30
+- `edit_scale` -- residual edit scale; 0.2 is a good starting point
+- `client_host` / `client_port` -- set to `localhost` / `8102` when using SSH tunnel or running on the same machine
+
+> **Client recovery:** If the client hits an error or the robot gets stuck during online training, you can stop and restart only the client. The server waits for the policy/environment connection to recover, then continues training once the client is restarted.
+
+#### 5. Evaluation
+
+Evaluate the trained policy. Start the DROID server and the client rollout server the same way as in [EXPO-FT Finetuning](#4-expo-ft-finetuning), then launch evaluation from the server/GPU machine. All model parameters should match the training configuration.
+
+```bash
+# On the server / GPU machine.
+bash scripts/${TASK_NAME}/eval_policy.sh
+```
+
+Parameters should match the corresponding `run_server.sh` or `run_server_async.sh` training settings.
+
+## Citation
+
+```bibtex
+@misc{dong2026expoft,
+      title={EXPO-FT: Sample-Efficient Reinforcement Learning Finetuning for Vision-Language-Action Models},
+      author={Perry Dong and Kuo-Han Hung and Tian Gao and Dorsa Sadigh and Chelsea Finn},
+      year={2026},
+      eprint={2605.25477},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2605.25477},
+}
+```
+
