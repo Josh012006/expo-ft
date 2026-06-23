@@ -5,6 +5,8 @@ for use with the EXPO-FT training loop.
 
 import logging
 import numpy as np
+import os
+
 import gymnasium as gym
 import mani_skill.envs  # noqa: F401
 
