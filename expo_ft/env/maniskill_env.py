@@ -1,0 +1,142 @@
+"""
+ManiSkill environment wrapper that reproduces the EnvClientWrapper interface
+for use with the EXPO-FT training loop.
+"""
+
+import logging
+import numpy as np
+import gymnasium as gym
+import mani_skill.envs  # noqa: F401
+
+
+class ManiSkillEnvWrapper:
+    """Drop-in replacement for EnvClientWrapper using a local ManiSkill env."""
+
+    def __init__(self, env_creation_request: dict, cfg=None):
+        """
+        Args:
+            env_creation_request: dict with keys:
+                - example_action: np.ndarray
+                - env_usage: str ("train" or "eval")
+                - video_dir: str (path to save videos, or None)
+            cfg: task config (loaded from YAML)
+        """
+        self.cfg = cfg
+        self.env_id = cfg.env_id
+        self.task_description = cfg.language_instruction
+        self._video_dir = env_creation_request.get("video_dir", None)
+        self._env_usage = env_creation_request.get("env_usage", "train")
+
+        self._env = gym.make(
+            cfg.env_id,
+            obs_mode="rgb",
+            control_mode=cfg.control_mode,
+            num_envs=1,
+            max_episode_steps=cfg.max_episode_steps,
+        )
+
+        # Video recording wrapper if needed
+        if self._video_dir is not None:
+            self._env = gym.wrappers.RecordVideo(
+                self._env,
+                video_folder=self._video_dir,
+                episode_trigger=lambda ep: True,
+                disable_logger=True,
+            )
+
+        self._obs = None
+        self._info = {}
+        self._done = False
+        self._success = False
+        self._reward = 0.0
+
+        logging.info(f"ManiSkillEnvWrapper: created {cfg.env_id} ({self._env_usage})")
+
+    def reset(self):
+        """Reset the environment and return observation."""
+        obs, info = self._env.reset()
+        self._obs = self._parse_obs(obs)
+        self._info = info
+        self._done = False
+        self._success = False
+        self._reward = 0.0
+        return self._obs
+
+    def step(self, action):
+        """
+        Step the environment.
+
+        Returns:
+            (real_executed_action, action_type)
+            action_type is always "policy" (no human intervention in sim)
+        """
+        action = np.array(action, dtype=np.float32)
+        obs, reward, terminated, truncated, info = self._env.step(action)
+        self._obs = self._parse_obs(obs)
+        self._reward = float(reward.item() if hasattr(reward, 'item') else reward)
+        self._done = bool((terminated | truncated).item()
+                          if hasattr(terminated, 'item') else (terminated or truncated))
+        self._success = bool(info.get("success", False))
+        if hasattr(self._success, 'item'):
+            self._success = self._success.item()
+        self._info = info
+        return action, "policy"
+
+    def get_observation(self):
+        """Return the current observation."""
+        return self._obs
+
+    def get_info_for_step(self):
+        """
+        Return (done, success, reward, mask).
+        mask = 1 - done (continuation mask for RL).
+        """
+        mask = 1.0 - float(self._done)
+        return self._done, self._success, self._reward, mask
+
+    def _parse_obs(self, obs):
+        """
+        Convert ManiSkill obs dict to the format expected by the EXPO-FT replay buffer.
+
+        ManiSkill keys:
+            obs['sensor_data']['base_camera']['rgb']  (1, H, W, 3)
+            obs['sensor_data']['hand_camera']['rgb']  (1, H, W, 3)
+            obs['agent']['qpos']                      (1, 9)
+            obs['extra']['tcp_pose']                  (1, 7)
+
+        EXPO-FT expected keys (matching DroidInputs):
+            observation/exterior_image_1_left  (H, W, 3) uint8
+            observation/wrist_image_left       (H, W, 3) uint8
+            observation/cartesian_position     (6,) float32
+            observation/gripper_position       (1,) float32
+            prompt                             str
+        """
+        from scipy.spatial.transform import Rotation
+
+        def to_np(t):
+            return t.cpu().numpy() if hasattr(t, 'cpu') else np.array(t)
+
+        rgb_base  = to_np(obs['sensor_data']['base_camera']['rgb'])[0]   # (H, W, 3)
+        rgb_wrist = to_np(obs['sensor_data']['hand_camera']['rgb'])[0]   # (H, W, 3)
+        tcp_pose  = to_np(obs['extra']['tcp_pose'])[0]                   # (7,)
+        qpos      = to_np(obs['agent']['qpos'])[0]                       # (9,)
+
+        # Cartesian position: xyz + euler from quaternion
+        xyz        = tcp_pose[:3]
+        quat_xyzw  = tcp_pose[3:]
+        euler      = Rotation.from_quat(quat_xyzw).as_euler("xyz", degrees=False)
+        cartesian  = np.concatenate([xyz, euler]).astype(np.float32)
+
+        # Gripper: last joint
+        gripper = qpos[-1:].astype(np.float32)
+
+        return {
+            "observation/exterior_image_1_left": rgb_base.astype(np.uint8),
+            "observation/wrist_image_left":      rgb_wrist.astype(np.uint8),
+            "observation/cartesian_position":    cartesian,
+            "observation/gripper_position":      gripper,
+            "prompt":                            self.task_description,
+        }
+
+    def close(self):
+        self._env.close()

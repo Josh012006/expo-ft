@@ -1,0 +1,59 @@
+
+======== GPU REPORT ========
+
+==============NVSMI LOG==============
+
+Timestamp                                 : Tue Jun 23 07:23:17 2026
+Driver Version                            : 580.95.05
+CUDA Version                              : 13.0
+
+Attached GPUs                             : 1
+GPU 00000000:86:00.0
+    Accounting Mode                       : Enabled
+    Accounting Mode Buffer Size           : 4000
+    Accounted Processes
+        Process ID                        : 2447565
+            GPU Utilization               : 0 %
+            Memory Utilization            : 0 %
+            Max memory usage              : 314 MiB
+            Time                          : 768 ms
+            Is Running                    : 0
+        Process ID                        : 2448201
+            GPU Utilization               : 2 %
+            Memory Utilization            : 0 %
+            Max memory usage              : 641 MiB
+            Time                          : 10290 ms
+            Is Running                    : 0
+        Process ID                        : 2500260
+            GPU Utilization               : 2 %
+            Memory Utilization            : 0 %
+            Max memory usage              : 641 MiB
+            Time                          : 4908 ms
+            Is Running                    : 0
+        Process ID                        : 2501735
+            GPU Utilization               : 27 %
+            Memory Utilization            : 1 %
+            Max memory usage              : 2925 MiB
+            Time                          : 1352611 ms
+            Is Running                    : 0
+
+Tue Jun 23 07:23:17 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  Tesla V100-SXM2-32GB-LS        On  |   00000000:86:00.0 Off |                    0 |
+| N/A   30C    P0             41W /  163W |       0MiB /  32768MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
