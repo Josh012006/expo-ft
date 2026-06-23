@@ -28,6 +28,9 @@ import openpi.training.sharding as openpi_sharding
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
+from torch.utils.tensorboard import SummaryWriter
+
+
 FLAGS = flags.FLAGS
 
 flags.DEFINE_boolean("tqdm", True, "Use tqdm progress bar.")
@@ -73,6 +76,9 @@ def main(_):
     os.makedirs(train_video_dir, exist_ok=True)
     checkpoint_dir = os.path.join(log_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # TensorBoard writer — logs saved alongside checkpoints
+    tb_writer = SummaryWriter(log_dir=os.path.join(log_dir, "tensorboard"))
 
     checkpoint_dir_path = epath.Path(checkpoint_dir)
     checkpoint_manager, resuming = initialize_checkpoint_dir(
@@ -324,6 +330,11 @@ def main(_):
                 logging.exception("Could not save agent buffer.")
 
         step_metrics["training/loop_time_ms"] = (time.time() - loop_start) * 1000.0
+        
+        # TensorBoard logging
+        for k, v in step_metrics.items():
+            if isinstance(v, (int, float)):
+                tb_writer.add_scalar(k, v, global_step=i)
         wandb.log(step_metrics, step=i)
     
     if cfg.checkpoint_model:
@@ -333,6 +344,7 @@ def main(_):
         except Exception as e:
             logging.error(f"Could not save final checkpoint: {e}")
         logging.info("Waiting for checkpoint manager to finish")
+        tb_writer.close()
         checkpoint_manager.wait_until_finished()
 
 

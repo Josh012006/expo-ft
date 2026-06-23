@@ -23,7 +23,8 @@ resume_dir: null  # path to an existing run to resume, e.g. "logs/stack_cube/202
 # ── Algorithm ──────────────────────────────────────────────────
 model_cls: "EXPOLearner"  # "EXPOLearner" for RL, "BCLearner" for SFT-only
 seed: 42
-max_steps: 100000          # total number of environment interaction steps
+max_episodes: 1000
+max_steps_per_episode: 100
 batch_size: 64             # number of transitions sampled from replay buffer per gradient update
 utd_ratio: 20              # gradient updates performed per new transition collected
 offline_ratio: 0.0         # fraction of batch from offline demo buffer (0 = demos inserted into online buffer)

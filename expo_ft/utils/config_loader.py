@@ -19,6 +19,10 @@ def load_task_config(yaml_path: str) -> SimpleNamespace:
 
     cfg = SimpleNamespace(**raw)
 
+    # Compute max_steps from episodes config
+    if hasattr(cfg, 'max_episodes') and hasattr(cfg, 'max_steps_per_episode'):
+        cfg.max_steps = cfg.max_episodes * cfg.max_steps_per_episode
+
     # Convert nested lists to tuples where needed (e.g. rl_hidden_dims)
     if hasattr(cfg, "rl_hidden_dims"):
         cfg.rl_hidden_dims = tuple(cfg.rl_hidden_dims)
