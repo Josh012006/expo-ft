@@ -4,6 +4,17 @@ import h5py
 import numpy as np
 from tqdm import tqdm
 
+def _flatten_dict(d, prefix=''):
+    """Flatten nested dict with '/' separator."""
+    result = {}
+    for k, v in d.items():
+        full_key = f"{prefix}/{k}" if prefix else k
+        if isinstance(v, dict):
+            result.update(_flatten_dict(v, full_key))
+        else:
+            result[full_key] = v
+    return result
+
 def _discover_episode_dirs(base_path):
     dirs = [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
     # Keep only numeric directory names (episode indices); skip e.g. action_videos, lerobot
@@ -44,7 +55,8 @@ def process_droid_dataset(
                 return result
             
             ep_obs = load_recursive(f["saved_observation"])
-            
+            ep_obs = _flatten_dict(ep_obs)
+
             action_key = task_config.action_space
             gripper_key = f"gripper_{task_config.gripper_action_space}"
             a1 = np.asarray(f["action"][action_key])
