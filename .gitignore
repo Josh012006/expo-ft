@@ -13,3 +13,5 @@ client/droid/
 assets/
 .venv/
 client/.venv/
+demos/
+logs/
