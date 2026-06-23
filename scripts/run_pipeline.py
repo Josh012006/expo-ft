@@ -50,27 +50,28 @@ def stage_norm_stats(cfg, args):
     ])
 
 
-def stage_sft(cfg, args):
+def stage_sft(cfg, args, run_dir):
     """SFT warmup — fine-tune π₀.₅ on the demo dataset."""
-    run_dir, _ = resolve_run_dir(cfg)
     sft_output = os.path.join(run_dir, "sft")
 
     run([
         "uv", "run",
         str(OPENPI_SCRIPTS / "train.py"),
-        "--config-name", get_sft_config_name(cfg),
-        "--exp-name", "sft_warmup",
-        "--overwrite",
-        f"--data.repo_id={cfg.lerobot_repo_id}",
+        get_sft_config_name(cfg),
+        "--exp-name", "stack_cube_sft",
+        "--data.repo-id", cfg.lerobot_repo_id,
+        "--assets-base-dir", "./assets",
+        "--checkpoint-base-dir", sft_output,
         f"--num-train-steps={cfg.sft_num_train_steps}",
         f"--batch-size={cfg.sft_batch_size}",
-        f"--checkpoint-dir={sft_output}",
+        "--save-interval", "1000",
+        "--log-interval", "100",
+        "--no-wandb-enabled",
     ])
 
 
-def stage_rl(cfg, args):
+def stage_rl(cfg, args, run_dir, resuming):
     """RL training with EXPOLearner."""
-    run_dir, resuming = resolve_run_dir(cfg)
 
     cmd = [
         "python", str(TRAIN_PI_ROBO),
@@ -103,25 +104,21 @@ def stage_rl(cfg, args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True, help="Path to task YAML config")
-    parser.add_argument(
-        "--stage",
-        choices=["norm_stats", "sft", "rl", "all"],
-        default="all",
-        help="Which stage to run"
-    )
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--stage", choices=["norm_stats", "sft", "rl", "all"], default="all")
     args = parser.parse_args()
 
     cfg = load_task_config(args.config)
+    run_dir, resuming = resolve_run_dir(cfg)
 
     if args.stage in ("norm_stats", "all"):
         stage_norm_stats(cfg, args)
 
     if args.stage in ("sft", "all"):
-        stage_sft(cfg, args)
+        stage_sft(cfg, args, run_dir)
 
     if args.stage in ("rl", "all"):
-        stage_rl(cfg, args)
+        stage_rl(cfg, args, run_dir, resuming)
 
 
 if __name__ == "__main__":
