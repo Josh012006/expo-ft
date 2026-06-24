@@ -245,6 +245,7 @@ def build_pi05(config, seed, mesh, data_sharding, replicated_sharding,
         replicated_sharding=replicated_sharding,
         freeze_pi05_encoder=freeze_encoder,
         infer_device=jax.devices()[0],
+        skip_repack_transforms=agent_kwargs.pop("skip_repack_transforms", False),
     )
     if resume:
         target_actor_params = actor.get_params(actor_train_state)
@@ -275,6 +276,7 @@ class Pi05Agent(Model):
         infer_device: Optional[jax.Device] = None,
         action_dim: Optional[int] = None,
         state_dim: Optional[int] = None,
+        skip_repack_transforms: bool = False,
     ):
 
         self.action_dim = action_dim
@@ -292,6 +294,7 @@ class Pi05Agent(Model):
         self.replicated_sharding = replicated_sharding
         self.infer_device = infer_device or jax.devices()[0]
         self.infer_sharding = jax.sharding.SingleDeviceSharding(self.infer_device)
+        self.skip_repack_transforms = skip_repack_transforms
         self.input_transforms = self._build_input_transform_pipeline()
         self.output_transforms = self._build_output_transform_pipeline()
 
@@ -304,9 +307,10 @@ class Pi05Agent(Model):
 
     def _build_input_transform_pipeline(self, normalize: bool = True):
         """Compose repack, data, normalize, and model transforms for raw inputs."""
+        repack = [] if self.skip_repack_transforms else self.data_config.repack_transforms.inputs
         if normalize:
             transforms = [
-                *self.data_config.repack_transforms.inputs,
+                *repack,
                 *self.data_config.data_transforms.inputs,
                 _transforms.Normalize(
                     self.data_config.norm_stats, use_quantiles=self.data_config.use_quantile_norm
@@ -315,13 +319,12 @@ class Pi05Agent(Model):
             ]
         else:
             transforms = [
-                *self.data_config.repack_transforms.inputs,
+                *repack,
                 *self.data_config.data_transforms.inputs,
                 *self.data_config.model_transforms.inputs,
-            ]
-
+             ]
         return _transforms.compose(transforms)
-    
+
     def _build_output_transform_pipeline(self, unnormalize: bool = True):
         """Compose model, unnormalize, and data transforms for model outputs."""
         if unnormalize:
@@ -355,6 +358,7 @@ class Pi05Agent(Model):
         default_prompt: Optional[str] = None,
         freeze_pi05_encoder: bool = False,
         infer_device: Optional[jax.Device] = None,
+        skip_repack_transforms: bool = False,
     ) -> tuple["Pi05Agent", Any]:
         """Initialize a Pi05Agent instance using init_train_state."""
         train_state, train_state_sharding = pi05_init_train_state(
@@ -374,6 +378,7 @@ class Pi05Agent(Model):
             default_prompt=default_prompt,
             freeze_pi05_encoder=freeze_pi05_encoder,
             infer_device=infer_device,
+            skip_repack_transforms=skip_repack_transforms,
         )
         
         return agent, train_state, train_state_sharding

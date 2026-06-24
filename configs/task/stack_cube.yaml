@@ -12,7 +12,12 @@ env_wrapper: "maniskill"  # "maniskill" ou "droid" (real robot)
 # ── Data ───────────────────────────────────────────────────────
 lerobot_repo_id: "expo_ft/stack_cube"
 droid_format_dir: "demos/StackCube-v1/droid_format"
+action_space: "cartesian_velocity" # Action space keys for DROID format reader
+gripper_action_space: "velocity"
 num_data: 0  # max number of offline demo episodes to load (0 = all)
+# Skip RepackTransform in replay buffer — our observations already have the
+# correct keys for DroidInputs (observation/cartesian_position, etc.)
+skip_repack_transforms: true
 
 # ── Run / Logging ──────────────────────────────────────────────
 project_name: "expo-ft"

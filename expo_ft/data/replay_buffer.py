@@ -42,6 +42,7 @@ def create_replay_buffer(config, example_action, capacity, task_description, rep
         task_description=task_description,
         replan_steps=replan_steps,
         discount=config.discount,
+        skip_repack_transforms=getattr(config, 'skip_repack_transforms', False),
     )
     buf.seed(seed)
     return buf
@@ -89,6 +90,7 @@ class PiReplayBuffer(Dataset):
         task_description: str = None,
         replan_steps: int = None,
         discount: float = 0.99,
+        skip_repack_transforms: bool = False,
     ):
         data_config = pi_train_config.data.create(pi_train_config.assets_dirs, pi_train_config.model)
         model_config = pi_train_config.model
@@ -131,6 +133,7 @@ class PiReplayBuffer(Dataset):
         self._action_dim = padded_action_dim
         self._replan_steps = replan_steps
         self._discount = discount
+        self._skip_repack_transforms = skip_repack_transforms
         self._skip_norm_stats = skip_norm_stats
         self._prompt = task_description
         self._transform = self._build_transform_pipeline()
@@ -280,7 +283,7 @@ class PiReplayBuffer(Dataset):
                 )
         
         transforms = [
-            *self._data_config.repack_transforms.inputs,
+            *([] if self._skip_repack_transforms else self._data_config.repack_transforms.inputs),
             *self._data_config.data_transforms.inputs,
             _transforms.Normalize(
                 norm_stats, use_quantiles=self._data_config.use_quantile_norm
