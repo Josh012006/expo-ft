@@ -54,20 +54,26 @@ def stage_sft(cfg, args, run_dir):
     """SFT warmup — fine-tune π₀.₅ on the demo dataset."""
     sft_output = os.path.join(run_dir, "sft")
 
-    run([
+    cmd = [
         "uv", "run",
         str(OPENPI_SCRIPTS / "train.py"),
         get_sft_config_name(cfg),
-        "--exp-name", "stack_cube_sft",
+        "--exp-name", cfg.sft_exp_name,
         "--data.repo-id", cfg.lerobot_repo_id,
         "--assets-base-dir", "./assets",
         "--checkpoint-base-dir", sft_output,
         f"--num-train-steps={cfg.sft_num_train_steps}",
         f"--batch-size={cfg.sft_batch_size}",
-        "--save-interval", "1000",
-        "--log-interval", "100",
-        "--no-wandb-enabled",
-    ])
+        f"--num-workers={cfg.sft_num_workers}",
+        f"--save-interval={cfg.sft_save_interval}",
+        f"--log-interval={cfg.sft_log_interval}",
+        f"--project-name={cfg.project_name}",
+    ]
+
+    if cfg.sft_resume:
+        cmd.append("--resume")
+
+    run(cmd)
 
 
 def stage_rl(cfg, args, run_dir, resuming):
