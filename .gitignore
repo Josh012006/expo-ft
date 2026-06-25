@@ -15,3 +15,4 @@ assets/
 client/.venv/
 demos/
 logs/
+slurm-*.out

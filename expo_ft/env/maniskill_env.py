@@ -35,16 +35,17 @@ class ManiSkillEnvWrapper:
             control_mode=cfg.control_mode,
             num_envs=1,
             max_episode_steps=cfg.max_episode_steps,
+            sensor_configs=dict(
+                width=getattr(cfg, 'camera_width', 128),
+                height=getattr(cfg, 'camera_height', 128),
+            ),
         )
 
-        # Video recording wrapper if needed
+        # Manual video recording (gymnasium RecordVideo incompatible with ManiSkill tensors)
         if self._video_dir is not None:
-            self._env = gym.wrappers.RecordVideo(
-                self._env,
-                video_folder=self._video_dir,
-                episode_trigger=lambda ep: True,
-                disable_logger=True,
-            )
+            os.makedirs(self._video_dir, exist_ok=True)
+        self._frames = []
+        self._episode_count = 0
 
         self._obs = None
         self._info = {}
@@ -56,6 +57,14 @@ class ManiSkillEnvWrapper:
 
     def reset(self):
         """Reset the environment and return observation."""
+        # Save previous episode video if any
+        if self._video_dir is not None and len(self._frames) > 0:
+            import imageio
+            path = os.path.join(self._video_dir, f"episode_{self._episode_count:04d}.mp4")
+            imageio.mimsave(path, self._frames, fps=10)
+            self._frames = []
+            self._episode_count += 1
+
         obs, info = self._env.reset()
         self._obs = self._parse_obs(obs)
         self._info = info
@@ -74,6 +83,11 @@ class ManiSkillEnvWrapper:
         """
         action = np.array(action, dtype=np.float32)
         obs, reward, terminated, truncated, info = self._env.step(action)
+        if self._video_dir is not None:
+            frame = obs['sensor_data']['base_camera']['rgb']
+            if hasattr(frame, 'cpu'):
+                frame = frame.cpu().numpy()
+            self._frames.append(np.array(frame[0]).astype(np.uint8))
         self._obs = self._parse_obs(obs)
         self._reward = float(reward.item() if hasattr(reward, 'item') else reward)
         self._done = bool((terminated | truncated).item()
@@ -141,4 +155,9 @@ class ManiSkillEnvWrapper:
         }
 
     def close(self):
+        # Save last episode video
+        if self._video_dir is not None and len(self._frames) > 0:
+            import imageio
+            path = os.path.join(self._video_dir, f"episode_{self._episode_count:04d}.mp4")
+            imageio.mimsave(path, self._frames, fps=10)
         self._env.close()

@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import sys
+import os
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -25,7 +26,7 @@ from expo_ft.utils.config_loader import load_task_config
 from expo_ft.env.maniskill_env import ManiSkillEnvWrapper
 
 
-def evaluate(cfg, checkpoint_path, n_episodes, seed):
+def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None):
     import jax
     import numpy as np
     import openpi.training.sharding as openpi_sharding
@@ -60,7 +61,7 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed):
         env_creation_request={
             "example_action": example_action,
             "env_usage": "eval",
-            "video_dir": None,
+            "video_dir": video_dir,
         },
         cfg=cfg,
     )
@@ -80,12 +81,24 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed):
     model_config.pi05_asset_id = cfg.lerobot_repo_id
     model_config.skip_repack_transforms = cfg.skip_repack_transforms
 
+    # Load SFT checkpoint if provided
+    if checkpoint_path is not None:
+        model_config.pi05_weight_loader_path = str(Path(checkpoint_path) / "params")
+        print(f"Loaded checkpoint from: {checkpoint_path}")
+    else:
+        print("Using base π₀.₅ weights (no checkpoint)")
+
     # Build π₀.₅
     actor, actor_train_state, target_actor_params, agent_kwargs, vla_metadata = build_pi05(
         model_config, seed, mesh, data_sharding, replicated_sharding,
         resume=False,
         default_prompt=cfg.language_instruction,
     )
+
+    # Print first few weights to verify checkpoint is loaded
+    params = actor.get_params(actor_train_state)
+    leaf = jax.tree_util.tree_leaves(params)[0]
+    print(f"First param sum: {float(jax.numpy.sum(leaf)):.6f}")
 
     # Create replay buffer for agent init
     replay_buffer = create_replay_buffer(
@@ -143,11 +156,24 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed):
 
         while not done and steps < cfg.max_steps_per_episode:
             if not action_plan:
-                action_chunk, agent, _ = agent.sample_actions(obs)
+                action_chunk, agent, _ = agent.sample_actions(obs, only_base_actions=True)
+                if ep == 0 and steps == 0:
+                    print(f"action_chunk shape: {action_chunk.shape}")
+                    print(f"action_chunk[0]: {action_chunk[0]}")
+                    print(f"action min: {action_chunk.min():.3f}, max: {action_chunk.max():.3f}")
+                    print(f"obs cartesian_position: {obs['observation/cartesian_position']}")
+                    print(f"obs gripper: {obs['observation/gripper_position']}")
                 action_plan.extend(action_chunk[:cfg.replan_steps])
 
             action = action_plan.popleft()
             _, _ = env.step(action.tolist())
+            if ep == 0 and steps == 0:
+                print(f"prompt: {obs.get('prompt', 'MISSING')}")
+                print(f"obs keys: {list(obs.keys())}")
+                print(f"base_image shape: {obs['observation/exterior_image_1_left'].shape}")
+                print(f"base_image min/max: {obs['observation/exterior_image_1_left'].min()}/{obs['observation/exterior_image_1_left'].max()}")
+            if ep == 0 and steps < 5:
+                print(f"step {steps}: action={action[:3]}, tcp={obs['observation/cartesian_position'][:3]}")
             done, success, _, _ = env.get_info_for_step()
             obs = env.get_observation()
             steps += 1
@@ -184,4 +210,5 @@ if __name__ == "__main__":
         checkpoint_path=args.checkpoint,
         n_episodes=args.n_episodes,
         seed=args.seed,
+        video_dir=str(REPO_ROOT / "logs" / "eval_videos" / f"{'sft' if args.checkpoint else 'baseline'}_{__import__('datetime').datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}")
     )
