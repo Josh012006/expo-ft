@@ -39,6 +39,7 @@ class ManiSkillEnvWrapper:
                 width=getattr(cfg, 'camera_width', 128),
                 height=getattr(cfg, 'camera_height', 128),
             ),
+            sim_backend=getattr(cfg, 'sim_backend', 'physx_cuda'),
         )
 
         # Manual video recording (gymnasium RecordVideo incompatible with ManiSkill tensors)
