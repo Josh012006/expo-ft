@@ -28,7 +28,7 @@ gripper_action_space: "position"
 num_data: 0  # max number of offline demo episodes to load (0 = all)
 # Skip RepackTransform in replay buffer — our observations already have the
 # correct keys for DroidInputs (observation/cartesian_position, etc.)
-skip_repack_transforms: false
+skip_repack_transforms: true
 camera_width: 128
 camera_height: 128
 
@@ -61,7 +61,7 @@ keep_period: 10000         # keep one checkpoint every N steps (older ones are d
 # ── SFT warmup ─────────────────────────────────────────────────
 sft_exp_name: "stack_cube_sft"
 sft_num_workers: 12
-sft_num_train_steps: 20000
+sft_num_train_steps: 1000
 sft_batch_size: 64
 sft_use_lora: true         # use LoRA fine-tuning (faster, less memory than full fine-tune)
 sft_peak_lr: 2.5e-5

@@ -58,7 +58,7 @@ def process_droid_dataset(
             ep_obs = _flatten_dict(ep_obs)
 
             action_key = task_config.action_space
-            gripper_key = f"gripper_{task_config.gripper_action_space}"
+            gripper_key = task_config.gripper_action_space
             a1 = np.asarray(f["action"][action_key])
             a2 = np.asarray(f["action"][gripper_key])
             ep_actions = np.concatenate([a1, a2[:, None] if len(a2.shape) == 1 else a2], axis=-1)

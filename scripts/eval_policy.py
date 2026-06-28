@@ -3,17 +3,18 @@ Evaluate π₀.₅ policy on a ManiSkill task.
 
 Usage:
     # Baseline (no checkpoint — base π₀.₅)
-    python scripts/eval_policy.py --config configs/task/stack_cube.yaml --n-episodes 50
+    python scripts/eval_policy.py --config configs/task/maniskill_stack_cube.yaml --n-episodes 50
 
     # After SFT
-    python scripts/eval_policy.py --config configs/task/stack_cube.yaml \
-        --checkpoint logs/stack_cube/<run>/sft/stack_cube_sft/checkpoints/<step> \
+    python scripts/eval_policy.py --config configs/task/maniskill_stack_cube.yaml \
+        --checkpoint logs/stack_cube/<run>/sft/<exp_name>/checkpoints/<step> \
         --n-episodes 50
 """
 
 import argparse
 import sys
 import os
+import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -22,7 +23,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import numpy as np
 from tqdm import tqdm
 
-from expo_ft.utils.config_loader import load_task_config
+from expo_ft.utils.config_loader import load_task_config, get_sft_config_name
 from expo_ft.env.maniskill_env import ManiSkillEnvWrapper
 
 
@@ -34,11 +35,6 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None):
     from expo_ft.data.replay_buffer import create_replay_buffer
     from expo_ft.env.droid_utils import process_droid_dataset
     from expo_ft.agents.alg.expo_ft import load_agent
-
-    # Load model config
-    from absl import flags
-    from ml_collections import config_flags
-    import sys
 
     mesh = openpi_sharding.make_mesh(1)
     data_sharding = jax.sharding.NamedSharding(
@@ -76,10 +72,11 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None):
     spec.loader.exec_module(mod)
     model_config = mod.get_config()
 
-    # Point to our local norm stats
-    from expo_ft.utils.config_loader import get_sft_config_name
-    model_config.pi05_assets_dir = str(REPO_ROOT / "assets" / get_sft_config_name(cfg))
-    model_config.pi05_asset_id = cfg.lerobot_repo_id
+    # Override config dynamically from task YAML — no hardcoded values
+    sft_config_name = get_sft_config_name(cfg)
+    model_config.pi05_config_name  = sft_config_name
+    model_config.pi05_assets_dir   = str(REPO_ROOT / "assets" / sft_config_name)
+    model_config.pi05_asset_id     = cfg.lerobot_repo_id
     model_config.skip_repack_transforms = cfg.skip_repack_transforms
 
     # Load SFT checkpoint if provided
@@ -96,7 +93,7 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None):
         default_prompt=cfg.language_instruction,
     )
 
-    # Print first few weights to verify checkpoint is loaded
+    # Print first param sum to verify checkpoint loading
     params = actor.get_params(actor_train_state)
     leaf = jax.tree_util.tree_leaves(params)[0]
     print(f"First param sum: {float(jax.numpy.sum(leaf)):.6f}")
@@ -114,13 +111,13 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None):
 
     agent_example_observation, agent_example_state, agent_example_action = \
         replay_buffer.convert_to_critic_format({
-            "base_image": replay_buffer.dataset_dict['base_image'][0][np.newaxis],
+            "base_image":       replay_buffer.dataset_dict['base_image'][0][np.newaxis],
             "left_wrist_image": replay_buffer.dataset_dict['left_wrist_image'][0][np.newaxis],
-            "state": replay_buffer.dataset_dict['state'][0][np.newaxis],
-            "actions": replay_buffer.dataset_dict['actions'][0][np.newaxis],
+            "state":            replay_buffer.dataset_dict['state'][0][np.newaxis],
+            "actions":          replay_buffer.dataset_dict['actions'][0][np.newaxis],
         })
     actor.action_dim = agent_example_action.squeeze().shape[-1]
-    actor.state_dim = agent_example_state.squeeze().shape[-1]
+    actor.state_dim  = agent_example_state.squeeze().shape[-1]
 
     agent = load_agent(
         seed=seed,
@@ -142,10 +139,13 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None):
     )
     agent = agent.cache_infer_params()
 
+    # Config-driven keys
+    state_obs_key  = cfg.state_obs_key
+    action_dim     = getattr(cfg, 'output_action_dim', 7)
+
     # Evaluation loop
     successes = []
     episode_lengths = []
-    rng = jax.random.PRNGKey(seed)
 
     for ep in tqdm(range(n_episodes), desc="Evaluating"):
         obs = env.reset()
@@ -162,19 +162,21 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None):
                     print(f"action_chunk shape: {action_chunk.shape}")
                     print(f"action_chunk[0]: {action_chunk[0]}")
                     print(f"action min: {action_chunk.min():.3f}, max: {action_chunk.max():.3f}")
-                    print(f"obs cartesian_position: {obs['observation/cartesian_position']}")
+                    print(f"obs {state_obs_key}: {obs[state_obs_key]}")
                     print(f"obs gripper: {obs['observation/gripper_position']}")
                 action_plan.extend(action_chunk[:cfg.replan_steps])
 
             action = action_plan.popleft()
             _, _ = env.step(action.tolist())
+
             if ep == 0 and steps == 0:
                 print(f"prompt: {obs.get('prompt', 'MISSING')}")
                 print(f"obs keys: {list(obs.keys())}")
                 print(f"base_image shape: {obs['observation/exterior_image_1_left'].shape}")
                 print(f"base_image min/max: {obs['observation/exterior_image_1_left'].min()}/{obs['observation/exterior_image_1_left'].max()}")
             if ep == 0 and steps < 5:
-                print(f"step {steps}: action={action[:3]}, tcp={obs['observation/cartesian_position'][:3]}")
+                print(f"step {steps}: action={action[:action_dim]}, state={obs[state_obs_key][:3]}")
+
             done, success, _, _ = env.get_info_for_step()
             obs = env.get_observation()
             steps += 1
@@ -185,7 +187,7 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None):
     env.close()
 
     success_rate = np.mean(successes)
-    avg_length = np.mean(episode_lengths)
+    avg_length   = np.mean(episode_lengths)
 
     print(f"\n{'='*40}")
     print(f"Episodes:     {n_episodes}")
@@ -198,18 +200,22 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config",      required=True,       help="Path to task YAML config")
-    parser.add_argument("--checkpoint",  default=None,        help="Path to checkpoint (None = base π₀.₅)")
-    parser.add_argument("--n-episodes",  type=int, default=50, help="Number of evaluation episodes")
-    parser.add_argument("--seed",        type=int, default=42)
+    parser.add_argument("--config",     required=True,        help="Path to task YAML config")
+    parser.add_argument("--checkpoint", default=None,         help="Path to SFT checkpoint (None = base π₀.₅)")
+    parser.add_argument("--n-episodes", type=int, default=50, help="Number of evaluation episodes")
+    parser.add_argument("--seed",       type=int, default=42)
     args = parser.parse_args()
 
     cfg = load_task_config(args.config)
+
+    label     = "sft" if args.checkpoint else "baseline"
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    video_dir = str(REPO_ROOT / "logs" / "eval_videos" / f"{label}_{timestamp}")
 
     evaluate(
         cfg=cfg,
         checkpoint_path=args.checkpoint,
         n_episodes=args.n_episodes,
         seed=args.seed,
-        video_dir=str(REPO_ROOT / "logs" / "eval_videos" / f"{'sft' if args.checkpoint else 'baseline'}_{__import__('datetime').datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}")
+        video_dir=video_dir,
     )

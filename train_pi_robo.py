@@ -49,6 +49,12 @@ def main(_):
 
     # Load task config from YAML
     cfg = load_task_config(FLAGS.task_config)
+    # Override pi05_config_name dynamically from task config
+    from expo_ft.utils.config_loader import get_sft_config_name
+    FLAGS.config.pi05_config_name = get_sft_config_name(cfg)
+    FLAGS.config.pi05_assets_dir = str(Path(__file__).parent / "assets" / get_sft_config_name(cfg))
+    FLAGS.config.pi05_asset_id = cfg.lerobot_repo_id
+    FLAGS.config.skip_repack_transforms = cfg.skip_repack_transforms
     run_dir, resuming = resolve_run_dir(cfg)
 
     assert 0.0 <= cfg.offline_ratio <= 1.0
