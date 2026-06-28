@@ -24,8 +24,7 @@ import numpy as np
 from tqdm import tqdm
 
 from expo_ft.utils.config_loader import load_task_config, get_sft_config_name
-from expo_ft.env.maniskill_env import ManiSkillEnvWrapper
-
+from expo_ft.env.env_factory import make_env_wrapper
 
 def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None):
     import jax
@@ -53,7 +52,7 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None):
     example_action = dataset[0]['actions'][np.newaxis]
 
     # Create env
-    env = ManiSkillEnvWrapper(
+    env = make_env_wrapper(
         env_creation_request={
             "example_action": example_action,
             "env_usage": "eval",

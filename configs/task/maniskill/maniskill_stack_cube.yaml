@@ -1,4 +1,4 @@
-# configs/task/stack_cube.yaml
+# configs/task/maniskill/maniskill_stack_cube.yaml
 
 # ── Environment ────────────────────────────────────────────────
 env_id: "StackCube-v1"

@@ -16,5 +16,5 @@ cd ~/projects/expo-ft
 source scripts/setup_env.sh
 
 python scripts/run_pipeline.py \
-    --config configs/task/maniskill_stack_cube.yaml \
+    --config configs/task/maniskill/maniskill_stack_cube.yaml \
     --stage sft

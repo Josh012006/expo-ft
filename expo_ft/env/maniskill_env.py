@@ -60,9 +60,9 @@ class ManiSkillEnvWrapper:
         """Reset the environment and return observation."""
         # Save previous episode video if any
         if self._video_dir is not None and len(self._frames) > 0:
-            import imageio
-            path = os.path.join(self._video_dir, f"episode_{self._episode_count:04d}.mp4")
-            imageio.mimsave(path, self._frames, fps=10)
+            path = os.path.join(self._video_dir, f"episode_{self._episode_count}.mp4")
+            import imageio.v3 as iio
+            iio.imwrite(path, self._frames, fps=10, codec='libx264')
             self._frames = []
             self._episode_count += 1
 
@@ -163,7 +163,7 @@ class ManiSkillEnvWrapper:
     def close(self):
         # Save last episode video
         if self._video_dir is not None and len(self._frames) > 0:
-            import imageio
-            path = os.path.join(self._video_dir, f"episode_{self._episode_count:04d}.mp4")
-            imageio.mimsave(path, self._frames, fps=10)
+            path = os.path.join(self._video_dir, f"episode_{self._episode_count}.mp4")
+            import imageio.v3 as iio
+            iio.imwrite(path, self._frames, fps=10, codec='libx264')
         self._env.close()

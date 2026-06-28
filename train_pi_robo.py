@@ -115,13 +115,7 @@ def main(_):
     }
 
     logging.info("Creating environment...")
-    if cfg.env_wrapper == "maniskill":
-        from expo_ft.env.maniskill_env import ManiSkillEnvWrapper
-        env = ManiSkillEnvWrapper(
-            env_creation_request=train_env_creation_request,
-            cfg=cfg,
-        )
-    elif cfg.env_wrapper == "droid":
+    if cfg.env_wrapper == "droid":
         from expo_ft.env.env_client import EnvClientWrapper
         env = EnvClientWrapper(
             env_creation_request=train_env_creation_request,
@@ -129,7 +123,8 @@ def main(_):
             port=8102,
         )
     else:
-        raise ValueError(f"Unknown env_wrapper: {cfg.env_wrapper}")
+        from expo_ft.env.env_factory import make_env_wrapper
+        env = make_env_wrapper(env_creation_request=train_env_creation_request, cfg=cfg)
     env.reset()
     logging.info(f"Created training environment {env.env_id}")
 

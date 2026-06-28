@@ -16,6 +16,6 @@ cd ~/projects/expo-ft
 source scripts/setup_env.sh
 
 python scripts/eval_policy.py \
-    --config configs/task/maniskill_stack_cube.yaml \
-    --checkpoint logs/stack_cube/stack_cube_expo_ft_2026-06-25_07-07-18/sft/expo_pi05_droid_lora_finetune_sft_cartesian_state/stack_cube_sft/19999 \
+    --config configs/task/maniskill/maniskill_stack_cube.yaml \
+    --checkpoint logs/stack_cube/stack_cube_expo_ft_2026-06-28_03-12-27/sft/expo_pi05_droid_lora_finetune_sft_joint_state/stack_cube_sft/999 \
     --n-episodes 50
