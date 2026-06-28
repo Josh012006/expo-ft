@@ -58,7 +58,14 @@ def get_sft_config_name(cfg: SimpleNamespace) -> str:
     Return the openpi TrainConfig name to use for SFT warmup,
     based on task config flags.
     """
+    use_cartesian = getattr(cfg, 'use_cartesian_state', True)
     if cfg.sft_use_lora:
-        return "expo_pi05_droid_lora_finetune_sft_cartesian_state"
+        if use_cartesian:
+            return "expo_pi05_droid_lora_finetune_sft_cartesian_state"
+        else:
+            return "expo_pi05_droid_lora_finetune_sft_joint_state"
     else:
-        return "expo_pi05_droid_full_finetune_sft_cartesian_state"
+        if use_cartesian:
+            return "expo_pi05_droid_full_finetune_sft_cartesian_state"
+        else:
+            return "expo_pi05_droid_full_finetune_sft_joint_state"

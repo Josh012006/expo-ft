@@ -2,7 +2,6 @@
 
 # ── Environment ────────────────────────────────────────────────
 env_id: "StackCube-v1"
-control_mode: "pd_ee_delta_pose"
 language_instruction: "stack the red cube on top of the green cube"
 control_hz: 10
 max_episode_steps: 100
@@ -10,17 +9,28 @@ env_type: "sim"  # "sim" for simulation, "droid" for real robot
 env_wrapper: "maniskill"  # "maniskill" ou "droid" (real robot)
 sim_backend: "physx_cuda"
 
+# Control mode config
+control_mode: "pd_joint_delta_pos"
+normalize_action: true
+use_cartesian_state: false
+output_action_dim: 8
+
+# Observation config
+state_obs_key: "observation/joint_position"
+state_obs_dim: 7
+
+
 # ── Data ───────────────────────────────────────────────────────
 lerobot_repo_id: "expo_ft/stack_cube"
 droid_format_dir: "demos/StackCube-v1/droid_format"
-action_space: "cartesian_velocity" # Action space keys for DROID format reader
-gripper_action_space: "velocity"
+action_space: "joint_position" # Action space keys for DROID format reader
+gripper_action_space: "position"
 num_data: 0  # max number of offline demo episodes to load (0 = all)
 # Skip RepackTransform in replay buffer — our observations already have the
 # correct keys for DroidInputs (observation/cartesian_position, etc.)
-skip_repack_transforms: true
-camera_width: 224
-camera_height: 224
+skip_repack_transforms: false
+camera_width: 128
+camera_height: 128
 
 # ── Run / Logging ──────────────────────────────────────────────
 project_name: "expo-ft"

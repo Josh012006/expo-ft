@@ -138,11 +138,16 @@ class ManiSkillEnvWrapper:
         tcp_pose  = to_np(obs['extra']['tcp_pose'])[0]                   # (7,)
         qpos      = to_np(obs['agent']['qpos'])[0]                       # (9,)
 
-        # Cartesian position: xyz + euler from quaternion
-        xyz        = tcp_pose[:3]
-        quat_xyzw  = tcp_pose[3:]
-        euler      = Rotation.from_quat(quat_xyzw).as_euler("xyz", degrees=False)
-        cartesian  = np.concatenate([xyz, euler]).astype(np.float32)
+        state_key = getattr(self.cfg, 'state_obs_key', 'observation/cartesian_position')
+        if state_key == 'observation/joint_position':
+            # 7 joint positions from qpos
+            state = qpos[:7].astype(np.float32)
+        elif state_key == 'observation/cartesian_position':
+            # Cartesian position: xyz + euler from quaternion
+            xyz        = tcp_pose[:3]
+            quat_xyzw  = tcp_pose[3:]
+            euler      = Rotation.from_quat(quat_xyzw).as_euler("xyz", degrees=False)
+            state      = np.concatenate([xyz, euler]).astype(np.float32)
 
         # Gripper: last joint
         gripper = qpos[-1:].astype(np.float32)
@@ -150,7 +155,7 @@ class ManiSkillEnvWrapper:
         return {
             "observation/exterior_image_1_left": rgb_base.astype(np.uint8),
             "observation/wrist_image_left":      rgb_wrist.astype(np.uint8),
-            "observation/cartesian_position":    cartesian,
+            state_key:    state,
             "observation/gripper_position":      gripper,
             "prompt":                            self.task_description,
         }

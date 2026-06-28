@@ -77,7 +77,8 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None):
     model_config = mod.get_config()
 
     # Point to our local norm stats
-    model_config.pi05_assets_dir = str(REPO_ROOT / "assets" / "expo_pi05_droid_lora_finetune_sft_cartesian_state")
+    from expo_ft.utils.config_loader import get_sft_config_name
+    model_config.pi05_assets_dir = str(REPO_ROOT / "assets" / get_sft_config_name(cfg))
     model_config.pi05_asset_id = cfg.lerobot_repo_id
     model_config.skip_repack_transforms = cfg.skip_repack_transforms
 
