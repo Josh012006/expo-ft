@@ -87,11 +87,6 @@ def convert(traj_path: str, output_dir: str, task_description: str, cfg=None, ma
             # Actions: arm + gripper, pad last timestep with zeros
             act_arm  = actions[:, :arm_action_dim].astype(np.float32)
             act_grip = actions[:, arm_action_dim:arm_action_dim+1].astype(np.float32)
-            # Normalize using exact ManiSkill controller bounds (pd_ee_delta_pose):
-            # arm: low=-0.1, high=0.1 (symmetric) → normalized = physical / 0.1
-            # gripper: low=-0.01, high=0.04 → normalized = (physical - 0.015) / 0.025
-            act_arm  = np.clip(act_arm  / 0.1, -1, 1)
-            act_grip = np.clip((act_grip - 0.015) / 0.025, -1, 1)
             act_arm  = np.concatenate([act_arm,  np.zeros((1, arm_action_dim), dtype=np.float32)], axis=0)
             act_grip = np.concatenate([act_grip, np.zeros((1, 1),             dtype=np.float32)], axis=0)
 

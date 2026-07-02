@@ -49,6 +49,55 @@ def stage_norm_stats(cfg, args):
         "--repo-id", cfg.lerobot_repo_id,
     ])
 
+def stage_demos(cfg, args):
+    """Generate ManiSkill demos, replay-validate them in the task's control mode,
+    then convert to droid_format (RL offline buffer) and LeRobot (SFT trainer)."""
+    n_demos = getattr(cfg, "num_demos", 550)
+    mp_root = REPO_ROOT / "demos"  # mani_skill appends <env_id>/motionplanning itself
+
+    # 1. Generate raw mplib demos (native pd_joint_pos), keep only successful ones.
+    #    Forced to physx_cpu (not cfg.sim_backend) to match step 2, which is hard-locked
+    #    to CPU regardless (control mode conversion isn't supported on GPU) — keeps the
+    #    whole demo-prep pipeline on one consistent backend, no mid-pipeline switch.
+    run([
+        "python", "-m", "mani_skill.examples.motionplanning.panda.run",
+        "-e", cfg.env_id, "-n", str(n_demos), "--only-count-success",
+        "--record-dir", str(mp_root), "--traj-name", "trajectory", "-b", "physx_cpu",
+    ])
+    raw_h5 = mp_root / cfg.env_id / "motionplanning" / "trajectory.h5"
+
+    # 2. Replay into RGB + the task's control mode. This IS the validity check —
+    #    the printed "X/N=XX% demos saved" at the end is the demo success rate.
+    #    - control mode conversion is not supported on GPU -> forced physx_cpu.
+    #    - --use-env-states is INCOMPATIBLE with control mode conversion (ManiSkill
+    #      asserts on this) -> must be omitted here.
+    run([
+        "python", "-m", "mani_skill.trajectory.replay_trajectory",
+        "--traj-path", str(raw_h5), "--save-traj",
+        "-o", "rgb", "-c", cfg.control_mode, "-b", "physx_cpu",
+    ])
+    # replay_trajectory writes its output in the SAME directory as --traj-path,
+    # not a separate "rl" subfolder.
+    rgb_h5 = raw_h5.parent / f"trajectory.rgb.{cfg.control_mode}.physx_cpu.h5"
+
+    # 3. droid_format (used by stage_rl's offline buffer)
+    run([
+        "python", str(REPO_ROOT / "scripts" / "convert_maniskill_to_droid.py"),
+        "--traj-path", str(rgb_h5), "--output-dir", cfg.droid_format_dir,
+        "--task-description", cfg.language_instruction, "--config", args.config,
+    ])
+
+    # 4. LeRobot format (used by openpi's SFT trainer via --data.repo-id)
+    run([
+        "python", str(REPO_ROOT / "scripts" / "convert_maniskill_to_lerobot.py"),
+        "--traj-path", str(rgb_h5), "--repo-name", cfg.lerobot_repo_id,
+        "--task-description", cfg.language_instruction, "--config", args.config,
+    ])
+    # norm_stats intentionally NOT run here for *_joint_state SFT configs — they use
+    # the DROID-official AssetsConfig baked into openpi's training/config.py, which
+    # stage_sft's CLI never overrides. Only run --stage norm_stats separately if
+    # get_sft_config_name(cfg) resolves to a config WITHOUT that baked override.
+
 
 def stage_sft(cfg, args, run_dir):
     """SFT warmup — fine-tune π₀.₅ on the demo dataset."""
@@ -111,11 +160,14 @@ def stage_rl(cfg, args, run_dir, resuming):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
-    parser.add_argument("--stage", choices=["norm_stats", "sft", "rl", "all"], default="all")
+    parser.add_argument("--stage", choices=["demos", "norm_stats", "sft", "rl", "all"], default="all")
     args = parser.parse_args()
 
     cfg = load_task_config(args.config)
     run_dir, resuming = resolve_run_dir(cfg)
+
+    if args.stage in ("demos", "all"):
+    	stage_demos(cfg, args)
 
     if args.stage in ("norm_stats", "all"):
         stage_norm_stats(cfg, args)

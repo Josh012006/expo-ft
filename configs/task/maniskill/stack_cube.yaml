@@ -4,10 +4,10 @@
 env_id: "StackCube-v1"
 language_instruction: "stack the red cube on top of the green cube"
 control_hz: 10
-max_episode_steps: 100
+max_episode_steps: 120
 env_type: "sim"  # "sim" for simulation, "droid" for real robot
 env_wrapper: "maniskill"  # "maniskill" ou "droid" (real robot)
-sim_backend: "physx_cuda"
+sim_backend: "physx_cpu"
 
 # Control mode config
 control_mode: "pd_joint_delta_pos"

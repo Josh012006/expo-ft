@@ -129,11 +129,8 @@ def main(
             # Gripper position: first finger (both fingers always identical on Panda)
             gripper = qpos[:, 7:8].astype(np.float32)                     # (T, 1)
 
-            # Normalize using exact ManiSkill controller bounds (pd_ee_delta_pose):
-            # arm: low=-0.1, high=0.1 (symmetric) → normalized = physical / 0.1
-            # gripper: low=-0.01, high=0.04 → normalized = (physical - 0.015) / 0.025
-            act_arm  = np.clip(actions[:, :arm_action_dim] / 0.1, -1, 1).astype(np.float32)
-            act_grip = np.clip((actions[:, arm_action_dim:] - 0.015) / 0.025, -1, 1).astype(np.float32)
+            act_arm  = actions[:, :arm_action_dim].astype(np.float32)
+            act_grip = actions[:, arm_action_dim:].astype(np.float32)
             actions_normalized = np.concatenate([act_arm, act_grip], axis=-1)
             # Pad last timestep with zeros
             actions_padded = np.concatenate(

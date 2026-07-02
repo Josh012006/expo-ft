@@ -56,7 +56,7 @@ class ManiSkillEnvWrapper:
 
         logging.info(f"ManiSkillEnvWrapper: created {cfg.env_id} ({self._env_usage})")
 
-    def reset(self):
+    def reset(self, **reset_kwargs):
         """Reset the environment and return observation."""
         # Save previous episode video if any
         if self._video_dir is not None and len(self._frames) > 0:
@@ -66,7 +66,7 @@ class ManiSkillEnvWrapper:
             self._frames = []
             self._episode_count += 1
 
-        obs, info = self._env.reset()
+        obs, info = self._env.reset(**reset_kwargs)
         self._obs = self._parse_obs(obs)
         self._info = info
         self._done = False

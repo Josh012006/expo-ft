@@ -1,4 +1,12 @@
 #!/bin/bash
+# Usage:
+#   sbatch job_sft.sh <venv_name> <config_path>
+#
+# Examples:
+#   sbatch job_sft.sh .venv configs/task/maniskill/stack_cube.yaml
+#   sbatch job_sft.sh .venv configs/task/maniskill/pick_cube.yaml
+#   sbatch job_sft.sh .venv configs/task/maniskill/push_cube.yaml
+#
 #SBATCH --job-name=expo_sft
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
@@ -11,10 +19,10 @@
 #SBATCH --mail-user=josue.mongan@mila.quebec
 #SBATCH --output=logs/sft_%j.out
 #SBATCH --no-requeue
-
+VENV=${1:-.venv}
+CONFIG=${2:-configs/task/maniskill/stack_cube.yaml}
 cd ~/projects/expo-ft
-source scripts/setup_env.sh
-
+source scripts/setup_env.sh "$VENV"
 python scripts/run_pipeline.py \
-    --config configs/task/maniskill/stack_cube.yaml \
+    --config "$CONFIG" \
     --stage sft

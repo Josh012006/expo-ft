@@ -30,7 +30,7 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
     import openpi.training.sharding as openpi_sharding
     from expo_ft.agents.vla.pi05 import build_pi05
     from expo_ft.data.replay_buffer import create_replay_buffer
-    from expo_ft.env.droid_utils import process_droid_dataset
+    from expo_ft.env.droid_utils import make_dummy_transition
     from expo_ft.agents.alg.expo_ft import load_agent
 
     # CRITIQUE : ManiSkill DOIT clupper et rescale les deltas en [-0.1, 0.1]
@@ -45,11 +45,7 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
     )
 
     # Load a few demo transitions to get example_action and init replay buffer
-    dataset = process_droid_dataset(
-        cfg.droid_format_dir,
-        cfg,
-        num_data=1,
-    )
+    dataset = make_dummy_transition(cfg)
     example_action = dataset[0]['actions'][np.newaxis]
 
     # Create env with explicit normalize_action=True
@@ -72,21 +68,19 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
     spec.loader.exec_module(mod)
     model_config = mod.get_config()
 
-    # Override config dynamically from task YAML — no hardcoded values
+    # AssetsConfig DROID already baked-in
     sft_config_name = get_sft_config_name(cfg)
     model_config.pi05_config_name  = sft_config_name
-    model_config.pi05_assets_dir   = str(REPO_ROOT / "assets" / sft_config_name)
-    model_config.pi05_asset_id     = cfg.lerobot_repo_id
     model_config.skip_repack_transforms = cfg.skip_repack_transforms
 
-    # Load SFT checkpoint if provided
     if checkpoint_path is not None:
-        model_config.pi05_weight_loader_path = str(Path(checkpoint_path) / "params")
-        print(f"Loaded checkpoint from: {checkpoint_path}")
+    	model_config.pi05_weight_loader_path = str(Path(checkpoint_path) / "params")
+    	print(f"Loaded checkpoint from: {checkpoint_path}")
     else:
-        print("Using base π₀.₅ weights (no checkpoint)")
+    	model_config.pi05_weight_loader_path = None
+    	print("Using base π₀.₅ weights (no checkpoint) — pi05_droid_jointpos + DROID norm_stats")
 
-    # Build π₀.₅ (unnormalize est à True par défaut ici, ce qui est correct pour le SFT)
+    # Build π₀.₅ (unnormalize is True)
     actor, actor_train_state, target_actor_params, agent_kwargs, vla_metadata = build_pi05(
         model_config, seed, mesh, data_sharding, replicated_sharding,
         resume=False,
@@ -224,8 +218,9 @@ if __name__ == "__main__":
 
     cfg = load_task_config(args.config)
 
+    mode = "sft" if args.checkpoint is not None else "baseline"
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    video_dir = str(REPO_ROOT / "logs" / "eval_videos" / f"eval_{timestamp}")
+    video_dir = str(REPO_ROOT / "logs" / "eval_videos" / f"eval_{cfg.env_id}_{mode}_{timestamp}")
 
     evaluate(
         cfg=cfg, 

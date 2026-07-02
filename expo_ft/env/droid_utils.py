@@ -22,6 +22,37 @@ def _discover_episode_dirs(base_path):
     dirs = sorted(dirs, key=lambda x: int(x))
     return [os.path.join(base_path, d) for d in dirs]
 
+
+
+def make_dummy_transition(task_config):
+    """Build a single synthetic transition with correct shapes/dtypes, derived purely
+    from the task config — no dataset on disk required.
+
+    Used only at eval time to initialize env/replay-buffer/critic shapes (JAX needs
+    static shapes before it can jit). Content is never read: real observations come
+    from env.reset()/env.get_observation() during the actual rollout loop. This lets
+    eval run without a converted droid_format/ dataset, decoupling eval from data prep.
+    """
+    H, W = task_config.camera_height, task_config.camera_width
+    # Must be uint8 with max > 1 (see PiReplayBuffer._preprocess_single_transition assert).
+    dummy_image = np.full((H, W, 3), 128, dtype=np.uint8)
+
+    observations = {
+        "observation/exterior_image_1_left": dummy_image,
+        "observation/wrist_image_left": dummy_image.copy(),
+        task_config.state_obs_key: np.zeros((task_config.state_obs_dim,), dtype=np.float32),
+        "observation/gripper_position": np.zeros((1,), dtype=np.float32),
+        "prompt": task_config.language_instruction,
+    }
+    return [{
+        "observations": observations,
+        "actions": np.zeros((task_config.output_action_dim,), dtype=np.float32),
+        "rewards": np.float32(0.0),
+        "masks": np.float32(1.0),
+        "dones": np.float32(0.0),
+    }]
+
+
 def process_droid_dataset(
     datapath, 
     task_config, 
