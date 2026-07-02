@@ -106,7 +106,12 @@ def main(
             ep = f[ep_key]
 
             rgb_base  = np.array(ep["obs/sensor_data/base_camera/rgb"])   # (T, H, W, 3)
-            rgb_wrist = np.array(ep["obs/sensor_data/hand_camera/rgb"])   # (T, H, W, 3)
+            if "hand_camera" in ep["obs/sensor_data"]:
+                rgb_wrist = np.array(ep["obs/sensor_data/hand_camera/rgb"])   # (T, H, W, 3)
+            else:
+                # No wrist camera available for this task (e.g. PushCube) — use black images.
+                rgb_wrist = np.zeros_like(rgb_base)
+                rgb_wrist[:, 0, 0] = 2
             tcp_pose  = np.array(ep["obs/extra/tcp_pose"])                 # (T, 7)
             qpos      = np.array(ep["obs/agent/qpos"])                     # (T, 9)
             actions   = np.array(ep["actions"])                            # (T-1, action_dim)
@@ -124,9 +129,15 @@ def main(
             # Gripper position: first finger (both fingers always identical on Panda)
             gripper = qpos[:, 7:8].astype(np.float32)                     # (T, 1)
 
-            # Actions: pad last timestep with zeros
+            # Normalize using exact ManiSkill controller bounds (pd_ee_delta_pose):
+            # arm: low=-0.1, high=0.1 (symmetric) → normalized = physical / 0.1
+            # gripper: low=-0.01, high=0.04 → normalized = (physical - 0.015) / 0.025
+            act_arm  = np.clip(actions[:, :arm_action_dim] / 0.1, -1, 1).astype(np.float32)
+            act_grip = np.clip((actions[:, arm_action_dim:] - 0.015) / 0.025, -1, 1).astype(np.float32)
+            actions_normalized = np.concatenate([act_arm, act_grip], axis=-1)
+            # Pad last timestep with zeros
             actions_padded = np.concatenate(
-                [actions, np.zeros((1, action_dim), dtype=np.float32)], axis=0
+                [actions_normalized, np.zeros((1, action_dim), dtype=np.float32)], axis=0
             )                                                              # (T, action_dim)
 
             for t in range(T):

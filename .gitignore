@@ -16,3 +16,5 @@ client/.venv/
 demos/
 logs/
 slurm-*.out
+third_party/robocasa
+third_party/robosuite

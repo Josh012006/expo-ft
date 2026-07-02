@@ -13,8 +13,8 @@
 #SBATCH --no-requeue
 
 cd ~/projects/expo-ft
-source scripts/setup_env.sh
+source scripts/setup_env.sh .venv-robocasa
 
 python scripts/run_pipeline.py \
-    --config configs/task/maniskill/stack_cube.yaml \
+    --config configs/task/robocasa/close_drawer.yaml \
     --stage sft

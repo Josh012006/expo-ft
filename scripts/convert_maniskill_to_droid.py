@@ -60,7 +60,12 @@ def convert(traj_path: str, output_dir: str, task_description: str, cfg=None, ma
             ep = f[ep_key]
 
             rgb_base  = np.array(ep["obs/sensor_data/base_camera/rgb"])   # (T, H, W, 3)
-            rgb_wrist = np.array(ep["obs/sensor_data/hand_camera/rgb"])   # (T, H, W, 3)
+            if "hand_camera" in ep["obs/sensor_data"]:
+                rgb_wrist = np.array(ep["obs/sensor_data/hand_camera/rgb"])   # (T, H, W, 3)
+            else:
+                # No wrist camera available for this task (e.g. PushCube) — use a black image.
+                rgb_wrist = np.zeros_like(rgb_base)
+                rgb_wrist[:, 0, 0] = 2
             tcp_pose  = np.array(ep["obs/extra/tcp_pose"])                 # (T, 7)
             qpos      = np.array(ep["obs/agent/qpos"])                     # (T, 9)
             actions   = np.array(ep["actions"])                            # (T-1, action_dim)
@@ -82,6 +87,11 @@ def convert(traj_path: str, output_dir: str, task_description: str, cfg=None, ma
             # Actions: arm + gripper, pad last timestep with zeros
             act_arm  = actions[:, :arm_action_dim].astype(np.float32)
             act_grip = actions[:, arm_action_dim:arm_action_dim+1].astype(np.float32)
+            # Normalize using exact ManiSkill controller bounds (pd_ee_delta_pose):
+            # arm: low=-0.1, high=0.1 (symmetric) → normalized = physical / 0.1
+            # gripper: low=-0.01, high=0.04 → normalized = (physical - 0.015) / 0.025
+            act_arm  = np.clip(act_arm  / 0.1, -1, 1)
+            act_grip = np.clip((act_grip - 0.015) / 0.025, -1, 1)
             act_arm  = np.concatenate([act_arm,  np.zeros((1, arm_action_dim), dtype=np.float32)], axis=0)
             act_grip = np.concatenate([act_grip, np.zeros((1, 1),             dtype=np.float32)], axis=0)
 

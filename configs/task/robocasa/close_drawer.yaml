@@ -1,0 +1,80 @@
+# configs/task/robocasa/close_drawer.yaml
+
+# ── Environment ────────────────────────────────────────────────
+env_id: "CloseDrawer"
+env_wrapper: "robocasa"
+language_instruction: "close the drawer"
+robot_name: "PandaOmron"
+control_hz: 20
+max_episode_steps: 200
+env_type: "sim"
+sim_backend: "mujoco"
+
+# Control mode config
+control_mode: "osc_pose"
+normalize_action: true
+use_cartesian_state: true
+output_action_dim: 7
+
+# Observation config
+state_obs_key: "observation/cartesian_position"
+state_obs_dim: 6
+
+# Normalization
+action_stats_path: "assets/action_stats_closedrawer_baseline.json"
+
+# ── Data ───────────────────────────────────────────────────────
+lerobot_repo_id: "expo_ft/robocasa_close_drawer"
+droid_format_dir: "demos/robocasa/close_drawer/droid_format"
+action_space: "cartesian_velocity"
+gripper_action_space: "gripper_velocity"
+num_data: 0
+skip_repack_transforms: true
+camera_width: 224
+camera_height: 224
+
+# ── Run / Logging ──────────────────────────────────────────────
+project_name: "expo-ft"
+run_name: "robocasa_close_drawer_expo_ft"
+output_dir: "logs/robocasa_close_drawer"
+resume_dir: null
+
+# ── SFT warmup ─────────────────────────────────────────────────
+sft_exp_name: "robocasa_close_drawer_sft"
+sft_num_workers: 8
+sft_num_train_steps: 20000
+sft_batch_size: 64
+sft_use_lora: true
+sft_peak_lr: 2.5e-5
+sft_save_interval: 200
+sft_log_interval: 100
+sft_resume: false
+
+# ── Algorithm ──────────────────────────────────────────────────
+model_cls: "EXPOLearner"
+seed: 42
+max_episodes: 1000
+max_steps_per_episode: 200
+batch_size: 64
+utd_ratio: 20
+offline_ratio: 0.0
+update_type: "episode"
+num_updates: 1
+num_batch: 1
+replan_steps: 8
+fsdp_devices: 1
+
+# ── Checkpointing ──────────────────────────────────────────────
+checkpoint_model: true
+checkpoint_interval: 100
+checkpoint_buffer: false
+keep_period: 10000
+
+# ── RL hyperparameters ─────────────────────────────────────────
+rl_lr: 3e-4
+rl_discount: 0.99
+rl_tau: 0.005
+rl_alpha: 0.1
+rl_hidden_dims: [256, 256]
+rl_edit_action_scale: 0.05
+actor_success_only: false

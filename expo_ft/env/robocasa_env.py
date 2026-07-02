@@ -49,7 +49,7 @@ class RoboCasaEnvWrapper:
         )
 
         self._env = robosuite.make(
-            env_name=task_name,
+            env_name=self.task_name,
             robots=robot_name,
             controller_configs=controller_config,
             camera_names=[
@@ -81,6 +81,18 @@ class RoboCasaEnvWrapper:
         self._success = False
         self._reward  = 0.0
 
+        import json
+        self._action_q01 = None
+        self._action_q99 = None
+        self._action_range = None
+        if hasattr(cfg, 'action_stats_path') and cfg.action_stats_path:
+            with open(cfg.action_stats_path) as f:
+                stats = json.load(f)
+            self._action_q01 = np.array(stats['q01'], dtype=np.float32)
+            self._action_q99 = np.array(stats['q99'], dtype=np.float32)
+            self._action_range = self._action_q99 - self._action_q01
+            print(f"Loaded action stats from {cfg.action_stats_path}")
+
         logging.info(f"RoboCasaEnvWrapper: {self.task_name} ({self._env_usage})")
 
     def reset(self):
@@ -93,6 +105,9 @@ class RoboCasaEnvWrapper:
             self._episode_count += 1
 
         obs = self._env.reset()
+        # Read dynamic language instruction from env
+        if hasattr(self._env, '_ep_meta') and self._env._ep_meta.get('lang'):
+            self.task_description = self._env._ep_meta['lang']
         self._obs     = self._parse_obs(obs)
         self._done    = False
         self._success = False
@@ -101,7 +116,16 @@ class RoboCasaEnvWrapper:
 
     def step(self, action):
         action = np.array(action, dtype=np.float32)
-        obs, reward, done, info = self._env.step(action)
+        # Exact affine mapping from pi0.5 output distribution to [-1, 1]
+        if self._action_q01 is not None:
+            action = (action - self._action_q01) / self._action_range * 2 - 1
+            action = np.clip(action, -1, 1)
+        # π₀.₅ produces 7D actions [eef(6) + gripper(1)].
+        # PandaOmron expects 12D: [right(6), right_gripper(1), base(3), torso(1)].
+        # Fix base and torso to 0 for tasks where the mobile base stays still.
+        action_12d = np.zeros(12, dtype=np.float32)
+        action_12d[:min(7, len(action))] = action[:7]
+        obs, reward, done, info = self._env.step(action_12d)
 
         if self._video_dir is not None:
             frame = obs.get("robot0_agentview_left_image")
@@ -149,9 +173,9 @@ class RoboCasaEnvWrapper:
         rgb_base  = np.flipud(obs["robot0_agentview_left_image"]).astype(np.uint8)
         rgb_wrist = np.flipud(obs["robot0_eye_in_hand_image"]).astype(np.uint8)
 
-        # State
-        eef_pos  = obs["robot0_eef_pos"].astype(np.float32)   # (3,)
-        eef_quat = obs["robot0_eef_quat"].astype(np.float32)  # (4,) xyzw
+        # State — use base-relative EEF to match LeRobot dataset convention
+        eef_pos  = obs["robot0_base_to_eef_pos"].astype(np.float32)   # (3,) relative to base
+        eef_quat = obs["robot0_base_to_eef_quat"].astype(np.float32)  # (4,) xyzw relative to base
 
         if state_obs_key == 'observation/cartesian_position':
             euler = Rotation.from_quat(eef_quat).as_euler("xyz", degrees=False)

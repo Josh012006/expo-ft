@@ -134,7 +134,13 @@ class ManiSkillEnvWrapper:
             return t.cpu().numpy() if hasattr(t, 'cpu') else np.array(t)
 
         rgb_base  = to_np(obs['sensor_data']['base_camera']['rgb'])[0]   # (H, W, 3)
-        rgb_wrist = to_np(obs['sensor_data']['hand_camera']['rgb'])[0]   # (H, W, 3)
+        if 'hand_camera' in obs['sensor_data']:
+            rgb_wrist = to_np(obs['sensor_data']['hand_camera']['rgb'])[0]   # (H, W, 3)
+        else:
+            # No wrist camera available for this task (e.g. PushCube) — use a near-black image.
+            # (one pixel set to 1 to satisfy the uint8 sanity check downstream: max > 1)
+            rgb_wrist = np.zeros_like(rgb_base)
+            rgb_wrist[0, 0] = 2
         tcp_pose  = to_np(obs['extra']['tcp_pose'])[0]                   # (7,)
         qpos      = to_np(obs['agent']['qpos'])[0]                       # (9,)
 

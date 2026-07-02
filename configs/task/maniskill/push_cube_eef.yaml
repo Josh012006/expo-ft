@@ -1,0 +1,81 @@
+# configs/task/maniskill/maniskill_stack_cube.yaml
+
+# ── Environment ────────────────────────────────────────────────
+env_id: "PushCube-v1"
+language_instruction: "push the cube to the target region"
+control_hz: 10
+max_episode_steps: 100
+env_type: "sim"  # "sim" for simulation, "droid" for real robot
+env_wrapper: "maniskill"  # "maniskill" ou "droid" (real robot)
+sim_backend: "physx_cuda"
+
+# Control mode config
+control_mode: "pd_ee_delta_pose"
+normalize_action: false
+use_cartesian_state: true
+output_action_dim: 7
+
+# Observation config
+state_obs_key: "observation/cartesian_position"
+state_obs_dim: 6
+
+# Normalization
+action_stats_path: "assets/action_stats_pushcube_baseline.json"
+
+# ── Data ───────────────────────────────────────────────────────
+lerobot_repo_id: "expo_ft/push_cube_eef"
+droid_format_dir: "demos/PushCube-v1/droid_format_eef"
+action_space: "cartesian_velocity" # Action space keys for DROID format reader
+gripper_action_space: "gripper_velocity"
+num_data: 0  # max number of offline demo episodes to load (0 = all)
+# Skip RepackTransform in replay buffer — our observations already have the
+# correct keys for DroidInputs (observation/cartesian_position, etc.)
+skip_repack_transforms: true
+camera_width: 128
+camera_height: 128
+
+# ── Run / Logging ──────────────────────────────────────────────
+project_name: "expo-ft"
+run_name: "push_cube_expo_ft"
+output_dir: "logs/push_cube"  # a timestamped subdir is created automatically per run
+resume_dir: "logs/push_cube/push_cube_expo_ft_2026-06-30_03-35-07"  # path to an existing run to resume, e.g. "logs/stack_cube/2026-06-23_10-00-00"
+
+# ── Algorithm ──────────────────────────────────────────────────
+model_cls: "EXPOLearner"  # "EXPOLearner" for RL, "BCLearner" for SFT-only
+seed: 42
+max_episodes: 1000
+max_steps_per_episode: 100
+batch_size: 64             # number of transitions sampled from replay buffer per gradient update
+utd_ratio: 20              # gradient updates performed per new transition collected
+offline_ratio: 0.0         # fraction of batch from offline demo buffer (0 = demos inserted into online buffer)
+update_type: "episode"     # when to trigger updates: "episode", "step", or "batch"
+num_updates: 1             # number of gradient updates per trigger
+num_batch: 1               # number of episodes to accumulate before updating (only used when update_type="batch")
+replan_steps: 8            # number of actions to execute from each action chunk before replanning (action_horizon=16)
+fsdp_devices: 1            # number of GPUs for FSDP sharding (1 = single GPU, no sharding)
+
+# ── Checkpointing ──────────────────────────────────────────────
+checkpoint_model: true
+checkpoint_interval: 100  # save checkpoint every N steps (0 = only save at end)
+checkpoint_buffer: false   # save replay buffer transitions to disk at each step
+keep_period: 10000         # keep one checkpoint every N steps (older ones are deleted)
+
+# ── SFT warmup ─────────────────────────────────────────────────
+sft_exp_name: "push_cube_sft"
+sft_num_workers: 12
+sft_num_train_steps: 20000
+sft_batch_size: 64
+sft_use_lora: true         # use LoRA fine-tuning (faster, less memory than full fine-tune)
+sft_peak_lr: 2.5e-5
+sft_save_interval: 200
+sft_log_interval: 100
+sft_resume: true
+
+# ── RL hyperparameters (EXPOLearner) ───────────────────────────
+rl_lr: 3e-4                # learning rate for critic and edit policy
+rl_discount: 0.99          # discount factor gamma for Bellman backup
+rl_tau: 0.005              # polyak averaging coefficient for target network soft update
+rl_alpha: 0.1              # entropy temperature (controls exploration vs exploitation)
+rl_hidden_dims: [256, 256] # hidden layer sizes for critic and edit policy MLPs
+rl_edit_action_scale: 0.05 # max magnitude of residual action added by edit policy
+actor_success_only: false  # if true, actor batch is sampled only from successful transitions
