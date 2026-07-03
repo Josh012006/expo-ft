@@ -57,7 +57,13 @@ class ManiSkillEnvWrapper:
         logging.info(f"ManiSkillEnvWrapper: created {cfg.env_id} ({self._env_usage})")
 
     def reset(self, **reset_kwargs):
-        """Reset the environment and return observation."""
+        """Reset the environment and return observation.
+
+        reset_kwargs are forwarded to the underlying ManiSkill env's reset() —
+        e.g. seed=..., options=... — to allow reproducing a specific recorded
+        episode exactly. Defaults to no kwargs (existing random-reset behavior
+        for eval/RL is unchanged).
+        """
         # Save previous episode video if any
         if self._video_dir is not None and len(self._frames) > 0:
             path = os.path.join(self._video_dir, f"episode_{self._episode_count}.mp4")
@@ -110,6 +116,13 @@ class ManiSkillEnvWrapper:
         """
         mask = 1.0 - float(self._done)
         return self._done, self._success, self._reward, mask
+
+    def get_raw_info(self):
+        """Return the full raw info dict from the last step() call — e.g.
+        is_obj_placed, is_robot_static, is_grasped for tasks that expose them.
+        Purely additive/diagnostic: does not affect get_info_for_step() or the
+        success value used anywhere else in the pipeline."""
+        return dict(self._info) if self._info is not None else {}
 
     def _parse_obs(self, obs):
         """

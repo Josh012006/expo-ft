@@ -24,7 +24,26 @@ from tqdm import tqdm
 from expo_ft.utils.config_loader import load_task_config, get_sft_config_name
 from expo_ft.env.env_factory import make_env_wrapper
 
-def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_action_stats=False):
+def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_action_stats=False,
+             episode_seeds=None, output_json=None, diagnose_subconditions=False):
+    """
+    episode_seeds: optional list[int] of length n_episodes. When provided, env.reset()
+    is called with seed=episode_seeds[ep] for each episode — guarantees the SAME initial
+    conditions (object/goal positions) across different checkpoints, for a fair
+    apples-to-apples comparison. When None, falls back to unseeded random resets
+    (existing behavior, unchanged).
+
+    diagnose_subconditions: purely additive diagnostic, does NOT change success_rate
+    or any reported metric. When True, at every step also reads env.get_raw_info()
+    and tracks, per episode, whether each boolean sub-condition of a composite
+    success criterion (e.g. PickCube-v1's is_obj_placed / is_robot_static) was ever
+    True, and whether they were ever True AT THE SAME STEP. Printed as a summary at
+    the end, alongside (not instead of) the normal success_rate report.
+    """
+    if episode_seeds is not None and len(episode_seeds) != n_episodes:
+        raise ValueError(
+            f"episode_seeds has {len(episode_seeds)} entries but n_episodes={n_episodes}"
+        )
     import jax
     import numpy as np
     import openpi.training.sharding as openpi_sharding
@@ -44,7 +63,8 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
         mesh, jax.sharding.PartitionSpec()
     )
 
-    # Load a few demo transitions to get example_action and init replay buffer
+    # Synthetic transition (shapes/dtypes only, from cfg) — no dataset on disk needed.
+    # Eval never reads real demo content: env.reset()/get_observation() drive the rollout.
     dataset = make_dummy_transition(cfg)
     example_action = dataset[0]['actions'][np.newaxis]
 
@@ -68,19 +88,31 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
     spec.loader.exec_module(mod)
     model_config = mod.get_config()
 
-    # AssetsConfig DROID already baked-in
+    # Override config dynamically from task YAML — no hardcoded values
     sft_config_name = get_sft_config_name(cfg)
     model_config.pi05_config_name  = sft_config_name
     model_config.skip_repack_transforms = cfg.skip_repack_transforms
 
-    if checkpoint_path is not None:
-    	model_config.pi05_weight_loader_path = str(Path(checkpoint_path) / "params")
-    	print(f"Loaded checkpoint from: {checkpoint_path}")
-    else:
-    	model_config.pi05_weight_loader_path = None
-    	print("Using base π₀.₅ weights (no checkpoint) — pi05_droid_jointpos + DROID norm_stats")
+    # IMPORTANT : ne PAS fixer pi05_assets_dir / pi05_asset_id ici.
+    # La config openpi "expo_pi05_droid_lora_finetune_sft_joint_state" porte déjà
+    # assets=AssetsConfig(assets_dir="gs://openpi-assets/checkpoints/pi05_droid_jointpos/assets",
+    #                      asset_id="droid")
+    # bakée en dur dans training/config.py. Le SFT (run_pipeline.py stage_sft) n'override
+    # jamais ce champ via CLI, donc l'entraînement lui-même a normalisé/dénormalisé avec
+    # ces stats DROID officielles — pas avec compute_norm_stats.py sur nos démos locales.
+    # En laissant ces deux champs vides ici, build_pi05_config() retombe sur l'AssetsConfig
+    # bakée, ce qui garde l'eval cohérente avec l'entraînement, que checkpoint_path soit
+    # fourni (SFT) ou non (baseline pi05_droid_jointpos pur).
 
-    # Build π₀.₅ (unnormalize is True)
+    # Load SFT checkpoint if provided
+    if checkpoint_path is not None:
+        model_config.pi05_weight_loader_path = str(Path(checkpoint_path) / "params")
+        print(f"Loaded checkpoint from: {checkpoint_path}")
+    else:
+        model_config.pi05_weight_loader_path = None
+        print("Using base π₀.₅ weights (no checkpoint) — pi05_droid_jointpos + DROID norm_stats")
+
+    # Build π₀.₅ (unnormalize est à True par défaut ici, ce qui est correct pour le SFT)
     actor, actor_train_state, target_actor_params, agent_kwargs, vla_metadata = build_pi05(
         model_config, seed, mesh, data_sharding, replicated_sharding,
         resume=False,
@@ -139,14 +171,20 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
 
     # Evaluation loop
     successes = []
+    subcond_summaries = []  # only populated if diagnose_subconditions=True
     all_actions = []  # collect raw actions for distribution analysis
     episode_lengths = []
 
     for ep in tqdm(range(n_episodes), desc="Evaluating"):
-        obs = env.reset()
+        if episode_seeds is not None:
+            obs = env.reset(seed=int(episode_seeds[ep]))
+        else:
+            obs = env.reset()
         done = False
         steps = 0
         success = False
+        ep_subcond = {}  # key -> bool, "ever True this episode" (diagnostic only)
+        ep_subcond_together = False  # is_obj_placed AND is_robot_static ever True at the SAME step
         from collections import deque
         action_plan = deque()
 
@@ -174,10 +212,23 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
                 print(f"step {steps}: actionToSend={action[:action_dim]}, state={obs.get(state_obs_key, np.zeros(3))[:3]}")
 
             done, success, _, _ = env.get_info_for_step()
+            if diagnose_subconditions:
+                raw = env.get_raw_info()
+                step_vals = {}
+                for k, v in raw.items():
+                    try:
+                        step_vals[k] = bool(v.item()) if hasattr(v, "item") else bool(v)
+                    except (ValueError, TypeError):
+                        continue  # not a scalar bool-like field
+                    ep_subcond[k] = ep_subcond.get(k, False) or step_vals[k]
+                if step_vals.get("is_obj_placed") and step_vals.get("is_robot_static"):
+                    ep_subcond_together = True
             obs = env.get_observation()
             steps += 1
 
         successes.append(float(success))
+        if diagnose_subconditions:
+            subcond_summaries.append({"ever": dict(ep_subcond), "ever_together": ep_subcond_together})
         episode_lengths.append(steps)
 
     env.close()
@@ -190,6 +241,19 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
     print(f"Success rate: {success_rate:.1%} ({int(sum(successes))}/{n_episodes})")
     print(f"Avg length:   {avg_length:.1f} steps")
     print(f"{'='*40}")
+
+    if diagnose_subconditions and subcond_summaries:
+        keys = sorted({k for s in subcond_summaries for k in s["ever"].keys()})
+        print("\n--- SUB-CONDITION DIAGNOSTIC (does not affect success_rate above) ---")
+        for k in keys:
+            ever_rate = np.mean([s["ever"].get(k, False) for s in subcond_summaries])
+            print(f"  {k:20s} ever True: {ever_rate:.1%} ({sum(s['ever'].get(k, False) for s in subcond_summaries)}/{n_episodes} episodes)")
+        together_rate = np.mean([s["ever_together"] for s in subcond_summaries])
+        print(f"  {'is_obj_placed & is_robot_static (SAME step)':45s}: {together_rate:.1%} "
+              f"({sum(s['ever_together'] for s in subcond_summaries)}/{n_episodes} episodes)")
+        print("If 'ever True' is high for each condition individually but the 'SAME step' "
+              "rate is much lower, the arm is reaching the goal and later settling, just "
+              "not simultaneously — a stability/timing gap, not a failure to complete the task.")
 
     # Correction du crash de fin de fichier
     if all_actions and collect_action_stats:
@@ -206,6 +270,21 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
         print("\n--- COLLECTED ACTION STATS FROM INFERENCE ---")
         print(json.dumps(stats, indent=2))
 
+    if output_json is not None:
+        result = {
+            "checkpoint": str(checkpoint_path) if checkpoint_path is not None else None,
+            "n_episodes": n_episodes,
+            "success_rate": success_rate,
+            "avg_length": avg_length,
+            "successes": successes,
+            "episode_lengths": episode_lengths,
+            "used_fixed_episode_seeds": episode_seeds is not None,
+        }
+        Path(output_json).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_json, "w") as f:
+            json.dump(result, f, indent=2)
+        print(f"Wrote results to: {output_json}")
+
     return success_rate
 
 if __name__ == "__main__":
@@ -214,19 +293,58 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", default=None, help="Path to SFT directory checkpoint")
     parser.add_argument("--n-episodes", type=int, default=50)
     parser.add_argument("--seed",       type=int, default=42)
+    parser.add_argument(
+        "--episode-seeds", default=None,
+        help="Path to a JSON file containing a list of N per-episode seeds. When given, "
+             "overrides --n-episodes to match the list length, and every episode is reset "
+             "with its fixed seed instead of a random one — use this to compare multiple "
+             "checkpoints on the EXACT same episodes (see scripts/eval_curve.py).",
+    )
+    parser.add_argument(
+        "--output-json", default=None,
+        help="Path to write a structured JSON result (success_rate, per-episode outcomes, "
+             "etc). Used by scripts/eval_curve.py to aggregate across checkpoints.",
+    )
+    parser.add_argument(
+        "--no-video", action="store_true",
+        help="Skip saving rollout videos. Useful for large checkpoint sweeps where "
+             "hundreds of videos would otherwise be written.",
+    )
+    parser.add_argument(
+        "--diagnose-subconditions", action="store_true",
+        help="Purely additive diagnostic — does not change success_rate. At every "
+             "step, also reads the env's raw info dict and reports, per episode, "
+             "whether each sub-condition of a composite success criterion (e.g. "
+             "PickCube-v1's is_obj_placed / is_robot_static) was ever True, and "
+             "whether they were ever True at the SAME step.",
+    )
     args = parser.parse_args()
 
     cfg = load_task_config(args.config)
 
+    episode_seeds = None
+    n_episodes = args.n_episodes
+    if args.episode_seeds is not None:
+        with open(args.episode_seeds) as f:
+            episode_seeds = json.load(f)
+        n_episodes = len(episode_seeds)
+        print(f"Loaded {n_episodes} fixed episode seeds from: {args.episode_seeds}")
+
     mode = "sft" if args.checkpoint is not None else "baseline"
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    video_dir = str(REPO_ROOT / "logs" / "eval_videos" / f"eval_{cfg.env_id}_{mode}_{timestamp}")
+    if args.no_video:
+        video_dir = None
+    else:
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        video_dir = str(REPO_ROOT / "logs" / "eval_videos" / f"eval_{cfg.env_id}_{mode}_{timestamp}")
 
     evaluate(
-        cfg=cfg, 
-        checkpoint_path=args.checkpoint, 
-        n_episodes=args.n_episodes, 
-        seed=args.seed, 
+        cfg=cfg,
+        checkpoint_path=args.checkpoint,
+        n_episodes=n_episodes,
+        seed=args.seed,
         video_dir=video_dir,
-        collect_action_stats=True
+        collect_action_stats=True,
+        episode_seeds=episode_seeds,
+        output_json=args.output_json,
+        diagnose_subconditions=args.diagnose_subconditions,
     )

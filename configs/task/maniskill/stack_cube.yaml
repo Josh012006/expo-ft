@@ -42,7 +42,7 @@ resume_dir: null # "logs/stack_cube/stack_cube_expo_ft_2026-06-28_03-12-27"  # p
 model_cls: "EXPOLearner"  # "EXPOLearner" for RL, "BCLearner" for SFT-only
 seed: 42
 max_episodes: 1000
-max_steps_per_episode: 100
+max_steps_per_episode: 120
 batch_size: 64             # number of transitions sampled from replay buffer per gradient update
 utd_ratio: 20              # gradient updates performed per new transition collected
 offline_ratio: 0.0         # fraction of batch from offline demo buffer (0 = demos inserted into online buffer)
@@ -61,7 +61,7 @@ keep_period: 10000         # keep one checkpoint every N steps (older ones are d
 # ── SFT warmup ─────────────────────────────────────────────────
 sft_exp_name: "stack_cube_sft"
 sft_num_workers: 12
-sft_num_train_steps: 40000
+sft_num_train_steps: 4000
 sft_batch_size: 64
 sft_use_lora: true         # use LoRA fine-tuning (faster, less memory than full fine-tune)
 sft_peak_lr: 2.5e-5
