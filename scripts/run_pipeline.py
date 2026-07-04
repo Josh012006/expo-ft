@@ -142,35 +142,29 @@ def stage_sft(cfg, args, run_dir):
 
 
 def stage_rl(cfg, args, run_dir, resuming):
-    """RL training with EXPOLearner."""
+    """RL training with EXPOLearner.
 
-    num_data = args.num_demos if getattr(args, "num_demos", None) is not None else cfg.num_data
-
+    train_pi_robo.py loads the SAME task YAML itself (cfg = load_task_config(
+    FLAGS.task_config)) and reads seed/max_steps/batch_size/checkpoint settings/
+    output_dir/resume_dir/dataset paths/etc. directly from there — it does NOT
+    expose these as separate CLI flags (unlike stage_sft's openpi train.py,
+    which is tyro-based and does want everything via CLI). Only pass what
+    train_pi_robo.py actually defines: --config, --task_config, --fsdp_devices,
+    --num_data, plus ml_collections --config.<field>= overrides (these work
+    without an explicit flags.DEFINE, via config_flags.DEFINE_config_file).
+    run_dir/resuming are accepted for signature consistency with the other
+    stages but unused here — train_pi_robo.py resolves its own run directory
+    from cfg.output_dir/cfg.resume_dir independently.
+    """
     cmd = [
         "python", str(TRAIN_PI_ROBO),
-        f"--config=configs/model/expo_ft_pi_config.py",
+        "--config=configs/model/expo_ft_pi_config.py",
         f"--task_config={args.config}",
-        f"--output_dir={run_dir}",
-        f"--seed={cfg.seed}",
-        f"--max_steps={cfg.max_steps}",
-        f"--batch_size={cfg.batch_size}",
-        f"--utd_ratio={cfg.utd_ratio}",
-        f"--offline_ratio={cfg.offline_ratio}",
-        f"--update_type={cfg.update_type}",
-        f"--num_updates={cfg.num_updates}",
-        f"--num_batch={cfg.num_batch}",
-        f"--replan_steps={cfg.replan_steps}",
         f"--fsdp_devices={cfg.fsdp_devices}",
-        f"--checkpoint_model={cfg.checkpoint_model}",
-        f"--checkpoint_interval={cfg.checkpoint_interval}",
-        f"--checkpoint_buffer={cfg.checkpoint_buffer}",
-        f"--keep_period={cfg.keep_period}",
-        f"--dataset_path={cfg.droid_format_dir}",
-        f"--num_data={num_data}",
-        f"--project_name={cfg.project_name}",
-        f"--run_name={cfg.run_name}",
-        f"--resume={resuming}",
     ]
+
+    if getattr(args, "num_demos", None) is not None:
+        cmd.append(f"--num_data={args.num_demos}")
 
     if getattr(args, "sft_checkpoint", None) is not None:
         cmd.append(f"--config.pi05_weight_loader_path={Path(args.sft_checkpoint) / 'params'}")
@@ -185,12 +179,16 @@ def main():
     parser.add_argument(
         "--num-demos", type=int, default=None,
         help="Limit SFT to the first N episodes of the LeRobot dataset (only affects "
-             "--stage sft/all). Omit to use every episode in the dataset.",
+             "--stage sft/all). Also limits the RL offline replay buffer's demo count "
+             "(--stage rl/all). Omit to use every episode/demo available.",
     )
     parser.add_argument(
         "--sft-checkpoint", default=None,
-        help="Path to the SFT checkpoint directory to initialize RL from. "
-             "Omit to use the config's default (base pretrained checkpoint, NOT SFT).",
+        help="Path to the SFT checkpoint directory to initialize RL from "
+             "(e.g. logs/stack_cube/<run>/sft/<config_name>/<exp_name>/1400). "
+             "Omit to use the config's default weight loader (base pretrained "
+             "checkpoint, NOT SFT-finetuned — only appropriate if you deliberately "
+             "want to skip SFT, e.g. for the SFT-warmup-necessity ablation).",
     )
     args = parser.parse_args()
 

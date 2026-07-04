@@ -35,8 +35,8 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_boolean("tqdm", True, "Use tqdm progress bar.")
 flags.DEFINE_integer("fsdp_devices", 1, "Number of FSDP devices for sharding.")
-flags.DEFINE_string("task_config", "configs/task/maniskill/stack_cube.yaml", "Path to task YAML config.")
 flags.DEFINE_integer("num_data", 0, "Max number of offline demo episodes to load into the replay buffer (0 = use all available).")
+flags.DEFINE_string("task_config", "configs/task/stack_cube.yaml", "Path to task YAML config.")
 
 config_flags.DEFINE_config_file(
     "config",
@@ -54,6 +54,9 @@ def main(_):
     from expo_ft.utils.config_loader import get_sft_config_name
     FLAGS.config.pi05_config_name = get_sft_config_name(cfg)
     FLAGS.config.skip_repack_transforms = cfg.skip_repack_transforms
+    # AssetsConfig DROID officielle deja bakee dans la config openpi nommee ci-dessus —
+    # ne pas l'ecraser ici (meme bug corrige dans eval_policy.py : le SFT a ete
+    # entraine avec ces stats officielles, pas des stats locales par repo_id).
     run_dir, resuming = resolve_run_dir(cfg)
 
     assert 0.0 <= cfg.offline_ratio <= 1.0
@@ -89,7 +92,11 @@ def main(_):
     checkpoint_manager, resuming = initialize_checkpoint_dir(
         checkpoint_dir_path,
         keep_period=cfg.keep_period,
-        overwrite=False,
+        # A fresh run gets its own brand-new timestamped directory (see
+        # resolve_run_dir) — safe to "overwrite" since it's empty. Only skip
+        # this when we're genuinely resuming (cfg.resume_dir set), so we never
+        # risk wiping real checkpoints being resumed into.
+        overwrite=not resuming,
         resume=resuming,
     )
 
