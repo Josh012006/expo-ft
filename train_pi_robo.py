@@ -35,7 +35,8 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_boolean("tqdm", True, "Use tqdm progress bar.")
 flags.DEFINE_integer("fsdp_devices", 1, "Number of FSDP devices for sharding.")
-flags.DEFINE_string("task_config", "configs/task/stack_cube.yaml", "Path to task YAML config.")
+flags.DEFINE_string("task_config", "configs/task/maniskill/stack_cube.yaml", "Path to task YAML config.")
+flags.DEFINE_integer("num_data", 0, "Max number of offline demo episodes to load into the replay buffer (0 = use all available).")
 
 config_flags.DEFINE_config_file(
     "config",
@@ -52,8 +53,6 @@ def main(_):
     # Override pi05_config_name dynamically from task config
     from expo_ft.utils.config_loader import get_sft_config_name
     FLAGS.config.pi05_config_name = get_sft_config_name(cfg)
-    FLAGS.config.pi05_assets_dir = str(Path(__file__).parent / "assets" / get_sft_config_name(cfg))
-    FLAGS.config.pi05_asset_id = cfg.lerobot_repo_id
     FLAGS.config.skip_repack_transforms = cfg.skip_repack_transforms
     run_dir, resuming = resolve_run_dir(cfg)
 
@@ -101,7 +100,7 @@ def main(_):
         dataset = process_droid_dataset(
             cfg.droid_format_dir,
             cfg,
-            num_data=cfg.num_data if cfg.num_data > 0 else None,
+            num_data=FLAGS.num_data if FLAGS.num_data > 0 else None,
         )
         example_action = dataset[0]['actions'][np.newaxis]
     else:

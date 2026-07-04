@@ -144,12 +144,13 @@ def stage_sft(cfg, args, run_dir):
 def stage_rl(cfg, args, run_dir, resuming):
     """RL training with EXPOLearner."""
 
+    num_data = args.num_demos if getattr(args, "num_demos", None) is not None else cfg.num_data
+
     cmd = [
         "python", str(TRAIN_PI_ROBO),
         f"--config=configs/model/expo_ft_pi_config.py",
-        f"--config_task={args.config}",
+        f"--task_config={args.config}",
         f"--output_dir={run_dir}",
-        f"--run_name=rl",
         f"--seed={cfg.seed}",
         f"--max_steps={cfg.max_steps}",
         f"--batch_size={cfg.batch_size}",
@@ -165,11 +166,15 @@ def stage_rl(cfg, args, run_dir, resuming):
         f"--checkpoint_buffer={cfg.checkpoint_buffer}",
         f"--keep_period={cfg.keep_period}",
         f"--dataset_path={cfg.droid_format_dir}",
-        f"--num_data={cfg.num_data}",
+        f"--num_data={num_data}",
         f"--project_name={cfg.project_name}",
         f"--run_name={cfg.run_name}",
         f"--resume={resuming}",
     ]
+
+    if getattr(args, "sft_checkpoint", None) is not None:
+        cmd.append(f"--config.pi05_weight_loader_path={Path(args.sft_checkpoint) / 'params'}")
+
     run(cmd)
 
 
@@ -181,6 +186,11 @@ def main():
         "--num-demos", type=int, default=None,
         help="Limit SFT to the first N episodes of the LeRobot dataset (only affects "
              "--stage sft/all). Omit to use every episode in the dataset.",
+    )
+    parser.add_argument(
+        "--sft-checkpoint", default=None,
+        help="Path to the SFT checkpoint directory to initialize RL from. "
+             "Omit to use the config's default (base pretrained checkpoint, NOT SFT).",
     )
     args = parser.parse_args()
 
