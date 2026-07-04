@@ -9,6 +9,7 @@ import os
 
 import gymnasium as gym
 import mani_skill.envs  # noqa: F401
+from mani_skill.utils.visualization.misc import tile_images
 
 
 class ManiSkillEnvWrapper:
@@ -91,10 +92,16 @@ class ManiSkillEnvWrapper:
         action = np.array(action, dtype=np.float32)
         obs, reward, terminated, truncated, info = self._env.step(action)
         if self._video_dir is not None:
-            frame = obs['sensor_data']['base_camera']['rgb']
-            if hasattr(frame, 'cpu'):
-                frame = frame.cpu().numpy()
-            self._frames.append(np.array(frame[0]).astype(np.uint8))
+            # Tile every available sensor camera side by side (e.g. base_camera +
+            # hand_camera when present) instead of only showing base_camera.
+            cam_frames = []
+            for cam_name in sorted(obs['sensor_data'].keys()):
+                frame = obs['sensor_data'][cam_name]['rgb']
+                if hasattr(frame, 'cpu'):
+                    frame = frame.cpu().numpy()
+                cam_frames.append(np.array(frame[0]).astype(np.uint8))
+            tiled = tile_images(cam_frames) if len(cam_frames) > 1 else cam_frames[0]
+            self._frames.append(tiled)
         self._obs = self._parse_obs(obs)
         self._reward = float(reward.item() if hasattr(reward, 'item') else reward)
         self._done = bool((terminated | truncated).item()

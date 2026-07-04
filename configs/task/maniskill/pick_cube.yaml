@@ -2,7 +2,7 @@
 
 # ── Environment ────────────────────────────────────────────────
 env_id: "PickCube-v1"
-language_instruction: "pick up the cube"
+language_instruction: "pick up the red cube and bring it to the green point"
 control_hz: 10
 max_episode_steps: 120
 env_type: "sim"

@@ -104,10 +104,23 @@ def rebuild_curve(results_dir: Path, curve_json_path: Path, curve_png_path: Path
             data = json.load(f)
         label = result_path.stem
         step = 0 if label == "base" else int(label)
+
+        # Standard error of a proportion (successes are 0/1 per episode):
+        # SE = sqrt(p*(1-p)/n). Computed from the per-episode successes already
+        # saved by eval_policy.py — no need to re-run anything.
+        successes = data.get("successes")
+        if successes:
+            n = len(successes)
+            p = data["success_rate"]
+            se = float(np.sqrt(p * (1 - p) / n)) if n > 0 else 0.0
+        else:
+            se = None  # older result files saved before "successes" was recorded
+
         entries.append({
             "label": label,
             "step": step,
             "success_rate": data["success_rate"],
+            "success_se": se,
             "n_episodes": data["n_episodes"],
         })
     entries.sort(key=lambda e: e["step"])
@@ -124,19 +137,25 @@ def rebuild_curve(results_dir: Path, curve_json_path: Path, curve_png_path: Path
 
     steps = [e["step"] for e in entries]
     rates = [e["success_rate"] * 100 for e in entries]
+    # yerr in percentage points; 0 for any entry missing successes (no visible bar).
+    errs = [(e["success_se"] * 100 if e["success_se"] is not None else 0.0) for e in entries]
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
-    ax.plot(steps, rates, marker="o", linewidth=2)
+    ax.errorbar(
+        steps, rates, yerr=errs, marker="o", linewidth=2,
+        capsize=4, elinewidth=1, ecolor="gray", alpha=0.9,
+    )
     ax.set_xlabel("SFT training iteration (0 = base model)")
-    ax.set_ylabel("Success rate (%)")
+    ax.set_ylabel("Success rate (%)  \u00b1 1 SE")
     ax.set_title(f"Eval success rate vs. checkpoint — {task_label}")
     ax.set_ylim(-2, 102)
     ax.grid(True, alpha=0.3)
     for s, r in zip(steps, rates):
-        ax.annotate(f"{r:.0f}%", (s, r), textcoords="offset points", xytext=(0, 8), ha="center", fontsize=8)
+        ax.annotate(f"{r:.0f}%", (s, r), textcoords="offset points", xytext=(0, 10), ha="center", fontsize=8)
     fig.tight_layout()
     fig.savefig(curve_png_path, dpi=150)
     plt.close(fig)
+
 
     return entries
 

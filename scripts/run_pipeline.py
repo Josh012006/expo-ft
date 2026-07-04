@@ -40,15 +40,6 @@ def run(cmd: list[str], **kwargs):
         sys.exit(result.returncode)
 
 
-def stage_norm_stats(cfg, args):
-    """Compute normalization statistics for the LeRobot dataset."""
-    run([
-        "uv", "run",
-        str(OPENPI_SCRIPTS / "compute_norm_stats.py"),
-        "--config-name", get_sft_config_name(cfg),
-        "--repo-id", cfg.lerobot_repo_id,
-    ])
-
 def stage_demos(cfg, args):
     """Generate ManiSkill demos, replay-validate them in the task's control mode,
     then convert to droid_format (RL offline buffer) and LeRobot (SFT trainer)."""
@@ -57,8 +48,8 @@ def stage_demos(cfg, args):
 
     # 1. Generate raw mplib demos (native pd_joint_pos), keep only successful ones.
     #    Forced to physx_cpu (not cfg.sim_backend) to match step 2, which is hard-locked
-    #    to CPU regardless (control mode conversion isn't supported on GPU) — keeps the
-    #    whole demo-prep pipeline on one consistent backend, no mid-pipeline switch.
+    #    to CPU regardless (control mode conversion isn't supported on GPU) — this keeps
+    #    the whole demo-prep pipeline on one consistent backend, no mid-pipeline switch.
     run([
         "python", "-m", "mani_skill.examples.motionplanning.panda.run",
         "-e", cfg.env_id, "-n", str(n_demos), "--only-count-success",
@@ -68,16 +59,20 @@ def stage_demos(cfg, args):
 
     # 2. Replay into RGB + the task's control mode. This IS the validity check —
     #    the printed "X/N=XX% demos saved" at the end is the demo success rate.
-    #    - control mode conversion is not supported on GPU -> forced physx_cpu.
-    #    - --use-env-states is INCOMPATIBLE with control mode conversion (ManiSkill
-    #      asserts on this) -> must be omitted here.
+    #    NOTE: two GOTCHAS here, both hard requirements of ManiSkill's replay tool:
+    #    (a) control mode conversion (native pd_joint_pos -> cfg.control_mode) is not
+    #        supported on GPU-parallelized backends -> must force physx_cpu.
+    #    (b) --use-env-states is INCOMPATIBLE with control mode conversion (ManiSkill
+    #        asserts on this) since converting modes changes how many actions are
+    #        needed for the same states, so state teleportation is meaningless here.
+    #        Conversion instead genuinely re-simulates forward on CPU via
+    #        action_conversion.from_pd_joint_pos — the resulting demos are real
+    #        physx_cpu dynamics, not GPU-teleported states.
     run([
         "python", "-m", "mani_skill.trajectory.replay_trajectory",
         "--traj-path", str(raw_h5), "--save-traj",
         "-o", "rgb", "-c", cfg.control_mode, "-b", "physx_cpu",
     ])
-    # replay_trajectory writes its output in the SAME directory as --traj-path,
-    # not a separate "rl" subfolder.
     rgb_h5 = raw_h5.parent / f"trajectory.rgb.{cfg.control_mode}.physx_cpu.h5"
 
     # 3. droid_format (used by stage_rl's offline buffer)
@@ -99,15 +94,33 @@ def stage_demos(cfg, args):
     # get_sft_config_name(cfg) resolves to a config WITHOUT that baked override.
 
 
+def stage_norm_stats(cfg, args):
+    """Compute normalization statistics for the LeRobot dataset."""
+    run([
+        "uv", "run",
+        str(OPENPI_SCRIPTS / "compute_norm_stats.py"),
+        "--config-name", get_sft_config_name(cfg),
+        "--repo-id", cfg.lerobot_repo_id,
+    ])
+
+
 def stage_sft(cfg, args, run_dir):
     """SFT warmup — fine-tune π₀.₅ on the demo dataset."""
     sft_output = os.path.join(run_dir, "sft")
+
+    # --num-demos on the CLI overrides how many episodes of the LeRobot dataset
+    # are used, without touching the dataset on disk or the YAML config. Auto
+    # -namespace the exp_name so a limited-demo run never collides with (or
+    # overwrites) the full-dataset run's checkpoints. Omitted -> use everything.
+    sft_exp_name = cfg.sft_exp_name
+    if getattr(args, "num_demos", None) is not None:
+        sft_exp_name = f"{cfg.sft_exp_name}_demos{args.num_demos}"
 
     cmd = [
         "uv", "run",
         str(OPENPI_SCRIPTS / "train.py"),
         get_sft_config_name(cfg),
-        "--exp-name", cfg.sft_exp_name,
+        "--exp-name", sft_exp_name,
         "--data.repo-id", cfg.lerobot_repo_id,
         "--assets-base-dir", "./assets",
         "--checkpoint-base-dir", sft_output,
@@ -118,6 +131,9 @@ def stage_sft(cfg, args, run_dir):
         f"--log-interval={cfg.sft_log_interval}",
         f"--project-name={cfg.project_name}",
     ]
+
+    if getattr(args, "num_demos", None) is not None:
+        cmd.append(f"--data.num-demos={args.num_demos}")
 
     if cfg.sft_resume:
         cmd.append("--resume")
@@ -161,13 +177,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--stage", choices=["demos", "norm_stats", "sft", "rl", "all"], default="all")
+    parser.add_argument(
+        "--num-demos", type=int, default=None,
+        help="Limit SFT to the first N episodes of the LeRobot dataset (only affects "
+             "--stage sft/all). Omit to use every episode in the dataset.",
+    )
     args = parser.parse_args()
 
     cfg = load_task_config(args.config)
     run_dir, resuming = resolve_run_dir(cfg)
 
     if args.stage in ("demos", "all"):
-    	stage_demos(cfg, args)
+        stage_demos(cfg, args)
 
     if args.stage in ("norm_stats", "all"):
         stage_norm_stats(cfg, args)
