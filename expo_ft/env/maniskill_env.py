@@ -10,6 +10,7 @@ import os
 import gymnasium as gym
 import mani_skill.envs  # noqa: F401
 from mani_skill.utils.visualization.misc import tile_images
+from mani_skill.utils.sapien_utils import look_at
 
 
 class ManiSkillEnvWrapper:
@@ -30,6 +31,10 @@ class ManiSkillEnvWrapper:
         self._video_dir = env_creation_request.get("video_dir", None)
         self._env_usage = env_creation_request.get("env_usage", "train")
 
+        eye_pos = getattr(cfg, 'camera_eye_pos', [0.3, 0, 0.6])
+        target_pos = getattr(cfg, 'camera_target_pos', [-0.1, 0, 0.1])
+        camera_pose = look_at(eye=eye_pos, target=target_pos).raw_pose[0].cpu().tolist()
+
         self._env = gym.make(
             cfg.env_id,
             obs_mode="rgb",
@@ -39,6 +44,7 @@ class ManiSkillEnvWrapper:
             sensor_configs=dict(
                 width=getattr(cfg, 'camera_width', 128),
                 height=getattr(cfg, 'camera_height', 128),
+                base_camera=dict(pose=camera_pose),
             ),
             sim_backend=getattr(cfg, 'sim_backend', 'physx_cuda'),
         )

@@ -909,8 +909,10 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         last_minibatch = jax.tree_util.tree_map(lambda x: x[-1] if x is not None and hasattr(x, "shape") else x, minibatches)
 
         # When actor_success_only, use the dedicated success-episode batch for
-        # the Pi05 actor update; otherwise use the last critic minibatch.
-        if self.actor_success_only:
+        # the Pi05 actor update; otherwise (or if no successful episode exists
+        # yet in the buffer, e.g. early in training / near-0% base success)
+        # fall back to the last critic minibatch.
+        if self.actor_success_only and actor_batch is not None:
             actor_batch = actor_batch.copy()
             rng, key = jax.random.split(new_agent.rng)
             actor_batch["image"] = self.data_augmentation_fn(key, actor_batch["image"])

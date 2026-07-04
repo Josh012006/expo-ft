@@ -38,6 +38,7 @@ flags.DEFINE_integer("fsdp_devices", 1, "Number of FSDP devices for sharding.")
 flags.DEFINE_integer("num_data", 0, "Max number of offline demo episodes to load into the replay buffer (0 = use all available).")
 flags.DEFINE_string("task_config", "configs/task/stack_cube.yaml", "Path to task YAML config.")
 
+
 config_flags.DEFINE_config_file(
     "config",
     "configs/model/expo_ft_pi_config.py",
@@ -54,6 +55,14 @@ def main(_):
     from expo_ft.utils.config_loader import get_sft_config_name
     FLAGS.config.pi05_config_name = get_sft_config_name(cfg)
     FLAGS.config.skip_repack_transforms = cfg.skip_repack_transforms
+    # Sync actor_success_only from the task YAML into the model config too —
+    # BatchProcessor already reads it from cfg (line below, via train_pi_robo's
+    # own actor_success_only variable), but the EXPOLearner agent itself reads
+    # its own copy from FLAGS.config, which defaults to True in
+    # expo_ft_pi_config.py. Without this sync, BatchProcessor (correctly seeing
+    # the YAML's actor_success_only=False) never builds an actor_batch, while
+    # the agent (still seeing FLAGS.config's default True) expects one — crash.
+    FLAGS.config.actor_success_only = getattr(cfg, "actor_success_only", False)
     # AssetsConfig DROID officielle deja bakee dans la config openpi nommee ci-dessus —
     # ne pas l'ecraser ici (meme bug corrige dans eval_policy.py : le SFT a ete
     # entraine avec ces stats officielles, pas des stats locales par repo_id).
@@ -92,6 +101,7 @@ def main(_):
     checkpoint_manager, resuming = initialize_checkpoint_dir(
         checkpoint_dir_path,
         keep_period=cfg.keep_period,
+        max_to_keep=getattr(cfg, "max_to_keep", 100),
         # A fresh run gets its own brand-new timestamped directory (see
         # resolve_run_dir) — safe to "overwrite" since it's empty. Only skip
         # this when we're genuinely resuming (cfg.resume_dir set), so we never
