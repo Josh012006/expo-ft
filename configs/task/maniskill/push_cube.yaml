@@ -45,7 +45,7 @@ model_cls: "EXPOLearner"
 seed: 42
 max_episodes: 1000
 max_steps_per_episode: 120
-batch_size: 32
+batch_size: 24
 utd_ratio: 10
 offline_ratio: 0.0
 update_type: "episode"
