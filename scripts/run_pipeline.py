@@ -69,7 +69,7 @@ def stage_demos(cfg, args):
     #        action_conversion.from_pd_joint_pos — the resulting demos are real
     #        physx_cpu dynamics, not GPU-teleported states.
     run([
-        "python", "-m", "mani_skill.trajectory.replay_trajectory",
+        "python", str(REPO_ROOT / "scripts" / "replay_trajectory_patched.py"),
         "--traj-path", str(raw_h5), "--save-traj",
         "-o", "rgb", "-c", cfg.control_mode, "-b", "physx_cpu",
     ])

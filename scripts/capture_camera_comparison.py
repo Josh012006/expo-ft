@@ -28,13 +28,15 @@ import imageio.v3 as iio
 from mani_skill.utils.sapien_utils import look_at
 
 from expo_ft.utils.config_loader import load_task_config
+from expo_ft.env.patches import patch_pickcube_visible_goal
+patch_pickcube_visible_goal()
 
 
 def to_np(x):
     return x.cpu().numpy() if hasattr(x, "cpu") else np.array(x)
 
 
-def main(config_path, out_dir):
+def main(config_path, out_dir, seed=0):
     cfg = load_task_config(config_path)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -57,16 +59,16 @@ def main(config_path, out_dir):
         sensor_configs=dict(
             width=width,
             height=height,
-            base_camera=dict(pose=camera_pose),
+            base_camera=dict(pose=camera_pose, fov=getattr(cfg, 'camera_fov', 1.0)),
         ),
     )
-    obs, _ = env.reset(seed=0)
+    obs, _ = env.reset(seed=seed)
 
     print(f"Sensor cameras available: {list(obs['sensor_data'].keys())}")
     for cam_name, cam_data in obs["sensor_data"].items():
         rgb = to_np(cam_data["rgb"])[0]
         print(f"  '{cam_name}' sensor camera shape: {rgb.shape}")
-        path = out_dir / f"{cfg.env_id}_sensor_{cam_name}.png"
+        path = out_dir / f"{cfg.env_id}_seed{seed}_sensor_{cam_name}.png"
         iio.imwrite(path, rgb.astype(np.uint8))
         print(f"  -> saved {path}")
 
@@ -75,7 +77,7 @@ def main(config_path, out_dir):
     render_img = env.unwrapped.render_rgb_array()
     render_img = to_np(render_img)[0] if render_img.ndim == 4 else to_np(render_img)
     print(f"  human render camera shape: {render_img.shape}")
-    path = out_dir / f"{cfg.env_id}_human_render.png"
+    path = out_dir / f"{cfg.env_id}_seed{seed}_human_render.png"
     iio.imwrite(path, render_img.astype(np.uint8))
     print(f"  -> saved {path}")
 
@@ -87,5 +89,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Path to task YAML config.")
     parser.add_argument("--out-dir", default="logs/camera_comparison")
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
-    main(args.config, args.out_dir)
+    main(args.config, args.out_dir, args.seed)

@@ -12,6 +12,9 @@ import mani_skill.envs  # noqa: F401
 from mani_skill.utils.visualization.misc import tile_images
 from mani_skill.utils.sapien_utils import look_at
 
+from expo_ft.env.patches import patch_pickcube_visible_goal
+patch_pickcube_visible_goal()
+
 
 class ManiSkillEnvWrapper:
     """Drop-in replacement for EnvClientWrapper using a local ManiSkill env."""
@@ -45,7 +48,7 @@ class ManiSkillEnvWrapper:
             sensor_configs=dict(
                 width=getattr(cfg, 'camera_width', 128),
                 height=getattr(cfg, 'camera_height', 128),
-                base_camera=dict(pose=camera_pose),
+                base_camera=dict(pose=camera_pose, fov=getattr(cfg, 'camera_fov', 1.0)),
             ),
             sim_backend=getattr(cfg, 'sim_backend', 'physx_cuda'),
         )
