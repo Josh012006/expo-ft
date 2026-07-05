@@ -29,6 +29,7 @@ dependencies = [
     "augmax>=0.4.1",
     "torch>=2.7.1",
     "lerobot>=0.1.0",
+    "tensorboard>=2.21.0",
 ]
 
 [build-system]

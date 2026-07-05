@@ -53,6 +53,7 @@ def main(config_path, out_dir):
         obs_mode="rgb",
         sim_backend=getattr(cfg, 'sim_backend', 'physx_cpu'),
         num_envs=1,
+        robot_uids=getattr(cfg, 'robot_uids', 'panda_wristcam'),
         sensor_configs=dict(
             width=width,
             height=height,

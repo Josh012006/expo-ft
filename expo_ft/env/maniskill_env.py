@@ -41,6 +41,7 @@ class ManiSkillEnvWrapper:
             control_mode=cfg.control_mode,
             num_envs=1,
             max_episode_steps=cfg.max_episode_steps,
+            robot_uids=getattr(cfg, 'robot_uids', 'panda_wristcam'),
             sensor_configs=dict(
                 width=getattr(cfg, 'camera_width', 128),
                 height=getattr(cfg, 'camera_height', 128),
