@@ -70,6 +70,7 @@ def stage_demos(cfg, args):
     #        physx_cpu dynamics, not GPU-teleported states.
     run([
         "python", str(REPO_ROOT / "scripts" / "replay_trajectory_patched.py"),
+        "--expo-config", args.config,
         "--traj-path", str(raw_h5), "--save-traj",
         "-o", "rgb", "-c", cfg.control_mode, "-b", "physx_cpu",
     ])

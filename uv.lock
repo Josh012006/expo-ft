@@ -1157,7 +1157,7 @@ requires-dist = [
     { name = "imageio", extras = ["ffmpeg"], specifier = ">=2.37.3" },
     { name = "jax", specifier = ">=0.5.3" },
     { name = "lerobot", git = "https://github.com/huggingface/lerobot?rev=0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" },
-    { name = "mani-skill", specifier = "==3.0.1" },
+    { name = "mani-skill", editable = "expo_ft/third_party/ManiSkill" },
     { name = "matplotlib", specifier = ">=3.11.0" },
     { name = "numpy", specifier = ">=1.26.4" },
     { name = "openpi", editable = "expo_ft/agents/vla/openpi" },
@@ -2452,7 +2452,7 @@ wheels = [
 [[package]]
 name = "mani-skill"
 version = "3.0.1"
-source = { registry = "https://pypi.org/simple" }
+source = { editable = "expo_ft/third_party/ManiSkill" }
 dependencies = [
     { name = "dacite" },
     { name = "defusedxml" },
@@ -2475,10 +2475,56 @@ dependencies = [
     { name = "trimesh" },
     { name = "tyro" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fa/87/fbb5485f98656b7cedfee779f925f53e4eecfcd38216afeeaf6467f31f35/mani_skill-3.0.1.tar.gz", hash = "sha256:d4eb4f02ab7032d168ffe91ec5af9e2e19eed00481659962d659fe37b0f23028", size = 101412863, upload-time = "2026-04-21T05:52:25.699Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/4a/44/cac08a55040c45f31e18cdc09a9dcc74bbd053fa36eb78c527d0318862bb/mani_skill-3.0.1-py3-none-any.whl", hash = "sha256:685de2f03c300b1ede49881a1bf6306ad062082d39c8d3be8b8e85603f32e33a", size = 101729066, upload-time = "2026-04-21T05:52:19.889Z" },
+
+[package.metadata]
+requires-dist = [
+    { name = "black", marker = "extra == 'dev'" },
+    { name = "build", marker = "extra == 'dev'" },
+    { name = "dacite" },
+    { name = "defusedxml" },
+    { name = "gitpython" },
+    { name = "gymnasium", specifier = ">=0.29.1" },
+    { name = "h5py" },
+    { name = "huggingface-hub" },
+    { name = "imageio" },
+    { name = "imageio", extras = ["ffmpeg"] },
+    { name = "ipython" },
+    { name = "isort", marker = "extra == 'dev'" },
+    { name = "mplib", marker = "sys_platform == 'linux'", specifier = "==0.1.1" },
+    { name = "myst-parser", marker = "extra == 'docs'" },
+    { name = "numpy", specifier = ">=1.22" },
+    { name = "nvidia-ml-py" },
+    { name = "nvidia-ml-py", marker = "extra == 'dev'" },
+    { name = "pre-commit", marker = "extra == 'dev'" },
+    { name = "pydata-sphinx-theme", marker = "extra == 'docs'" },
+    { name = "pytest", marker = "extra == 'dev'" },
+    { name = "pytest-forked", marker = "extra == 'dev'" },
+    { name = "pytest-xdist", extras = ["psutil"], marker = "extra == 'dev'" },
+    { name = "pytorch-kinematics", specifier = "==0.7.6" },
+    { name = "pyyaml" },
+    { name = "sapien", marker = "sys_platform == 'darwin'", specifier = ">=3.0.2" },
+    { name = "sapien", marker = "sys_platform == 'linux'", specifier = ">=3.0.3" },
+    { name = "sapien", marker = "sys_platform == 'win32'", specifier = ">=3.0.0b1" },
+    { name = "scipy" },
+    { name = "sphinx", marker = "extra == 'docs'", specifier = "==8.2.3" },
+    { name = "sphinx-autoapi", marker = "extra == 'docs'" },
+    { name = "sphinx-autobuild", marker = "extra == 'docs'" },
+    { name = "sphinx-autodoc-typehints", marker = "extra == 'docs'" },
+    { name = "sphinx-copybutton", marker = "extra == 'docs'" },
+    { name = "sphinx-design", marker = "extra == 'docs'" },
+    { name = "sphinx-subfigure", marker = "extra == 'docs'" },
+    { name = "sphinx-togglebutton", marker = "extra == 'docs'" },
+    { name = "sphinxcontrib-spelling", marker = "extra == 'docs'" },
+    { name = "sphinxcontrib-video", marker = "extra == 'docs'" },
+    { name = "stable-baselines3", marker = "extra == 'dev'" },
+    { name = "tabulate" },
+    { name = "tqdm" },
+    { name = "transforms3d" },
+    { name = "trimesh" },
+    { name = "twine", marker = "extra == 'dev'" },
+    { name = "tyro", specifier = ">=0.8.5" },
 ]
+provides-extras = ["dev", "docs"]
 
 [[package]]
 name = "markdown"

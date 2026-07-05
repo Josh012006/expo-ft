@@ -20,7 +20,6 @@ dependencies = [
     "flax>=0.10.2",
     "orbax-checkpoint>=0.11.13",
     "gymnasium>=0.29.1",
-    "mani-skill==3.0.1",
     "imageio[ffmpeg]>=2.37.3",
     "tqdm>=4.67.3",
     "wandb>=0.27.0",
@@ -30,6 +29,7 @@ dependencies = [
     "torch>=2.7.1",
     "lerobot>=0.1.0",
     "tensorboard>=2.21.0",
+    "mani-skill",
 ]
 
 [build-system]
@@ -44,6 +44,8 @@ openpi = { path = "expo_ft/agents/vla/openpi", editable = true }
 openpi-client = { path = "expo_ft/agents/vla/openpi/packages/openpi-client", editable = true }
 lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" }
 dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
+mani-skill = { path = "expo_ft/third_party/ManiSkill", editable = true }
+
 
 [tool.uv]
 override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "datasets>=3.0,<4.0"]
