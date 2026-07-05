@@ -21,7 +21,8 @@ uv sync
 ```
 
 This installs `openpi`/`openpi-client` (editable, from `expo_ft/agents/vla/openpi`)
-and `mani-skill` + all other dependencies.
+and `mani-skill` (editable, forked into `expo_ft/third_party/ManiSkill` — see
+Changelog) + all other dependencies.
 
 **If `uv sync` fails to find a package**: check that `pyproject.toml` actually
 lists it as a dependency. We've been bitten by this before — `mani-skill` and
@@ -52,41 +53,46 @@ Evaluation: `scripts/eval_policy.py` (single checkpoint) or `scripts/eval_curve.
 (sweeps every checkpoint in a directory on a fixed set of episode seeds, with
 ±1 SE error bars).
 
-Tasks currently in use: **StackCube-v1**, **PushCube-v1**. PickCube-v1 was
-tried and dropped (see Known Issues).
+Tasks currently in use: **StackCube-v1**, **PushCube-v1**, **PickCube-v1**
+(revived after the camera fixes below — see Known Issues).
 
 ## Known issues / open items
 
-- **Camera setup mismatch with π₀.₅-DROID's training distribution**: our
-  external camera is front-angled, not a proper left/right third-person view,
-  and PushCube has no wrist camera at all. `camera_eye_pos`/`camera_target_pos`
-  in the task YAML control the external camera's pose (see below) — wrist
-  camera addition is still open (it's mounted on a robot link, not freely
-  repositionable the same way).
-- **Resolution**: sim renders at 128×128 by default, upsampled to the model's
-  native 224×224 — a likely source of degradation vs. the model's real
-  pretraining data (which downsamples from high-res, not upsamples from low-res).
-  Set `camera_width`/`camera_height: 224` in the task YAML to render natively;
-  requires regenerating the RGB-converted demos afterward.
-- **PickCube-v1 dropped**: its goal marker is hidden from sensor cameras by
-  ManiSkill's default (`_hidden_objects`), and even after fixing that, the
-  single fixed camera angle can let the gripper occlude a low-height goal.
+- **Camera setup mismatch with π₀.₅-DROID's training distribution** — fixed:
+  external camera repositioned to an actual side view (`camera_eye_pos`/
+  `camera_target_pos`), FOV matched to the human-render camera (`camera_fov`,
+  was defaulting to a wider FOV than intended, making the same position look
+  more zoomed-out than expected), and PushCube's missing wrist camera fixed
+  via `robot_uids: panda_wristcam` (root cause: PushCube/PickCube default to
+  plain `"panda"`, StackCube already used `"panda_wristcam"` — this is the
+  actual difference between the Panda v2/v3 URDFs, not a scene/config issue).
+- **Resolution** — fixed: `camera_width`/`camera_height: 224` renders natively
+  at the model's input resolution instead of upsampling from 128.
+- **PickCube-v1** — goal marker visibility fixed via a monkeypatch
+  (`expo_ft/env/patches.py`, since ManiSkill hides it from sensor cameras by
+  default); the camera-angle fix above may also resolve the gripper-occlusion
+  concern raised earlier, revisiting now.
 
-## Camera configuration (YAML fields)
+## Camera & embodiment configuration (YAML fields)
 
 ```yaml
-camera_width: 128          # sensor camera resolution (both dims)
-camera_height: 128
-camera_eye_pos: [0.3, 0, 0.6]      # external camera position
-camera_target_pos: [-0.1, 0, 0.1]  # what the external camera looks at
+camera_width: 224
+camera_height: 224
+camera_eye_pos: [0.1, 0.4, 0.4]      # external camera position
+camera_target_pos: [0, 0, 0.1]       # what the external camera looks at
+camera_fov: 1.0                      # matches the human-render camera's FOV
+robot_uids: panda_wristcam           # panda_wristcam adds a wrist-mounted camera
 ```
 
 Read by `expo_ft/env/maniskill_env.py`, passed to ManiSkill via
-`gym.make(..., sensor_configs=...)` — a config-only change, no code edits
-needed to reposition or resize the external camera.
-`scripts/capture_camera_comparison.py --config <task.yaml>` renders both the
-sensor and human-render camera views for visual verification before
-committing to a change.
+`gym.make(..., sensor_configs=..., robot_uids=...)` — a config-only change,
+no code edits needed to reposition/resize the external camera or switch robot
+embodiment. `scripts/capture_camera_comparison.py --config <task.yaml> [--seed N]`
+renders both the sensor and human-render camera views for visual verification
+before committing to a change.
+
+Demo generation applies the same overrides via `scripts/replay_trajectory_patched.py`
+(see Changelog) — regenerate demos after changing any of these fields.
 
 ## Dataset-size ablation
 
@@ -134,12 +140,30 @@ collides with a full-dataset run.
   (checkpoints are ~18GB each — previous defaults filled disk quota fast with
   multiple parallel runs).
 
+**Camera/embodiment overrides also needed in demo generation:** demo RGB
+conversion (`replay_trajectory`) runs in ManiSkill's own subprocess with its
+own `gym.make(...)` call, completely independent of `maniskill_env.py` —
+so camera/resolution/robot_uids overrides silently never reached it, and demos
+kept being generated at the old 128×128/no-wristcam settings despite YAML
+changes. `scripts/replay_trajectory_patched.py` now also monkeypatches
+`gym.make` itself (via a new `--expo-config` arg pointing to the task YAML) to
+inject the same `sensor_configs`/`robot_uids` overrides `maniskill_env.py`
+uses, so demo generation and eval/RL are guaranteed consistent.
+
+**ManiSkill packaging:** switched from a pinned PyPI install to an editable
+install of a fork (`expo_ft/third_party/ManiSkill`, added to `[tool.uv.sources]`
+as a `path`+`editable` source — same pattern as `openpi`, deliberately *not*
+a `[tool.uv.workspace]` member since ManiSkill's `setup.py`-based packaging
+lacks the `[project]` table `uv` workspace membership requires). Lets us track
+task/environment modifications as real commits instead of runtime monkeypatches,
+and add custom tasks directly.
+
 **Tooling added:** `eval_curve.py` (checkpoint sweeps, fixed episode seeds, SE
 error bars), `validate_demos_full_pipeline.py` (rigorous end-to-end demo
 replay validation), `capture_camera_comparison.py` (visual camera
-verification), `diagnose_reward_timing.py` (confirms the reward/action timing
-convention matches the original ExpoFT reference implementation — intentional,
-not a porting bug).
+verification, supports `--seed`), `diagnose_reward_timing.py` (confirms the
+reward/action timing convention matches the original ExpoFT reference
+implementation — intentional, not a porting bug).
 
 ## Original paper
 
