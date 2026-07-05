@@ -187,12 +187,14 @@ def main():
     cfg = load_task_config(args.config)
 
     # resolve_run_dir() creates the directory immediately (os.makedirs) — only
-    # call it when the requested stage actually writes there (sft/rl write
-    # checkpoints under run_dir; demos writes to demos/, norm_stats doesn't
-    # write under logs/ at all). Otherwise a demos-only or norm_stats-only run
-    # left behind an empty, unused logs/<task>/<task>_expo_ft_<timestamp>/ dir.
+    # call it when the requested stage actually writes there. SFT writes
+    # checkpoints under run_dir/sft/...; RL does NOT use run_dir at all —
+    # train_pi_robo.py resolves its own run directory independently (with the
+    # "_rl" suffix) from cfg.rl_resume_dir. Calling this for "rl" alone used
+    # to leave an empty, unused logs/<task>/<task>_expo_ft_<timestamp>/ dir
+    # behind on every RL launch, right next to the real "..._rl" one.
     run_dir, resuming = (None, None)
-    if args.stage in ("sft", "rl", "all"):
+    if args.stage in ("sft", "all"):
         run_dir, resuming = resolve_run_dir(cfg, resume_dir=cfg.sft_resume_dir)
 
     if args.stage in ("demos", "all"):
