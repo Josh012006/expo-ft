@@ -44,7 +44,7 @@ robot_uids: "panda_wristcam"
 project_name: "expo-ft"
 run_name: "stack_cube_expo_ft"
 output_dir: "logs/stack_cube"  # a timestamped subdir is created automatically per run
-resume_dir: null # "logs/stack_cube/stack_cube_expo_ft_2026-06-28_03-12-27"  # path to an existing run to resume, e.g. "logs/stack_cube/2026-06-23_10-00-00"
+resume_dir:  "logs/stack_cube/stack_cube_expo_ft_2026-07-05_01-06-12"  # path to an existing run to resume, e.g. "logs/stack_cube/2026-06-23_10-00-00"
 
 # ── Algorithm ──────────────────────────────────────────────────
 model_cls: "EXPOLearner"  # "EXPOLearner" for RL, "BCLearner" for SFT-only
@@ -76,7 +76,7 @@ sft_use_lora: true         # use LoRA fine-tuning (faster, less memory than full
 sft_peak_lr: 2.5e-5
 sft_save_interval: 200
 sft_log_interval: 100
-sft_resume: false
+sft_resume: true
 
 # ── RL hyperparameters (EXPOLearner) ───────────────────────────
 rl_lr: 3e-4                # learning rate for critic and edit policy

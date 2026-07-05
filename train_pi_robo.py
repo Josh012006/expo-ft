@@ -66,7 +66,9 @@ def main(_):
     # AssetsConfig DROID officielle deja bakee dans la config openpi nommee ci-dessus —
     # ne pas l'ecraser ici (meme bug corrige dans eval_policy.py : le SFT a ete
     # entraine avec ces stats officielles, pas des stats locales par repo_id).
-    run_dir, resuming = resolve_run_dir(cfg)
+    # Mark the run directory as an RL run (e.g. stack_cube_expo_ft_2026-07-05_01-06-12_rl)
+    # so it's visually distinguishable from an SFT run directory at a glance.
+    run_dir, resuming = resolve_run_dir(cfg, suffix="rl")
 
     assert 0.0 <= cfg.offline_ratio <= 1.0
 

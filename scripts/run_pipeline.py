@@ -194,7 +194,15 @@ def main():
     args = parser.parse_args()
 
     cfg = load_task_config(args.config)
-    run_dir, resuming = resolve_run_dir(cfg)
+
+    # resolve_run_dir() creates the directory immediately (os.makedirs) — only
+    # call it when the requested stage actually writes there (sft/rl write
+    # checkpoints under run_dir; demos writes to demos/, norm_stats doesn't
+    # write under logs/ at all). Otherwise a demos-only or norm_stats-only run
+    # left behind an empty, unused logs/<task>/<task>_expo_ft_<timestamp>/ dir.
+    run_dir, resuming = (None, None)
+    if args.stage in ("sft", "rl", "all"):
+        run_dir, resuming = resolve_run_dir(cfg)
 
     if args.stage in ("demos", "all"):
         stage_demos(cfg, args)

@@ -39,7 +39,7 @@ robot_uids: "panda_wristcam"
 project_name: "expo-ft"
 run_name: "push_cube_expo_ft"
 output_dir: "logs/push_cube"
-resume_dir: null
+resume_dir: "logs/push_cube/push_cube_expo_ft_2026-07-05_01-06-12"
 
 # ── Algorithm ──────────────────────────────────────────────────
 model_cls: "EXPOLearner"
@@ -71,7 +71,7 @@ sft_use_lora: true
 sft_peak_lr: 2.5e-5
 sft_save_interval: 200
 sft_log_interval: 100
-sft_resume: false
+sft_resume: true
 
 # ── RL hyperparameters (EXPOLearner) ───────────────────────────
 rl_lr: 3e-4
