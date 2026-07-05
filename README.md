@@ -15,14 +15,21 @@ via Bellman backup and a SAC-style actor update).
 ## Setup
 
 ```bash
-git clone <this-repo>
+git clone --recurse-submodules <this-repo>
 cd expo-ft
 uv sync
 ```
 
-This installs `openpi`/`openpi-client` (editable, from `expo_ft/agents/vla/openpi`)
-and `mani-skill` (editable, forked into `expo_ft/third_party/ManiSkill` — see
-Changelog) + all other dependencies.
+`openpi` (`expo_ft/agents/vla/openpi`) and `mani-skill` (`expo_ft/third_party/ManiSkill`)
+are git submodules pointing at forks — `--recurse-submodules` is required, or
+you'll get empty directories and `uv sync` will fail. If you already cloned
+without it:
+```bash
+git submodule update --init --recursive
+```
+
+This installs `openpi`/`openpi-client` and `mani-skill` (both editable, from
+the submodule paths above) + all other dependencies.
 
 **If `uv sync` fails to find a package**: check that `pyproject.toml` actually
 lists it as a dependency. We've been bitten by this before — `mani-skill` and
@@ -157,6 +164,14 @@ a `[tool.uv.workspace]` member since ManiSkill's `setup.py`-based packaging
 lacks the `[project]` table `uv` workspace membership requires). Lets us track
 task/environment modifications as real commits instead of runtime monkeypatches,
 and add custom tasks directly.
+
+**Submodule tracking fixed:** `openpi` was listed in `.gitignore` and never
+tracked by git at all (silently — no warning, since git ignores it entirely);
+`mani-skill`'s fork was a nested git repo `git add -A` couldn't handle either
+(the "you've added another git repository" warning). Anyone cloning the repo
+before this fix would have gotten empty directories and a broken `uv sync`.
+Both are now proper `git submodule`s pointing at forks under the `Josh012006`
+GitHub account — see Setup for the `--recurse-submodules` requirement.
 
 **Tooling added:** `eval_curve.py` (checkpoint sweeps, fixed episode seeds, SE
 error bars), `validate_demos_full_pipeline.py` (rigorous end-to-end demo
