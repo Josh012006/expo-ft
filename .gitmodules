@@ -1,7 +1,7 @@
 [submodule "expo_ft/third_party/ManiSkill"]
 	path = expo_ft/third_party/ManiSkill
-	url = git@github.com:Josh012006/ManiSkill.git
+	url = https://github.com/Josh012006/ManiSkill.git
 [submodule "expo_ft/agents/vla/openpi"]
 	path = expo_ft/agents/vla/openpi
-	url = git@github.com:Josh012006/openpi.git
+	url = https://github.com/Josh012006/openpi.git
 	branch = expo_ft
