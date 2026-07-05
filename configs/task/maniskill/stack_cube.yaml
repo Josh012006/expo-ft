@@ -1,4 +1,4 @@
-# configs/task/maniskill/maniskill_stack_cube.yaml
+# configs/task/maniskill/stack_cube.yaml
 
 # ── Environment ────────────────────────────────────────────────
 env_id: "StackCube-v1"
@@ -14,22 +14,12 @@ control_mode: "pd_joint_delta_pos"
 normalize_action: true
 use_cartesian_state: false
 output_action_dim: 8
+action_space: "joint_position" # Action space keys for DROID format reader
+gripper_action_space: "position"
 
 # Observation config
 state_obs_key: "observation/joint_position"
 state_obs_dim: 7
-
-
-# ── Data ───────────────────────────────────────────────────────
-lerobot_repo_id: "expo_ft/stack_cube"
-droid_format_dir: "demos/StackCube-v1/droid_format"
-action_space: "joint_position" # Action space keys for DROID format reader
-gripper_action_space: "position"
-num_data: 50  # max number of offline demo episodes to load (0 = all)
-# Skip RepackTransform in replay buffer — our observations already have the
-# correct keys for DroidInputs (observation/cartesian_position, etc.)
-skip_repack_transforms: true
-
 
 # Camera config
 camera_width: 224
@@ -40,14 +30,36 @@ camera_fov: 1.0
 robot_uids: "panda_wristcam"
 
 
+# ── Data ───────────────────────────────────────────────────────
+lerobot_repo_id: "expo_ft/stack_cube"
+droid_format_dir: "demos/StackCube-v1/droid_format"
+# Skip RepackTransform in replay buffer — our observations already have the
+# correct keys for DroidInputs (observation/cartesian_position, etc.)
+skip_repack_transforms: true
+
+
 # ── Run / Logging ──────────────────────────────────────────────
 project_name: "expo-ft"
 run_name: "stack_cube_expo_ft"
 output_dir: "logs/stack_cube"  # a timestamped subdir is created automatically per run
-resume_dir: null # "logs/stack_cube/stack_cube_expo_ft_2026-07-05_01-06-12"  # path to an existing run to resume, e.g. "logs/stack_cube/2026-06-23_10-00-00"
 
-# ── Algorithm ──────────────────────────────────────────────────
-model_cls: "EXPOLearner"  # "EXPOLearner" for RL, "BCLearner" for SFT-only
+
+# ── SFT warmup ─────────────────────────────────────────────────
+sft_exp_name: "stack_cube_sft"
+sft_num_workers: 12
+sft_num_train_steps: 4000
+sft_batch_size: 64
+sft_use_lora: true         # use LoRA fine-tuning (faster, less memory than full fine-tune)
+sft_peak_lr: 2.5e-5
+sft_save_interval: 200
+sft_log_interval: 100
+sft_resume: false
+sft_resume_dir: null
+num_data_sft: 50
+
+
+# ── RL Algorithm ──────────────────────────────────────────────────
+model_cls: "EXPOLearner"  
 seed: 42
 max_episodes: 1000
 max_steps_per_episode: 120
@@ -60,6 +72,9 @@ num_batch: 1               # number of episodes to accumulate before updating (o
 replan_steps: 8            # number of actions to execute from each action chunk before replanning (action_horizon=16)
 fsdp_devices: 1            # number of GPUs for FSDP sharding (1 = single GPU, no sharding)
 
+num_data_rl: 50
+rl_resume_dir: null
+
 # ── RL Checkpointing ──────────────────────────────────────────────
 checkpoint_model: true
 checkpoint_interval: 1000  # save checkpoint every N steps (0 = only save at end)
@@ -67,16 +82,6 @@ checkpoint_buffer: false   # save replay buffer transitions to disk at each step
 keep_period: 40000         # keep one checkpoint every N steps (older ones are deleted)
 max_to_keep: 2
 
-# ── SFT warmup ─────────────────────────────────────────────────
-sft_exp_name: "stack_cube_sft"
-sft_num_workers: 12
-sft_num_train_steps: 4000
-sft_batch_size: 64
-sft_use_lora: true         # use LoRA fine-tuning (faster, less memory than full fine-tune)
-sft_peak_lr: 2.5e-5
-sft_save_interval: 200
-sft_log_interval: 100
-sft_resume: false
 
 # ── RL hyperparameters (EXPOLearner) ───────────────────────────
 rl_lr: 3e-4                # learning rate for critic and edit policy
@@ -85,4 +90,4 @@ rl_tau: 0.005              # polyak averaging coefficient for target network sof
 rl_alpha: 0.1              # entropy temperature (controls exploration vs exploitation)
 rl_hidden_dims: [256, 256] # hidden layer sizes for critic and edit policy MLPs
 rl_edit_action_scale: 0.05 # max magnitude of residual action added by edit policy
-actor_success_only: true  # if true, actor batch is sampled only from successful transitions
+actor_success_only: true   # if true, actor batch is sampled only from successful transitions

@@ -30,20 +30,24 @@ def load_task_config(yaml_path: str) -> SimpleNamespace:
     return cfg
 
 
-def resolve_run_dir(cfg: SimpleNamespace, suffix: str | None = None) -> tuple[str, bool]:
+def resolve_run_dir(cfg: SimpleNamespace, resume_dir: str | None = None, suffix: str | None = None) -> tuple[str, bool]:
     """
     Resolve the run directory for this experiment.
 
-    - If cfg.resume_dir is set: resume from that exact directory.
+    - If `resume_dir` is set: resume from that exact directory.
     - Otherwise: create a new timestamped subdirectory under cfg.output_dir,
       optionally with `suffix` appended after the timestamp (e.g. "rl", so RL
       runs are visually distinguishable from SFT runs at a glance).
 
+    `resume_dir` is passed in explicitly (rather than read from a single
+    shared cfg.resume_dir) because SFT and RL each resume independently —
+    callers should pass cfg.sft_resume_dir or cfg.rl_resume_dir as appropriate.
+
     Returns:
         (run_dir, resuming) where resuming is True if we are resuming.
     """
-    if cfg.resume_dir is not None:
-        run_dir = cfg.resume_dir
+    if resume_dir is not None:
+        run_dir = resume_dir
         resuming = True
     else:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")

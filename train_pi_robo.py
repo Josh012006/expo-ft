@@ -35,7 +35,6 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_boolean("tqdm", True, "Use tqdm progress bar.")
 flags.DEFINE_integer("fsdp_devices", 1, "Number of FSDP devices for sharding.")
-flags.DEFINE_integer("num_data", 0, "Max number of offline demo episodes to load into the replay buffer (0 = use all available).")
 flags.DEFINE_string("task_config", "configs/task/stack_cube.yaml", "Path to task YAML config.")
 
 
@@ -68,7 +67,7 @@ def main(_):
     # entraine avec ces stats officielles, pas des stats locales par repo_id).
     # Mark the run directory as an RL run (e.g. stack_cube_expo_ft_2026-07-05_01-06-12_rl)
     # so it's visually distinguishable from an SFT run directory at a glance.
-    run_dir, resuming = resolve_run_dir(cfg, suffix="rl")
+    run_dir, resuming = resolve_run_dir(cfg, resume_dir=cfg.rl_resume_dir, suffix="rl")
 
     assert 0.0 <= cfg.offline_ratio <= 1.0
 
@@ -106,7 +105,7 @@ def main(_):
         max_to_keep=getattr(cfg, "max_to_keep", 100),
         # A fresh run gets its own brand-new timestamped directory (see
         # resolve_run_dir) — safe to "overwrite" since it's empty. Only skip
-        # this when we're genuinely resuming (cfg.resume_dir set), so we never
+        # this when we're genuinely resuming (cfg.rl_resume_dir set), so we never
         # risk wiping real checkpoints being resumed into.
         overwrite=not resuming,
         resume=resuming,
@@ -119,7 +118,7 @@ def main(_):
         dataset = process_droid_dataset(
             cfg.droid_format_dir,
             cfg,
-            num_data=FLAGS.num_data if FLAGS.num_data > 0 else None,
+            num_data=cfg.num_data_rl if cfg.num_data_rl > 0 else None,
         )
         example_action = dataset[0]['actions'][np.newaxis]
     else:

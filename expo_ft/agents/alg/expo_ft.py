@@ -857,15 +857,28 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
 
 
     def update(self, agent, batch: DatasetDict, utd_ratio: int, actor_batch: DatasetDict = None):
+        # Avoid letting actor_batch flip between None and a real dict across
+        # the jax.jit boundary — that's a different pytree structure each
+        # time, and forces JAX to trace/compile (and keep resident) a SEPARATE
+        # XLA program the first time a successful episode appears in the
+        # buffer, potentially well into training (e.g. the OOM we hit around
+        # step 2473 on a run that started with 0% base success). Pass a
+        # static bool instead, and always give _update_jit a
+        # consistently-shaped placeholder (reusing `batch`'s own structure,
+        # which goes through the same prepare_critic_batch() call) when no
+        # real success-only actor_batch is available yet.
+        use_success_batch = actor_batch is not None
+        if actor_batch is None:
+            actor_batch = batch
         # Drop stale inference copies before JIT; rebuild after so rollouts use new weights.
         new_agent, info = self.replace(_infer_cache=None)._update_jit(
-            agent.replace(_infer_cache=None), batch, utd_ratio, actor_batch
+            agent.replace(_infer_cache=None), batch, utd_ratio, actor_batch, use_success_batch
         )
         return new_agent.cache_infer_params(), info
 
 
-    @partial(jax.jit, static_argnames="utd_ratio")
-    def _update_jit(self, agent, batch: DatasetDict, utd_ratio: int, actor_batch: DatasetDict = None):
+    @partial(jax.jit, static_argnames=("utd_ratio", "use_success_batch"))
+    def _update_jit(self, agent, batch: DatasetDict, utd_ratio: int, actor_batch: DatasetDict = None, use_success_batch: bool = False):
         batch = batch.copy()
         rng, key1 = jax.random.split(agent.rng)
         rng, key2 = jax.random.split(rng)
@@ -912,7 +925,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         # the Pi05 actor update; otherwise (or if no successful episode exists
         # yet in the buffer, e.g. early in training / near-0% base success)
         # fall back to the last critic minibatch.
-        if self.actor_success_only and actor_batch is not None:
+        if self.actor_success_only and use_success_batch:
             actor_batch = actor_batch.copy()
             rng, key = jax.random.split(new_agent.rng)
             actor_batch["image"] = self.data_augmentation_fn(key, actor_batch["image"])

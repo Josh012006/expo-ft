@@ -52,8 +52,8 @@ Everything runs through `scripts/run_pipeline.py --config <task.yaml> --stage <s
 | Stage | What it does | Job script |
 |---|---|---|
 | `demos` | Generate + convert demonstrations (motion planning → RGB replay → DROID/LeRobot format) | `job_demos.sh` |
-| `sft` | Supervised fine-tuning warmup on demos | `job_sft.sh <venv> <config> [num_demos]` |
-| `rl` | ExpoFT RL fine-tuning from an SFT checkpoint | `job_rl.sh <venv> <config> [num_demos] [sft_checkpoint]` |
+| `sft` | Supervised fine-tuning warmup on demos | `job_sft.sh <venv> <config>` |
+| `rl` | ExpoFT RL fine-tuning from an SFT checkpoint | `job_rl.sh <venv> <config> [sft_checkpoint]` |
 | `all` | All of the above in sequence | — |
 
 Evaluation: `scripts/eval_policy.py` (single checkpoint) or `scripts/eval_curve.py`
@@ -101,13 +101,27 @@ before committing to a change.
 Demo generation applies the same overrides via `scripts/replay_trajectory_patched.py`
 (see Changelog) — regenerate demos after changing any of these fields.
 
-## Dataset-size ablation
+## Dataset size & resuming (YAML fields)
 
-`--num-demos N` on `run_pipeline.py` limits both SFT (LeRobot dataset episodes)
-and RL (offline replay buffer demos) to the first N episodes of an
-already-converted dataset — no reconversion, no config duplication.
-Checkpoints auto-namespace (e.g. `..._sft_demos50`) so a limited-demo run never
-collides with a full-dataset run.
+```yaml
+num_data_sft: 50     # episodes used for SFT (0 = every episode in the LeRobot dataset)
+num_data_rl: 50      # episodes loaded into the RL offline replay buffer (0 = all)
+sft_resume_dir: null # resume an existing SFT run from this exact directory
+rl_resume_dir: null  # resume an existing RL run from this exact directory
+```
+
+Both demo-count fields limit an already-converted dataset to its first N
+episodes — no reconversion, no config duplication. SFT checkpoints
+auto-namespace when `num_data_sft > 0` (e.g. `..._sft_demos50`) so a
+limited-demo run never collides with a full-dataset run.
+
+`sft_resume_dir`/`rl_resume_dir` are deliberately separate fields (not a
+single shared `resume_dir`) — SFT and RL are different runs with different
+directories, and `run_pipeline.py`/`train_pi_robo.py` each resolve their own
+run directory independently (see Changelog).
+
+These used to be CLI overrides (`--num-demos` on `run_pipeline.py`); they're
+YAML-only now so a run's full configuration lives in one place.
 
 ## Changelog — key fixes made while adapting to ManiSkill (July 2026)
 
@@ -126,7 +140,7 @@ collides with a full-dataset run.
 - `stage_rl` was passing ~15 CLI flags that `train_pi_robo.py` never defines
   in this adaptation (seed/max_steps/batch_size/etc. are read directly from
   the task YAML instead) — stripped down to only the flags actually consumed
-  (`--config`, `--task_config`, `--fsdp_devices`, `--num_data`, plus
+  (`--config`, `--task_config`, `--fsdp_devices`, plus
   `--config.<field>=` ml_collections overrides).
 - Same norm_stats override bug as `eval_policy.py`, present here too — fixed
   the same way.
@@ -156,6 +170,28 @@ changes. `scripts/replay_trajectory_patched.py` now also monkeypatches
 `gym.make` itself (via a new `--expo-config` arg pointing to the task YAML) to
 inject the same `sensor_configs`/`robot_uids` overrides `maniskill_env.py`
 uses, so demo generation and eval/RL are guaranteed consistent.
+
+**RL OOM after ~2000+ steps, root-caused (not just worked around):**
+`EXPOLearner._update_jit` is `jax.jit`-compiled with `actor_batch` as a
+non-static argument. Our own `actor_success_only` cold-start fallback (above)
+passed `actor_batch=None` until the first successful episode landed in the
+buffer, then switched to passing a real dict — a different pytree structure
+each time, which forces JAX to trace and compile (and keep resident) a
+*second* XLA program the first time that switch happens, potentially well
+into training. Fixed by always passing a consistently-shaped `actor_batch`
+(falling back to reusing the main critic `batch`'s own structure) and
+controlling the actual branch with a separate `static_argnames` boolean
+instead — bounds JAX to exactly the 2 compilations the logic actually needs,
+rather than an unplanned structural transition triggered by training dynamics.
+
+**Dataset size and resume directories moved fully into the YAML:**
+`--num-demos` (CLI) is gone; replaced by `num_data_sft`/`num_data_rl` fields
+so a run's configuration lives in one place instead of being split between
+the YAML and job-launch arguments. Likewise the single shared `resume_dir`
+(ambiguous between the SFT and RL runs it could refer to) is now
+`sft_resume_dir`/`rl_resume_dir` — `resolve_run_dir()` takes the resume
+directory as an explicit argument rather than reading a fixed `cfg.resume_dir`
+field, so each stage passes its own.
 
 **ManiSkill packaging:** switched from a pinned PyPI install to an editable
 install of a fork (`expo_ft/third_party/ManiSkill`, added to `[tool.uv.sources]`

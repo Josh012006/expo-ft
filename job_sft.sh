@@ -1,13 +1,9 @@
 #!/bin/bash
 # Usage:
-#   sbatch job_sft.sh <venv_name> <config_path> [num_demos]
+#   sbatch job_sft.sh <venv_name> <config_path>
 #
-# Examples:
-#   sbatch job_sft.sh .venv configs/task/maniskill/stack_cube.yaml
-#       -> uses every episode in the LeRobot dataset
-#   sbatch job_sft.sh .venv configs/task/maniskill/stack_cube.yaml 50
-#       -> uses only the first 50 episodes, checkpoints land in a separate
-#          "<sft_exp_name>_demos50" directory, does not touch the full-dataset run
+# num_data_sft (how many demo episodes to use, 0 = all) now lives entirely in
+# the task YAML — edit it there instead of passing it here.
 #
 #SBATCH --job-name=expo_sft
 #SBATCH --ntasks=1
@@ -23,10 +19,8 @@
 #SBATCH --no-requeue
 VENV=${1:-.venv}
 CONFIG=${2:-configs/task/maniskill/stack_cube.yaml}
-NUM_DEMOS=${3:-}
 cd ~/projects/expo-ft
 source scripts/setup_env.sh "$VENV"
 python scripts/run_pipeline.py \
     --config "$CONFIG" \
-    --stage sft \
-    ${NUM_DEMOS:+--num-demos "$NUM_DEMOS"}
+    --stage sft

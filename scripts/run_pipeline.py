@@ -109,13 +109,12 @@ def stage_sft(cfg, args, run_dir):
     """SFT warmup — fine-tune π₀.₅ on the demo dataset."""
     sft_output = os.path.join(run_dir, "sft")
 
-    # --num-demos on the CLI overrides how many episodes of the LeRobot dataset
-    # are used, without touching the dataset on disk or the YAML config. Auto
-    # -namespace the exp_name so a limited-demo run never collides with (or
-    # overwrites) the full-dataset run's checkpoints. Omitted -> use everything.
+    # num_data_sft (0 = use every episode) comes straight from the task YAML now —
+    # auto-namespace the exp_name so a limited-demo run never collides with (or
+    # overwrites) the full-dataset run's checkpoints.
     sft_exp_name = cfg.sft_exp_name
-    if getattr(args, "num_demos", None) is not None:
-        sft_exp_name = f"{cfg.sft_exp_name}_demos{args.num_demos}"
+    if cfg.num_data_sft > 0:
+        sft_exp_name = f"{cfg.sft_exp_name}_demos{cfg.num_data_sft}"
 
     cmd = [
         "uv", "run",
@@ -133,8 +132,8 @@ def stage_sft(cfg, args, run_dir):
         f"--project-name={cfg.project_name}",
     ]
 
-    if getattr(args, "num_demos", None) is not None:
-        cmd.append(f"--data.num-demos={args.num_demos}")
+    if cfg.num_data_sft > 0:
+        cmd.append(f"--data.num-demos={cfg.num_data_sft}")
 
     if cfg.sft_resume:
         cmd.append("--resume")
@@ -147,15 +146,16 @@ def stage_rl(cfg, args, run_dir, resuming):
 
     train_pi_robo.py loads the SAME task YAML itself (cfg = load_task_config(
     FLAGS.task_config)) and reads seed/max_steps/batch_size/checkpoint settings/
-    output_dir/resume_dir/dataset paths/etc. directly from there — it does NOT
-    expose these as separate CLI flags (unlike stage_sft's openpi train.py,
-    which is tyro-based and does want everything via CLI). Only pass what
-    train_pi_robo.py actually defines: --config, --task_config, --fsdp_devices,
-    --num_data, plus ml_collections --config.<field>= overrides (these work
-    without an explicit flags.DEFINE, via config_flags.DEFINE_config_file).
-    run_dir/resuming are accepted for signature consistency with the other
-    stages but unused here — train_pi_robo.py resolves its own run directory
-    from cfg.output_dir/cfg.resume_dir independently.
+    output_dir/rl_resume_dir/num_data_rl/dataset paths/etc. directly from there
+    — it does NOT expose these as separate CLI flags (unlike stage_sft's
+    openpi train.py, which is tyro-based and does want everything via CLI).
+    Only pass what train_pi_robo.py actually defines as CLI flags: --config,
+    --task_config, --fsdp_devices, plus ml_collections --config.<field>=
+    overrides (these work without an explicit flags.DEFINE, via
+    config_flags.DEFINE_config_file). run_dir/resuming are accepted for
+    signature consistency with the other stages but unused here —
+    train_pi_robo.py resolves its own run directory from
+    cfg.output_dir/cfg.rl_resume_dir independently.
     """
     cmd = [
         "python", str(TRAIN_PI_ROBO),
@@ -163,9 +163,6 @@ def stage_rl(cfg, args, run_dir, resuming):
         f"--task_config={args.config}",
         f"--fsdp_devices={cfg.fsdp_devices}",
     ]
-
-    if getattr(args, "num_demos", None) is not None:
-        cmd.append(f"--num_data={args.num_demos}")
 
     if getattr(args, "sft_checkpoint", None) is not None:
         cmd.append(f"--config.pi05_weight_loader_path={Path(args.sft_checkpoint) / 'params'}")
@@ -177,12 +174,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--stage", choices=["demos", "norm_stats", "sft", "rl", "all"], default="all")
-    parser.add_argument(
-        "--num-demos", type=int, default=None,
-        help="Limit SFT to the first N episodes of the LeRobot dataset (only affects "
-             "--stage sft/all). Also limits the RL offline replay buffer's demo count "
-             "(--stage rl/all). Omit to use every episode/demo available.",
-    )
     parser.add_argument(
         "--sft-checkpoint", default=None,
         help="Path to the SFT checkpoint directory to initialize RL from "
@@ -202,7 +193,7 @@ def main():
     # left behind an empty, unused logs/<task>/<task>_expo_ft_<timestamp>/ dir.
     run_dir, resuming = (None, None)
     if args.stage in ("sft", "rl", "all"):
-        run_dir, resuming = resolve_run_dir(cfg)
+        run_dir, resuming = resolve_run_dir(cfg, resume_dir=cfg.sft_resume_dir)
 
     if args.stage in ("demos", "all"):
         stage_demos(cfg, args)
