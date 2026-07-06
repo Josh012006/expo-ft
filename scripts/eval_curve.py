@@ -77,14 +77,15 @@ def get_or_create_episode_seeds(output_dir: Path, n_episodes: int, master_seed: 
     return seeds
 
 
-def run_one_eval(config_path, checkpoint_path, seeds_path, output_json, log_path):
+def run_one_eval(config_path, checkpoint_path, seeds_path, output_json, log_path, save_videos=False):
     cmd = [
         sys.executable, str(REPO_ROOT / "scripts" / "eval_policy.py"),
         "--config", str(config_path),
         "--episode-seeds", str(seeds_path),
         "--output-json", str(output_json),
-        "--no-video",
     ]
+    if not save_videos:
+        cmd.append("--no-video")
     if checkpoint_path is not None:
         cmd += ["--checkpoint", str(checkpoint_path)]
 
@@ -183,6 +184,13 @@ def main():
         "--skip-base", action="store_true",
         help="Skip the base-model (step 0) evaluation, e.g. if it was already run separately.",
     )
+    parser.add_argument(
+        "--save-videos", action="store_true",
+        help="Save a rollout video per episode for every checkpoint (off by default — "
+             "with --n-episodes 200 across several checkpoints this can produce hundreds "
+             "of video files; consider a smaller --n-episodes for this run if you only "
+             "want videos for visual inspection, not the full statistical sweep).",
+    )
     args = parser.parse_args()
 
     checkpoints_dir = Path(args.checkpoints_dir).resolve()
@@ -220,6 +228,7 @@ def main():
                 seeds_path=seeds_path,
                 output_json=result_json,
                 log_path=logs_dir / f"{label}.log",
+                save_videos=args.save_videos,
             )
             if not ok:
                 continue  # keep going with the rest of the sweep
