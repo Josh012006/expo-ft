@@ -191,6 +191,16 @@ def main():
              "of video files; consider a smaller --n-episodes for this run if you only "
              "want videos for visual inspection, not the full statistical sweep).",
     )
+    parser.add_argument(
+        "--start-checkpoint", default=None,
+        help="Path to a checkpoint to use as the curve's starting reference "
+             "point (labeled 'base' on the x-axis) instead of the raw "
+             "pretrained model — e.g. the SFT checkpoint an RL run actually "
+             "started from, which is the meaningful baseline for an RL curve "
+             "(evaluating the untouched pretrained model there wouldn't "
+             "reflect what RL improved upon). Omit to evaluate the true base "
+             "pretrained model, as before.",
+    )
     args = parser.parse_args()
 
     checkpoints_dir = Path(args.checkpoints_dir).resolve()
@@ -210,7 +220,8 @@ def main():
 
     plan = []
     if not args.skip_base:
-        plan.append(("base", None))
+        start_ckpt = Path(args.start_checkpoint) if args.start_checkpoint else None
+        plan.append(("base", start_ckpt))
     for step in steps:
         plan.append((str(step), checkpoints_dir / str(step)))
 
