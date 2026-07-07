@@ -349,10 +349,13 @@ def main(_):
 
         step_metrics["training/loop_time_ms"] = (time.time() - loop_start) * 1000.0
         
-        # TensorBoard logging
+        # TensorBoard logging — convert to float() to handle JAX scalars
+        # (jnp.float32 etc.) which don't pass isinstance(v, (int, float))
         for k, v in step_metrics.items():
-            if isinstance(v, (int, float)):
-                tb_writer.add_scalar(k, v, global_step=i)
+            try:
+                tb_writer.add_scalar(k, float(v), global_step=i)
+            except (TypeError, ValueError):
+                pass  # skip non-scalar values (e.g. batch_info dicts)
         wandb.log(step_metrics, step=i)
     
     if cfg.checkpoint_model:

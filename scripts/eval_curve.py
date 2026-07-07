@@ -149,12 +149,20 @@ def rebuild_curve(results_dir: Path, curve_json_path: Path, curve_png_path: Path
         steps, rates, yerr=errs, marker="o", linewidth=2,
         capsize=4, elinewidth=1, ecolor="gray", alpha=0.9,
     )
-    ax.set_xlabel("SFT training iteration (0 = base model)")
+    # x-axis label depends on whether this is an RL curve or an SFT curve.
+    # For an RL curve the x-axis ticks are RL training steps (not SFT iterations),
+    # and step 0 is the SFT start checkpoint, not the raw pretrained model.
+    has_base = any(e["label"] == "base" for e in entries)
+    rl_curve = any(e["label"] not in ("base",) and e["step"] > 0 for e in entries)
+    if rl_curve:
+        ax.set_xlabel("RL training step (0 = SFT start checkpoint)")
+    else:
+        ax.set_xlabel("SFT training iteration (0 = base model)")
     ax.set_ylabel("Success rate (%)  \u00b1 1 SE")
     ax.set_title(f"Eval success rate vs. checkpoint — {task_label}")
     ax.set_ylim(-2, 102)
     ax.grid(True, alpha=0.3)
-    for s, r in zip(steps, rates):
+    for e, s, r in zip(entries, steps, rates):
         ax.annotate(f"{r:.0f}%", (s, r), textcoords="offset points", xytext=(0, 10), ha="center", fontsize=8)
     fig.tight_layout()
     fig.savefig(curve_png_path, dpi=150)
