@@ -77,7 +77,7 @@ def get_or_create_episode_seeds(output_dir: Path, n_episodes: int, master_seed: 
     return seeds
 
 
-def run_one_eval(config_path, checkpoint_path, seeds_path, output_json, log_path, save_videos=False):
+def run_one_eval(config_path, checkpoint_path, seeds_path, output_json, log_path, save_videos=False, is_rl_checkpoint=False, video_dir=None):
     cmd = [
         sys.executable, str(REPO_ROOT / "scripts" / "eval_policy.py"),
         "--config", str(config_path),
@@ -86,8 +86,11 @@ def run_one_eval(config_path, checkpoint_path, seeds_path, output_json, log_path
     ]
     if not save_videos:
         cmd.append("--no-video")
+    elif video_dir is not None:
+        cmd += ["--video-dir", str(video_dir)]
     if checkpoint_path is not None:
-        cmd += ["--checkpoint", str(checkpoint_path)]
+        flag = "--rl-checkpoint" if is_rl_checkpoint else "--checkpoint"
+        cmd += [flag, str(checkpoint_path)]
 
     print(f"\n$ {' '.join(cmd)}")
     with open(log_path, "w") as logf:
@@ -201,12 +204,22 @@ def main():
              "reflect what RL improved upon). Omit to evaluate the true base "
              "pretrained model, as before.",
     )
+    parser.add_argument(
+        "--rl-curve", action="store_true",
+        help="Treat the numbered checkpoints in checkpoints_dir as RL/EXPOLearner "
+             "checkpoints (loaded via --rl-checkpoint, full agent incl. trained "
+             "residual policy + critic) instead of SFT/openpi-style checkpoints. "
+             "The 'base' reference point (--start-checkpoint) is always treated "
+             "as an SFT checkpoint regardless of this flag, since that's what an "
+             "RL run actually started from.",
+    )
     args = parser.parse_args()
 
     checkpoints_dir = Path(args.checkpoints_dir).resolve()
     output_dir = Path(args.output_dir).resolve() if args.output_dir else checkpoints_dir
     results_dir = output_dir / "results"
     logs_dir = output_dir / "logs"
+    videos_dir = output_dir / "videos"
     results_dir.mkdir(parents=True, exist_ok=True)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -240,6 +253,8 @@ def main():
                 output_json=result_json,
                 log_path=logs_dir / f"{label}.log",
                 save_videos=args.save_videos,
+                is_rl_checkpoint=(label != "base" and args.rl_curve),
+                video_dir=(videos_dir / label) if args.save_videos else None,
             )
             if not ok:
                 continue  # keep going with the rest of the sweep

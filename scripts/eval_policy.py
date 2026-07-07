@@ -25,7 +25,7 @@ from expo_ft.utils.config_loader import load_task_config, get_sft_config_name
 from expo_ft.env.env_factory import make_env_wrapper
 
 def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_action_stats=False,
-             episode_seeds=None, output_json=None, diagnose_subconditions=False):
+             episode_seeds=None, output_json=None, diagnose_subconditions=False, rl_checkpoint_path=None):
     """
     episode_seeds: optional list[int] of length n_episodes. When provided, env.reset()
     is called with seed=episode_seeds[ep] for each episode — guarantees the SAME initial
@@ -38,6 +38,21 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
     and tracks, per episode, whether each boolean sub-condition of a composite
     success criterion (e.g. PickCube-v1's is_obj_placed / is_robot_static) was ever
     True, and whether they were ever True AT THE SAME STEP. Printed as a summary at
+
+    rl_checkpoint_path: path to an RL/EXPOLearner checkpoint STEP directory
+    (e.g. ".../checkpoints/40000"), as opposed to `checkpoint_path` which is
+    for SFT/openpi-style checkpoints. An RL checkpoint's "params" item is a
+    multi-component dict (batch_encoder/residual_actor/temp/critic/actor
+    params — see expo_ft.agents.alg.expo_ft._split_params), NOT the simple
+    {"params": <tree>} shape openpi's weight loader expects, so it cannot be
+    loaded via `checkpoint_path`/pi05_weight_loader_path at all — it needs
+    orbax's own restore_checkpoint() instead. When set, the built agent's
+    actual weights (VLA + residual actor + critic) are overwritten by
+    restore_checkpoint() right after construction, and evaluation uses
+    only_base_actions=False so the trained residual policy + critic-based
+    action selection actually run — evaluating an RL checkpoint with
+    only_base_actions=True (the SFT-checkpoint default) would silently
+    evaluate just the frozen VLA, never reflecting anything RL trained.
     the end, alongside (not instead of) the normal success_rate report.
     """
     if episode_seeds is not None and len(episode_seeds) != n_episodes:
@@ -104,13 +119,18 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
     # bakée, ce qui garde l'eval cohérente avec l'entraînement, que checkpoint_path soit
     # fourni (SFT) ou non (baseline pi05_droid_jointpos pur).
 
-    # Load SFT checkpoint if provided
-    if checkpoint_path is not None:
+    # Load SFT checkpoint if provided. NOTE: when rl_checkpoint_path is set, we
+    # deliberately ignore checkpoint_path here and load base weights as a
+    # structural placeholder — restore_checkpoint() below overwrites the
+    # actual VLA/residual/critic weights from the RL checkpoint right after,
+    # so there's no need to separately know the original SFT checkpoint path.
+    if checkpoint_path is not None and rl_checkpoint_path is None:
         model_config.pi05_weight_loader_path = str(Path(checkpoint_path) / "params")
         print(f"Loaded checkpoint from: {checkpoint_path}")
     else:
         model_config.pi05_weight_loader_path = None
-        print("Using base π₀.₅ weights (no checkpoint) — pi05_droid_jointpos + DROID norm_stats")
+        if rl_checkpoint_path is None:
+            print("Using base π₀.₅ weights (no checkpoint) — pi05_droid_jointpos + DROID norm_stats")
 
     # Build π₀.₅ (unnormalize est à True par défaut ici, ce qui est correct pour le SFT)
     actor, actor_train_state, target_actor_params, agent_kwargs, vla_metadata = build_pi05(
@@ -165,6 +185,29 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
     )
     agent = agent.cache_infer_params()
 
+    only_base_actions = True
+    if rl_checkpoint_path is not None:
+        import orbax.checkpoint as ocp
+        from expo_ft.agents.alg.expo_ft import restore_checkpoint
+
+        rl_ckpt_path = Path(rl_checkpoint_path).resolve()
+        rl_step = int(rl_ckpt_path.name)
+        rl_checkpoint_dir = rl_ckpt_path.parent
+        print(f"Restoring RL checkpoint: step {rl_step} from {rl_checkpoint_dir}")
+
+        rl_mngr = ocp.CheckpointManager(
+            rl_checkpoint_dir,
+            item_handlers={
+                "agent": ocp.PyTreeCheckpointHandler(),
+                "params": ocp.PyTreeCheckpointHandler(),
+            },
+            options=ocp.CheckpointManagerOptions(create=False),
+        )
+        agent = restore_checkpoint(rl_mngr, agent, rl_step)
+        agent = agent.cache_infer_params()
+        only_base_actions = False  # let the trained residual policy + critic actually run
+        print("RL checkpoint restored — evaluating full agent (VLA + residual policy + critic).")
+
     # Config-driven keys
     state_obs_key  = cfg.state_obs_key
     action_dim     = getattr(cfg, 'output_action_dim', 7)
@@ -190,7 +233,7 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
 
         while not done and steps < cfg.max_steps_per_episode:
             if not action_plan:
-                action_chunk, agent, _ = agent.sample_actions(obs, only_base_actions=True)
+                action_chunk, agent, _ = agent.sample_actions(obs, only_base_actions=only_base_actions)
                 all_actions.append(action_chunk)
                 if ep == 0 and steps == 0:
                     print(f"\n--- DEBUG EP 0 STEP 0 ---")
@@ -291,6 +334,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config",     required=True)
     parser.add_argument("--checkpoint", default=None, help="Path to SFT directory checkpoint")
+    parser.add_argument(
+        "--rl-checkpoint", default=None,
+        help="Path to an RL/EXPOLearner checkpoint STEP directory (e.g. "
+             ".../checkpoints/40000), as opposed to --checkpoint which is for "
+             "SFT/openpi-style checkpoints. Loads the full agent (VLA + "
+             "trained residual actor + critic) via orbax's own "
+             "restore_checkpoint() and evaluates with only_base_actions=False "
+             "so the trained residual policy actually runs. Mutually "
+             "exclusive with --checkpoint (this one wins if both are given).",
+    )
     parser.add_argument("--n-episodes", type=int, default=50)
     parser.add_argument("--seed",       type=int, default=42)
     parser.add_argument(
@@ -309,6 +362,15 @@ if __name__ == "__main__":
         "--no-video", action="store_true",
         help="Skip saving rollout videos. Useful for large checkpoint sweeps where "
              "hundreds of videos would otherwise be written.",
+    )
+    parser.add_argument(
+        "--video-dir", default=None,
+        help="Exact directory to save rollout videos in, overriding the default "
+             "auto-timestamped logs/eval_videos/eval_<env>_<mode>_<timestamp>/ dir. "
+             "Used by scripts/eval_curve.py so every checkpoint in a sweep writes "
+             "its videos under a shared parent directory, one subfolder per "
+             "checkpoint, instead of each eval_policy.py subprocess call getting "
+             "its own scattered timestamped folder. Ignored if --no-video is set.",
     )
     parser.add_argument(
         "--diagnose-subconditions", action="store_true",
@@ -330,9 +392,16 @@ if __name__ == "__main__":
         n_episodes = len(episode_seeds)
         print(f"Loaded {n_episodes} fixed episode seeds from: {args.episode_seeds}")
 
-    mode = "sft" if args.checkpoint is not None else "baseline"
+    if args.rl_checkpoint is not None:
+        mode = "rl"
+    elif args.checkpoint is not None:
+        mode = "sft"
+    else:
+        mode = "baseline"
     if args.no_video:
         video_dir = None
+    elif args.video_dir is not None:
+        video_dir = args.video_dir
     else:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         video_dir = str(REPO_ROOT / "logs" / "eval_videos" / f"eval_{cfg.env_id}_{mode}_{timestamp}")
@@ -347,4 +416,5 @@ if __name__ == "__main__":
         episode_seeds=episode_seeds,
         output_json=args.output_json,
         diagnose_subconditions=args.diagnose_subconditions,
+        rl_checkpoint_path=args.rl_checkpoint,
     )
