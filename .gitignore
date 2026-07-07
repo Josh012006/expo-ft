@@ -13,6 +13,9 @@ assets/
 client/.venv/
 demos/
 logs/
-slurm-*.out
+demos
+logs
+*.out
 third_party/robocasa
 third_party/robosuite
+weights-backup/

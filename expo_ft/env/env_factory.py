@@ -4,8 +4,6 @@ Selects the correct wrapper based on cfg.env_wrapper.
 
 Supported values:
     "maniskill"  → ManiSkillEnvWrapper  (default)
-    "libero"     → LiberoEnvWrapper
-    "robocasa"   → RoboCasaEnvWrapper
 """
 
 
@@ -26,16 +24,16 @@ def make_env_wrapper(env_creation_request: dict, cfg=None):
         from expo_ft.env.maniskill_env import ManiSkillEnvWrapper
         return ManiSkillEnvWrapper(env_creation_request, cfg)
 
-    elif env_wrapper == 'libero':
-        from expo_ft.env.libero_env import LiberoEnvWrapper
-        return LiberoEnvWrapper(env_creation_request, cfg)
+    #elif env_wrapper == 'libero':
+        #from expo_ft.env.libero_env import LiberoEnvWrapper
+        #return LiberoEnvWrapper(env_creation_request, cfg)
 
-    elif env_wrapper == 'robocasa':
-        from expo_ft.env.robocasa_env import RoboCasaEnvWrapper
-        return RoboCasaEnvWrapper(env_creation_request, cfg)
+    #elif env_wrapper == 'robocasa':
+        #from expo_ft.env.robocasa_env import RoboCasaEnvWrapper
+        #return RoboCasaEnvWrapper(env_creation_request, cfg)
 
     else:
         raise ValueError(
             f"Unknown env_wrapper: '{env_wrapper}'. "
-            f"Supported: 'maniskill', 'libero', 'robocasa'"
+            f"Supported: 'maniskill'"
         )

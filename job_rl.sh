@@ -27,7 +27,7 @@ SFT_CHECKPOINT=${3:-}
 cd ~/projects/expo-ft
 source scripts/setup_env.sh "$VENV"
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
-python scripts/run_pipeline.py \
+python3 scripts/run_pipeline.py \
     --config "$CONFIG" \
     --stage rl \
     ${SFT_CHECKPOINT:+--sft-checkpoint "$SFT_CHECKPOINT"}

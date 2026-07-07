@@ -23,6 +23,6 @@ VENV=${1:-.venv}
 CONFIG=${2:-configs/task/maniskill/stack_cube.yaml}
 cd ~/projects/expo-ft
 source scripts/setup_env.sh "$VENV"
-python scripts/run_pipeline.py \
+python3 scripts/run_pipeline.py \
     --config "$CONFIG" \
     --stage demos

@@ -37,7 +37,7 @@ RL_CHECKPOINT=${5:-}
 
 cd ~/projects/expo-ft
 source scripts/setup_env.sh "$VENV"
-python scripts/eval_policy.py \
+python3 scripts/eval_policy.py \
     --config "$CONFIG" \
     --n-episodes "$N_EPISODES" \
     ${CHECKPOINT:+--checkpoint "$CHECKPOINT"} \

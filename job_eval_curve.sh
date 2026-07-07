@@ -44,7 +44,7 @@ START_CHECKPOINT=${6:-}
 RL_CURVE=${7:-}
 cd ~/projects/expo-ft
 source scripts/setup_env.sh "$VENV"
-python scripts/eval_curve.py \
+python3 scripts/eval_curve.py \
     --config "$CONFIG" \
     --checkpoints-dir "$CHECKPOINTS_DIR" \
     --n-episodes "$N_EPISODES" \
