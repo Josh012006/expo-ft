@@ -58,14 +58,21 @@ def main(_):
     # Override FLAGS.config RL hyperparameters from the task YAML so everything
     # is configured in one place (the YAML) rather than split between YAML and
     # configs/model/expo_ft_pi_config.py.
-    FLAGS.config.actor_lr         = getattr(cfg, "rl_lr", FLAGS.config.actor_lr)
-    FLAGS.config.critic_lr        = getattr(cfg, "rl_lr", FLAGS.config.critic_lr)
-    FLAGS.config.discount         = getattr(cfg, "rl_discount", FLAGS.config.discount)
-    FLAGS.config.tau              = getattr(cfg, "rl_tau", FLAGS.config.tau)
-    FLAGS.config.init_temperature = getattr(cfg, "rl_init_temperature", FLAGS.config.init_temperature)
+    # NOTE: float() wrapping below is a deliberate defense against a PyYAML quirk —
+    # bare scientific notation without a decimal point (e.g. "3e-4") is parsed as
+    # a STRING, not a float (needs "3.0e-4" to parse correctly). ml_collections
+    # then raises a TypeError trying to assign a str into a float-typed field.
+    # float(x) is a no-op if x is already a float, and fixes it if x is a
+    # not-quite-valid-YAML-float string — belt and suspenders alongside fixing
+    # the YAML values themselves.
+    FLAGS.config.actor_lr         = float(getattr(cfg, "rl_lr", FLAGS.config.actor_lr))
+    FLAGS.config.critic_lr        = float(getattr(cfg, "rl_lr", FLAGS.config.critic_lr))
+    FLAGS.config.discount         = float(getattr(cfg, "rl_discount", FLAGS.config.discount))
+    FLAGS.config.tau              = float(getattr(cfg, "rl_tau", FLAGS.config.tau))
+    FLAGS.config.init_temperature = float(getattr(cfg, "rl_init_temperature", FLAGS.config.init_temperature))
     if hasattr(cfg, "rl_hidden_dims"):
         FLAGS.config.hidden_dims  = tuple(cfg.rl_hidden_dims)
-    FLAGS.config.edit_scale       = getattr(cfg, "rl_edit_scale", FLAGS.config.edit_scale)
+    FLAGS.config.edit_scale       = float(getattr(cfg, "rl_edit_scale", FLAGS.config.edit_scale))
     # Sync actor_success_only from the task YAML into the model config too —
     # BatchProcessor already reads it from cfg (line below, via train_pi_robo's
     # own actor_success_only variable), but the EXPOLearner agent itself reads
