@@ -54,6 +54,18 @@ def main(_):
     from expo_ft.utils.config_loader import get_sft_config_name
     FLAGS.config.pi05_config_name = get_sft_config_name(cfg)
     FLAGS.config.skip_repack_transforms = cfg.skip_repack_transforms
+
+    # Override FLAGS.config RL hyperparameters from the task YAML so everything
+    # is configured in one place (the YAML) rather than split between YAML and
+    # configs/model/expo_ft_pi_config.py.
+    FLAGS.config.actor_lr         = getattr(cfg, "rl_lr", FLAGS.config.actor_lr)
+    FLAGS.config.critic_lr        = getattr(cfg, "rl_lr", FLAGS.config.critic_lr)
+    FLAGS.config.discount         = getattr(cfg, "rl_discount", FLAGS.config.discount)
+    FLAGS.config.tau              = getattr(cfg, "rl_tau", FLAGS.config.tau)
+    FLAGS.config.init_temperature = getattr(cfg, "rl_init_temperature", FLAGS.config.init_temperature)
+    if hasattr(cfg, "rl_hidden_dims"):
+        FLAGS.config.hidden_dims  = tuple(cfg.rl_hidden_dims)
+    FLAGS.config.edit_scale       = getattr(cfg, "rl_edit_scale", FLAGS.config.edit_scale)
     # Sync actor_success_only from the task YAML into the model config too —
     # BatchProcessor already reads it from cfg (line below, via train_pi_robo's
     # own actor_success_only variable), but the EXPOLearner agent itself reads
