@@ -42,8 +42,14 @@ def run(cmd: list[str], **kwargs):
 
 def stage_demos(cfg, args):
     """Generate ManiSkill demos, replay-validate them in the task's control mode,
-    then convert to droid_format (RL offline buffer) and LeRobot (SFT trainer)."""
-    n_demos = getattr(cfg, "num_demos", 550)
+    then convert to droid_format (RL offline buffer) and LeRobot (SFT trainer).
+
+    n_demos (from cfg.num_demos_generate) is how many successful raw demo
+    episodes to GENERATE via motion planning — a one-time, upfront step.
+    This is a different concept from num_data_sft/num_data_rl, which control
+    how many of the already-generated demos to LOAD for SFT/RL respectively.
+    """
+    n_demos = getattr(cfg, "num_demos_generate", 550)
     mp_root = REPO_ROOT / "demos"  # mani_skill appends <env_id>/motionplanning itself
 
     # 1. Generate raw mplib demos (native pd_joint_pos), keep only successful ones.

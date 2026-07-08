@@ -31,6 +31,10 @@ robot_uids: "panda_wristcam"
 
 
 # ── Data ───────────────────────────────────────────────────────
+# How many successful demo episodes to GENERATE via motion planning
+# (--stage demos, a one-time upfront step). Different from num_data_sft/
+# num_data_rl below, which control how many of these to LOAD for SFT/RL.
+num_demos_generate: 550
 lerobot_repo_id: "expo_ft/push_cube"
 droid_format_dir: "demos/PushCube-v1/droid_format"
 # Skip RepackTransform in replay buffer — our observations already have the
