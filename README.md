@@ -42,8 +42,18 @@ python -c "import mani_skill.envs, torch, imageio, gymnasium, matplotlib; print(
 **For the compute part:**
 - Vulkan fix for headless rendering is baked into the job scripts
   (`libvulkan1` download + `VK_ICD_FILENAMES`).
-- Use A100L (80GB), not a 40GB A100 — training peaks around 60GB.
+- Use A100L (80GB), not a 40GB A100 — training peaks around 78GB (see the
+  `XLA_PYTHON_CLIENT_MEM_FRACTION` note below).
   `job_demos.sh` doesn't need a GPU-heavy card (no model loaded there).
+- `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` is set in `job_rl.sh` — JAX's default
+  is only 75% of the card, which was the actual root cause of repeated OOM
+  crashes at ~61GB on an 80GB card (see Changelog). Don't remove this.
+- On Mila, keep large package caches (`uv`, `openpi`, `huggingface`, `pip`,
+  `jax`) on `$SCRATCH` with symlinks back into `~/.cache` — `$HOME` is capped
+  at 100GB and these can easily exceed that alone. Keep the repo itself
+  (code, `.venv`) on `$HOME`, not `$SCRATCH` — `$SCRATCH` is meant for
+  temporary/job files and gets periodically cleaned; only `logs/` and
+  `demos/` should be symlinked there given their size.
 
 ## Pipeline
 
@@ -56,12 +66,41 @@ Everything runs through `scripts/run_pipeline.py --config <task.yaml> --stage <s
 | `rl` | ExpoFT RL fine-tuning from an SFT checkpoint | `job_rl.sh <venv> <config> [sft_checkpoint]` |
 | `all` | All of the above in sequence | — |
 
-Evaluation: `scripts/eval_policy.py` (single checkpoint) or `scripts/eval_curve.py`
-(sweeps every checkpoint in a directory on a fixed set of episode seeds, with
-±1 SE error bars).
+Evaluation:
+- `scripts/eval_policy.py` (single checkpoint) — `--checkpoint <sft_dir>` for an
+  SFT checkpoint, or `--rl-checkpoint <rl_checkpoints_dir>/<step>` for a full
+  RL/EXPOLearner checkpoint (residual policy + critic included, not just the
+  frozen VLA — see Changelog, this needed a real fix). `job_eval.sh <venv>
+  <config> <n_episodes> [checkpoint] [rl_checkpoint]`.
+- `scripts/eval_curve.py` — sweeps every checkpoint in a directory on a fixed
+  set of episode seeds, with ±1 SE error bars. Add `--rl-curve` when sweeping
+  RL checkpoints, and `--start-checkpoint <sft_dir>` to use the SFT checkpoint
+  an RL run started from as the curve's step-0 reference point (instead of the
+  untrained base model, which wouldn't reflect what RL improved upon).
+  `--save-videos` writes one subdirectory per checkpoint under a shared
+  `videos/` folder. `job_eval_curve.sh <venv> <config> <checkpoints_dir>
+  <n_episodes> [save_videos] [start_checkpoint] [rl_curve]`.
 
 Tasks currently in use: **StackCube-v1**, **PushCube-v1**, **PickCube-v1**
-(revived after the camera fixes below — see Known Issues).
+(the goal-marker visibility patch — see Known Issues — is required for
+PickCube to be usable at all).
+
+## Current status (July 2026)
+
+SFT is fully validated on all three tasks (see Published checkpoints below).
+**RL fine-tuning currently degrades the SFT policy on every task and every
+hyperparameter configuration tried so far** — success rate consistently
+collapses after an initial stable period, correlated in timing with growing
+instability in `training/critic_loss`. This holds even when starting from a
+strong SFT checkpoint (86% success) and even when reproducing the original
+paper's exact `utd_ratio=20` within the paper's own validated training length
+(~20k steps) — that specific test collapsed *faster* than our reduced
+`utd_ratio=2` configuration, showing `utd_ratio` itself (not total training
+duration) is the dominant driver of the instability observed here. See
+Changelog for the RL-hyperparameter fixes made along the way, and the
+`configs/model/expo_ft_pi_config.py` vs. task-YAML hyperparameter comparison
+below. This is an open, unresolved research question at the time of writing —
+not a known bug.
 
 ## Known issues / open items
 
@@ -77,8 +116,8 @@ Tasks currently in use: **StackCube-v1**, **PushCube-v1**, **PickCube-v1**
   at the model's input resolution instead of upsampling from 128.
 - **PickCube-v1** — goal marker visibility fixed via a monkeypatch
   (`expo_ft/env/patches.py`, since ManiSkill hides it from sensor cameras by
-  default); the camera-angle fix above may also resolve the gripper-occlusion
-  concern raised earlier, revisiting now.
+  default). Confirmed working and PickCube-v1 is back in the active task set
+  (all RL-stage experiments now cover all three tasks).
 
 ## Camera & embodiment configuration (YAML fields)
 
@@ -101,19 +140,45 @@ before committing to a change.
 Demo generation applies the same overrides via `scripts/replay_trajectory_patched.py`
 (see Changelog) — regenerate demos after changing any of these fields.
 
+## RL hyperparameters (YAML fields)
+
+```yaml
+rl_lr: 3.0e-4                    # learning rate for critic and actor (NOTE: write scientific
+                                  # notation WITH a decimal point — bare "3e-4" parses as a
+                                  # string, not a float, in PyYAML; see Changelog)
+rl_discount: 0.99                # discount factor gamma for Bellman backup
+rl_tau: 0.005                    # polyak averaging coefficient for critic target network
+rl_init_temperature: 1.0         # initial SAC entropy temperature
+rl_hidden_dims: [256, 256, 256]  # hidden layer sizes for critic and edit policy MLPs
+rl_edit_scale: 0.2               # max magnitude of residual action (paper: 0.05–0.2 by task difficulty)
+actor_success_only: true         # if true, actor batch is sampled only from successful transitions
+utd_ratio: 2                     # gradient updates per new transition collected (paper: 20 — see Current status)
+offline_ratio: 0.5               # fraction of batch from a separate offline demo buffer
+                                  # (paper actually uses 0 — demos inserted directly into the
+                                  # single online buffer; 0.5 is our own deviation, tested as a
+                                  # stability lever, not the paper's default)
+```
+
+These are read directly by `train_pi_robo.py` and explicitly override the
+corresponding fields in `configs/model/expo_ft_pi_config.py` — see Changelog
+for why this override wiring was needed (these used to be silently ignored).
+
 ## Dataset size & resuming (YAML fields)
 
 ```yaml
+num_demos_generate: 550  # episodes to GENERATE via motion planning (--stage demos, one-time)
 num_data_sft: 50     # episodes used for SFT (0 = every episode in the LeRobot dataset)
 num_data_rl: 50      # episodes loaded into the RL offline replay buffer (0 = all)
 sft_resume_dir: null # resume an existing SFT run from this exact directory
 rl_resume_dir: null  # resume an existing RL run from this exact directory
 ```
 
-Both demo-count fields limit an already-converted dataset to its first N
-episodes — no reconversion, no config duplication. SFT checkpoints
-auto-namespace when `num_data_sft > 0` (e.g. `..._sft_demos50`) so a
-limited-demo run never collides with a full-dataset run.
+`num_demos_generate` is a different concept from `num_data_sft`/`num_data_rl`
+above — how many demos to *generate*, vs. how many of the already-generated
+demos to *load*. Both demo-count-for-training fields limit an already-converted
+dataset to its first N episodes — no reconversion, no config duplication. SFT
+checkpoints auto-namespace when `num_data_sft > 0` (e.g. `..._sft_demos50`) so
+a limited-demo run never collides with a full-dataset run.
 
 `sft_resume_dir`/`rl_resume_dir` are deliberately separate fields (not a
 single shared `resume_dir`) — SFT and RL are different runs with different
@@ -124,6 +189,61 @@ These used to be CLI overrides (`--num-demos` on `run_pipeline.py`); they're
 YAML-only now so a run's full configuration lives in one place.
 
 ## Changelog — key fixes made while adapting to ManiSkill (July 2026)
+
+**RL checkpoint evaluation was silently impossible before this fix:**
+`eval_policy.py` had only ever been built/tested against SFT/openpi-style
+checkpoints (`--checkpoint`, loaded via `pi05_weight_loader_path`). Trying to
+point it at an RL/EXPOLearner checkpoint crashed with `KeyError: 'params'` —
+an RL checkpoint's `"params"` orbax item is a multi-component dict (VLA +
+residual actor + critic + temperature + batch encoder params, see
+`expo_ft.agents.alg.expo_ft._split_params`), not the simple `{"params": <tree>}`
+shape openpi's weight loader expects. Even if that had been fixed, evaluation
+would have still silently run with `only_base_actions=True` — evaluating just
+the frozen VLA, never the trained residual policy. New `--rl-checkpoint` flag
+restores the full agent via orbax's own `restore_checkpoint()` and evaluates
+with `only_base_actions=False` so the residual policy + critic-based action
+selection actually run. `eval_curve.py` gained matching `--rl-curve` /
+`--start-checkpoint` support (see Pipeline section above).
+
+**RL hyperparameters were silently ignored from the task YAML:** `rl_lr`,
+`rl_discount`, `rl_tau`, `rl_init_temperature` (previously misnamed
+`rl_alpha`), `rl_hidden_dims`, and `rl_edit_scale` (previously
+`rl_edit_action_scale`) were all defined in the task YAMLs but never actually
+read anywhere in `train_pi_robo.py` — the real values always came from
+`configs/model/expo_ft_pi_config.py`'s defaults instead, which happened to
+already match the paper for most of these (so no past run was actually
+mis-configured by this — but the YAML gave false confidence of control, and
+would have silently no-opped if anyone had tried to change one of these
+values). Fixed by explicitly wiring `FLAGS.config.X = getattr(cfg, "rl_X",
+...)` overrides near the top of `train_pi_robo.py::main()`, executed before
+`build_pi05()` reads `FLAGS.config` — verified this ordering is correct
+(`build_pi05_config()` does `agent_kwargs = dict(config)`, capturing whatever
+mutations were made up to that point).
+
+**PyYAML scientific-notation gotcha:** bare scientific notation without a
+decimal point (e.g. `3e-4`) parses as a **string**, not a float — PyYAML
+requires `3.0e-4`. This crashed a job the first time `rl_lr` was actually
+wired up to be read. All task YAMLs fixed to use the decimal-point form, and
+the override code in `train_pi_robo.py` now also defensively wraps every
+numeric override in `float(...)` as a second line of defense.
+
+**`num_demos` (in `stage_demos`, controls how many raw demos to *generate*)
+was an orphaned field** — no YAML ever defined a field by that name (only
+`num_data_sft`/`num_data_rl`, a different concept: how many *already-generated*
+demos to load), so it always silently fell back to a hardcoded `550`. Renamed
+to `num_demos_generate` and added to all three task YAMLs.
+
+**TensorBoard was silently missing most training metrics** (`critic_loss`,
+`actor_loss`, `residual_actor_loss` — only `eval/success_rate` and
+`training/loop_time_ms` showed up) because the logging code filtered on
+`isinstance(v, (int, float))`, which excludes JAX scalar arrays
+(`jnp.float32`). wandb showed everything fine since it accepts JAX arrays
+directly. Fixed with an explicit `float()` cast before `tb_writer.add_scalar`.
+
+**Repo migrated from living on `$SCRATCH` to living on `$HOME`** (only
+`logs/`/`demos/` remain symlinked to `$SCRATCH`), and `openpi`/`ManiSkill`
+converted from untracked/pip-installed dependencies to proper editable git
+submodules — see Setup above for the current recommended layout.
 
 **Pre-SFT pipeline:**
 - Fixed `eval_policy.py` unconditionally overriding the DROID-official
@@ -215,6 +335,18 @@ replay validation), `capture_camera_comparison.py` (visual camera
 verification, supports `--seed`), `diagnose_reward_timing.py` (confirms the
 reward/action timing convention matches the original ExpoFT reference
 implementation — intentional, not a porting bug).
+
+## Published checkpoints
+
+SFT checkpoints (LoRA, JAX/orbax format — see each model card for why no
+PyTorch conversion is provided) are published on HuggingFace:
+
+- [`josh11234/ExpoFT-Pi05-StackCube-v1-SFT`](https://huggingface.co/josh11234/ExpoFT-Pi05-StackCube-v1-SFT) (41% success on 200 held-out seeds)
+- [`josh11234/ExpoFT-Pi05-PushCube-v1-SFT-62p`](https://huggingface.co/josh11234/ExpoFT-Pi05-PushCube-v1-SFT-62p) (62% success on 200 held-out seeds)
+- [`josh11234/ExpoFT-Pi05-PushCube-v1-SFT-86p`](https://huggingface.co/josh11234/ExpoFT-Pi05-PushCube-v1-SFT-86p) (86% success on 200 held-out seeds)
+
+No RL checkpoints are published — RL has not yet produced a policy that
+improves on these SFT baselines (see Current status above).
 
 ## Original paper
 
