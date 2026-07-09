@@ -83,7 +83,7 @@ rl_resume_dir: null
 checkpoint_model: true
 checkpoint_interval: 1000  # save checkpoint every N steps (0 = only save at end)
 checkpoint_buffer: false   # save replay buffer transitions to disk at each step
-keep_period: 40000         # keep one checkpoint every N steps (older ones are deleted)
+keep_period: 20000         # keep one checkpoint every N steps (older ones are deleted)
 max_to_keep: 2
 
 

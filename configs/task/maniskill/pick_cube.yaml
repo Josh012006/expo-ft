@@ -51,14 +51,14 @@ output_dir: "logs/pick_cube"  # a timestamped subdir is created automatically pe
 # ── SFT warmup ─────────────────────────────────────────────────
 sft_exp_name: "pick_cube_sft"
 sft_num_workers: 12
-sft_num_train_steps: 4000
+sft_num_train_steps: 8000
 sft_batch_size: 64
 sft_use_lora: true         # use LoRA fine-tuning (faster, less memory than full fine-tune)
 sft_peak_lr: 2.5e-5
 sft_save_interval: 200
 sft_log_interval: 100
-sft_resume: false
-sft_resume_dir: null
+sft_resume: true
+sft_resume_dir: "logs/pick_cube/pick_cube_expo_ft_2026-07-05_01-06-12"
 num_data_sft: 50
 
 
@@ -83,7 +83,7 @@ rl_resume_dir: null
 checkpoint_model: true
 checkpoint_interval: 1000  # save checkpoint every N steps (0 = only save at end)
 checkpoint_buffer: false   # save replay buffer transitions to disk at each step
-keep_period: 40000         # keep one checkpoint every N steps (older ones are deleted)
+keep_period: 20000         # keep one checkpoint every N steps (older ones are deleted)
 max_to_keep: 2
 
 
