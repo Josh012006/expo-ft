@@ -51,14 +51,14 @@ output_dir: "logs/pick_cube"  # a timestamped subdir is created automatically pe
 # ── SFT warmup ─────────────────────────────────────────────────
 sft_exp_name: "pick_cube_sft"
 sft_num_workers: 12
-sft_num_train_steps: 8000
+sft_num_train_steps: 4000
 sft_batch_size: 64
 sft_use_lora: true         # use LoRA fine-tuning (faster, less memory than full fine-tune)
 sft_peak_lr: 2.5e-5
 sft_save_interval: 200
 sft_log_interval: 100
 sft_resume: true
-sft_resume_dir: "logs/pick_cube/pick_cube_expo_ft_2026-07-05_01-06-12"
+sft_resume_dir: null #"logs/pick_cube/pick_cube_expo_ft_2026-07-05_01-06-12"
 num_data_sft: 50
 
 
@@ -92,6 +92,11 @@ rl_lr: 3.0e-4                     # learning rate for critic and edit policy
 rl_discount: 0.99               # discount factor gamma for Bellman backup
 rl_tau: 0.005                   # polyak averaging coefficient for target network soft update
 rl_init_temperature: 1.0        # initial entropy temperature (controls exploration vs exploitation)
+rl_adjust_target_entropy: true   # if true, target entropy accounts for edit_scale's log-Jacobian
+                                  # correction (target = -action_dim/2 + action_dim*log(edit_scale));
+                                  # if false, this correction is omitted, which can badly miscalibrate
+                                  # the entropy target when edit_scale is far from 1 (was false, alpha
+                                  # grew unbounded chasing an uncorrected target — see July 2026 notes)
 rl_hidden_dims: [256, 256, 256] # hidden layer sizes for critic and edit policy MLPs
 rl_edit_scale: 0.2              # max magnitude of residual action added by edit policy
 actor_success_only: true        # if true, actor batch is sampled only from successful transitions
