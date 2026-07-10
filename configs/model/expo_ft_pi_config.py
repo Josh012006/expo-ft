@@ -1,3 +1,4 @@
+from ml_collections.config_dict import config_dict
 from configs.model import sac_config
 
 
@@ -16,6 +17,7 @@ def get_config():
     config.adjust_target_entropy = False
     config.entropy_scale = 1.0
     config.edit_scale = 0.2
+    config.fixed_temperature = config_dict.placeholder(float)  # if set, bypasses the learned SAC temperature entirely
     config.actor_drop = 0.0
     config.actor_lr = 3e-4
     config.critic_lr = 3e-4

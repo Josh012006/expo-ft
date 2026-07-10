@@ -71,6 +71,8 @@ def main(_):
     FLAGS.config.tau              = float(getattr(cfg, "rl_tau", FLAGS.config.tau))
     FLAGS.config.init_temperature = float(getattr(cfg, "rl_init_temperature", FLAGS.config.init_temperature))
     FLAGS.config.adjust_target_entropy = getattr(cfg, "rl_adjust_target_entropy", FLAGS.config.adjust_target_entropy)
+    _rl_fixed_temperature = getattr(cfg, "rl_fixed_temperature", FLAGS.config.fixed_temperature)
+    FLAGS.config.fixed_temperature = float(_rl_fixed_temperature) if _rl_fixed_temperature is not None else None
     if hasattr(cfg, "rl_hidden_dims"):
         FLAGS.config.hidden_dims  = tuple(cfg.rl_hidden_dims)
     FLAGS.config.edit_scale       = float(getattr(cfg, "rl_edit_scale", FLAGS.config.edit_scale))

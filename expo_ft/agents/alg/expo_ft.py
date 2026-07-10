@@ -202,6 +202,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
     freeze_encoder: Optional[bool] = struct.field(pytree_node=False)
     freeze_critic_encoder: bool = struct.field(pytree_node=False)
     actor_success_only: bool = struct.field(pytree_node=False)
+    fixed_temperature: Optional[float] = struct.field(pytree_node=False, default=None)
     _infer_cache: Optional[dict] = struct.field(pytree_node=False, default=None)
 
     @classmethod
@@ -235,6 +236,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         adjust_target_entropy: Optional[bool] = False,
         entropy_scale: float = 1.0,
         init_temperature: float = 1.0,
+        fixed_temperature: Optional[float] = None,
         use_pnorm: bool = False,
         use_critic_resnet: bool = False,
         actor_drop: Optional[float] = None,
@@ -435,6 +437,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             discount=discount,
             num_qs=num_qs,
             num_min_qs=num_min_qs,
+            fixed_temperature=fixed_temperature,
             data_augmentation_fn=make_data_augmentation_fn(use_full_augmentation),
 
             action_dim=action_dim,
@@ -710,8 +713,16 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
                 rngs={"dropout": key2},
             )  # training=True
             q = qs.mean(axis=0)
+            # Use a manually fixed temperature when configured (bypasses the learned
+            # temperature entirely) — a quick diagnostic Jesse suggested to see if the
+            # runaway/unconverged alpha behavior is itself contributing to instability,
+            # independent of whatever is or isn't miscalibrated in the learned version.
+            temperature = (
+                self.fixed_temperature if self.fixed_temperature is not None
+                else self.temp.apply_fn({"params": self.temp.params})
+            )
             residual_actor_loss = (
-                self.entropy_scale * log_probs * self.temp.apply_fn({"params": self.temp.params}) - q
+                self.entropy_scale * log_probs * temperature - q
             ).mean()
             return residual_actor_loss, {"residual_q": q.mean(), "residual_actor_loss": residual_actor_loss, "entropy": -log_probs.mean()}
 
@@ -939,8 +950,14 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
 
         if self.n_edit_samples > 0:
             new_agent, r_actor_info = new_agent.update_residual_actor(last_minibatch)
-            new_agent, temp_info = new_agent.update_temperature(r_actor_info["entropy"])
-            actor_info = {**actor_info, **r_actor_info, **temp_info}
+            actor_info = {**actor_info, **r_actor_info}
+            if self.fixed_temperature is None:
+                new_agent, temp_info = new_agent.update_temperature(r_actor_info["entropy"])
+                actor_info = {**actor_info, **temp_info}
+            else:
+                # Report the fixed value too, so it still shows up alongside the
+                # learned-temperature runs in wandb/TensorBoard for comparison.
+                actor_info["temperature"] = jnp.asarray(self.fixed_temperature)
 
         critic_info = jax.tree_util.tree_map(lambda x: x[-1], critic_infos)
         return new_agent, {**actor_info, **critic_info}

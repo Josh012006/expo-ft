@@ -62,6 +62,7 @@ class ManiSkillEnvWrapper:
         self._obs = None
         self._info = {}
         self._done = False
+        self._terminated = False
         self._success = False
         self._reward = 0.0
 
@@ -87,6 +88,7 @@ class ManiSkillEnvWrapper:
         self._obs = self._parse_obs(obs)
         self._info = info
         self._done = False
+        self._terminated = False
         self._success = False
         self._reward = 0.0
         return self._obs
@@ -114,6 +116,7 @@ class ManiSkillEnvWrapper:
             self._frames.append(tiled)
         self._obs = self._parse_obs(obs)
         self._reward = float(reward.item() if hasattr(reward, 'item') else reward)
+        self._terminated = bool(terminated.item() if hasattr(terminated, 'item') else terminated)
         self._done = bool((terminated | truncated).item()
                           if hasattr(terminated, 'item') else (terminated or truncated))
         self._success = bool(info.get("success", False))
@@ -129,9 +132,19 @@ class ManiSkillEnvWrapper:
     def get_info_for_step(self):
         """
         Return (done, success, reward, mask).
-        mask = 1 - done (continuation mask for RL).
+        mask = 1 - terminated (continuation mask for RL's Bellman bootstrap).
+
+        IMPORTANT: mask is based on `terminated` only, NOT `done` (which also
+        includes `truncated`, i.e. hitting max_episode_steps). A truncated
+        episode didn't actually reach a genuine end of the MDP — the task
+        simply ran out of allotted time — so its final transition should
+        still bootstrap from the value of the state it ended up in, per
+        standard time-limit-bootstrapping practice (Pardo et al., "Time
+        Limits in Reinforcement Learning", 2018). Using `done` here would
+        incorrectly zero the bootstrap for the (typically large) majority of
+        episodes that time out without succeeding.
         """
-        mask = 1.0 - float(self._done)
+        mask = 1.0 - float(self._terminated)
         return self._done, self._success, self._reward, mask
 
     def get_raw_info(self):

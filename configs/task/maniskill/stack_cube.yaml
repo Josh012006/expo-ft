@@ -98,5 +98,9 @@ rl_adjust_target_entropy: true   # if true, target entropy accounts for edit_sca
                                   # the entropy target when edit_scale is far from 1 (was false, alpha
                                   # grew unbounded chasing an uncorrected target — see July 2026 notes)
 rl_hidden_dims: [256, 256, 256] # hidden layer sizes for critic and edit policy MLPs
+rl_fixed_temperature: null      # if set (e.g. 0.1), bypasses the learned SAC
+                                  # temperature entirely — a diagnostic Jesse suggested
+                                  # to test whether the unconverged/climbing alpha itself
+                                  # contributes to instability (see July 2026 notes)
 rl_edit_scale: 0.2              # max magnitude of residual action added by edit policy
 actor_success_only: true        # if true, actor batch is sampled only from successful transitions
