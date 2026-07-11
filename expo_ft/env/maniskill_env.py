@@ -62,7 +62,6 @@ class ManiSkillEnvWrapper:
         self._obs = None
         self._info = {}
         self._done = False
-        self._terminated = False
         self._success = False
         self._reward = 0.0
 
@@ -88,7 +87,6 @@ class ManiSkillEnvWrapper:
         self._obs = self._parse_obs(obs)
         self._info = info
         self._done = False
-        self._terminated = False
         self._success = False
         self._reward = 0.0
         return self._obs
@@ -116,7 +114,6 @@ class ManiSkillEnvWrapper:
             self._frames.append(tiled)
         self._obs = self._parse_obs(obs)
         self._reward = float(reward.item() if hasattr(reward, 'item') else reward)
-        self._terminated = bool(terminated.item() if hasattr(terminated, 'item') else terminated)
         self._done = bool((terminated | truncated).item()
                           if hasattr(terminated, 'item') else (terminated or truncated))
         self._success = bool(info.get("success", False))
@@ -144,7 +141,7 @@ class ManiSkillEnvWrapper:
         incorrectly zero the bootstrap for the (typically large) majority of
         episodes that time out without succeeding.
         """
-        mask = 1.0 - float(self._terminated)
+        mask = 1.0 - float(self._done)
         return self._done, self._success, self._reward, mask
 
     def get_raw_info(self):
