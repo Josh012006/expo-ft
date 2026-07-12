@@ -18,6 +18,7 @@ def get_config():
     config.entropy_scale = 1.0
     config.edit_scale = 0.2
     config.fixed_temperature = config_dict.placeholder(float)  # if set, bypasses the learned SAC temperature entirely
+    config.critic_grad_clip_norm = config_dict.placeholder(float)  # if set, clips critic + encoder grads to this global norm before adam/adamw
     config.actor_drop = 0.0
     config.actor_lr = 3e-4
     config.critic_lr = 3e-4

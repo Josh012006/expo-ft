@@ -129,17 +129,17 @@ class ManiSkillEnvWrapper:
     def get_info_for_step(self):
         """
         Return (done, success, reward, mask).
-        mask = 1 - terminated (continuation mask for RL's Bellman bootstrap).
+        mask = 1 - done (continuation mask for RL's Bellman bootstrap).
 
-        IMPORTANT: mask is based on `terminated` only, NOT `done` (which also
-        includes `truncated`, i.e. hitting max_episode_steps). A truncated
-        episode didn't actually reach a genuine end of the MDP — the task
-        simply ran out of allotted time — so its final transition should
-        still bootstrap from the value of the state it ended up in, per
-        standard time-limit-bootstrapping practice (Pardo et al., "Time
-        Limits in Reinforcement Learning", 2018). Using `done` here would
-        incorrectly zero the bootstrap for the (typically large) majority of
-        episodes that time out without succeeding.
+        Reverted from the `terminated`-only variant (see git history,
+        commit e99b66d) per Jesse's feedback: given known critic-instability
+        issues from bootstrapping error, every episode — including ones that
+        end by hitting `max_episode_steps` rather than a genuine terminal
+        state — should have a grounded, non-bootstrapped boundary condition.
+        Treating this as a fixed-length episodic task (mask=0 at `done`,
+        which includes both `terminated` and `truncated`) prevents the
+        majority of failed/timed-out episodes from injecting a bootstrapped
+        (and currently unreliable) value estimate into their final target.
         """
         mask = 1.0 - float(self._done)
         return self._done, self._success, self._reward, mask

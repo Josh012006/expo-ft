@@ -232,6 +232,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         critic_dropout_rate: Optional[float] = None,
         critic_weight_decay: Optional[float] = None,
         critic_layer_norm: bool = False,
+        critic_grad_clip_norm: Optional[float] = None,
         target_entropy: Optional[float] = None,
         adjust_target_entropy: Optional[bool] = False,
         entropy_scale: float = 1.0,
@@ -299,10 +300,21 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         )
 
         batch_encoder_params = batch_encoder_def.init(encoder_key, observations)["params"]
+        # Same clip norm as the critic head — the encoder's gradients come from
+        # the same critic loss, so an unclipped encoder would defeat the point
+        # of clipping the head on top of it (Albert's hypothesis: an unfrozen,
+        # unclipped ResNet-34 inflating its own feature magnitudes to chase a
+        # rising Q target).
+        encoder_tx = optax.adam(learning_rate=critic_lr)
+        if critic_grad_clip_norm is not None:
+            encoder_tx = optax.chain(
+                optax.clip_by_global_norm(critic_grad_clip_norm),
+                encoder_tx,
+            )
         batch_encoder = TrainState.create(
             apply_fn=batch_encoder_def.apply,
             params=batch_encoder_params,
-            tx=optax.adam(learning_rate=critic_lr),
+            tx=encoder_tx,
         )
 
         batch_encoder_shape = jax.eval_shape(lambda: batch_encoder)
@@ -376,7 +388,18 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             )
         else:
             tx = optax.adam(learning_rate=critic_lr)
-            
+
+        # Gradient clipping on the critic (and its encoder, since the encoder's
+        # gradients flow through the same update when freeze_critic_encoder=False).
+        # Applied before the adam/adamw step transform, per standard practice —
+        # clip the raw gradient direction/magnitude first, then let adam adapt
+        # per-parameter scaling on top of the clipped gradient.
+        if critic_grad_clip_norm is not None:
+            tx = optax.chain(
+                optax.clip_by_global_norm(critic_grad_clip_norm),
+                tx,
+            )
+
         critic = TrainState.create(
             apply_fn=critic_def.apply,
             params=critic_params,
@@ -724,7 +747,12 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             residual_actor_loss = (
                 self.entropy_scale * log_probs * temperature - q
             ).mean()
-            return residual_actor_loss, {"residual_q": q.mean(), "residual_actor_loss": residual_actor_loss, "entropy": -log_probs.mean()}
+            return residual_actor_loss, {
+                "residual_q": q.mean(),
+                "residual_actor_loss": residual_actor_loss,
+                "entropy": -log_probs.mean(),
+                "temperature": jnp.asarray(temperature),
+            }
 
         grads, actor_info = jax.grad(residual_actor_loss_fn, has_aux=True)(self.residual_actor.params)
         residual_actor = self.residual_actor.apply_gradients(grads=grads)
@@ -823,6 +851,13 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
                 )
             # Apply sharding constraint to encoded observations (works inside grad)
             observations = jax.lax.with_sharding_constraint(observations, self.data_sharding)
+            # Per-sample L2 norm of the encoder's output feature vector — the
+            # thing that feeds directly into the critic's Q computation.
+            # Diagnostic for Albert's hypothesis: an unfrozen, unclipped ResNet-34
+            # inflating its own feature magnitudes to chase a rising Q target.
+            # Compare this against target_q_max/critic_loss over training —
+            # if all three climb together, that's direct evidence for it.
+            encoder_feature_norms = jnp.linalg.norm(observations, axis=-1)
             qs = self.critic.apply_fn(
                 {"params": params_dict['critic']},
                 observations,
@@ -840,6 +875,8 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
                 "target_q_min": target_q.min(),
                 "target_q_max": target_q.max(),
                 "target_q_mean": target_q.mean(),
+                "encoder_feature_norm_mean": encoder_feature_norms.mean(),
+                "encoder_feature_norm_max": encoder_feature_norms.max(),
             }
 
         grads, info = jax.grad(critic_loss_fn, has_aux=True)(params_dict)

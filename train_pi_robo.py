@@ -73,6 +73,11 @@ def main(_):
     FLAGS.config.adjust_target_entropy = getattr(cfg, "rl_adjust_target_entropy", FLAGS.config.adjust_target_entropy)
     _rl_fixed_temperature = getattr(cfg, "rl_fixed_temperature", FLAGS.config.fixed_temperature)
     FLAGS.config.fixed_temperature = float(_rl_fixed_temperature) if _rl_fixed_temperature is not None else None
+    _rl_critic_weight_decay = getattr(cfg, "rl_critic_weight_decay", FLAGS.config.critic_weight_decay)
+    FLAGS.config.critic_weight_decay = float(_rl_critic_weight_decay) if _rl_critic_weight_decay is not None else None
+    _rl_critic_grad_clip_norm = getattr(cfg, "rl_critic_grad_clip_norm", FLAGS.config.critic_grad_clip_norm)
+    FLAGS.config.critic_grad_clip_norm = float(_rl_critic_grad_clip_norm) if _rl_critic_grad_clip_norm is not None else None
+    FLAGS.config.freeze_critic_encoder = getattr(cfg, "rl_freeze_critic_encoder", FLAGS.config.freeze_critic_encoder)
     if hasattr(cfg, "rl_hidden_dims"):
         FLAGS.config.hidden_dims  = tuple(cfg.rl_hidden_dims)
     FLAGS.config.edit_scale       = float(getattr(cfg, "rl_edit_scale", FLAGS.config.edit_scale))
