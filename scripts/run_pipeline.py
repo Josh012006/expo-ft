@@ -147,8 +147,17 @@ def stage_sft(cfg, args, run_dir):
     run(cmd)
 
 
+_MODEL_CONFIG_BY_CLS = {
+    "EXPOLearner": "configs/model/expo_ft_pi_config.py",
+    "PPOLearner": "configs/model/ppo_pi_config.py",
+    "GRPOLearner": "configs/model/grpo_pi_config.py",
+    "SACLearner": "configs/model/sac_pi_config.py",
+    "BCLearner": "configs/model/dagger_pi_config.py",
+}
+
+
 def stage_rl(cfg, args, run_dir, resuming):
-    """RL training with EXPOLearner.
+    """RL training with whichever learner cfg.model_cls selects.
 
     train_pi_robo.py loads the SAME task YAML itself (cfg = load_task_config(
     FLAGS.task_config)) and reads seed/max_steps/batch_size/checkpoint settings/
@@ -162,10 +171,26 @@ def stage_rl(cfg, args, run_dir, resuming):
     signature consistency with the other stages but unused here —
     train_pi_robo.py resolves its own run directory from
     cfg.output_dir/cfg.rl_resume_dir independently.
+
+    The --config (hyperparameter) file is picked from cfg.model_cls, which is
+    expected to be set in the task YAML passed via --config on the command
+    line (e.g. stack_cube_ppo.yaml sets model_cls: "PPOLearner"). This is the
+    same field train_pi_robo.py itself reads from FLAGS.config.model_cls —
+    here it's read from the *task* YAML instead, purely to select which of
+    configs/model/*.py to hand to train_pi_robo.py's --config flag.
     """
+    model_cls = getattr(cfg, "model_cls", "EXPOLearner")
+    try:
+        model_config_path = _MODEL_CONFIG_BY_CLS[model_cls]
+    except KeyError:
+        raise ValueError(
+            f"Unknown model_cls {model_cls!r} in {args.config} — expected one of "
+            f"{list(_MODEL_CONFIG_BY_CLS)}."
+        )
+
     cmd = [
         "python", str(TRAIN_PI_ROBO),
-        "--config=configs/model/expo_ft_pi_config.py",
+        f"--config={model_config_path}",
         f"--task_config={args.config}",
         f"--fsdp_devices={cfg.fsdp_devices}",
     ]
@@ -174,6 +199,7 @@ def stage_rl(cfg, args, run_dir, resuming):
         cmd.append(f"--config.pi05_weight_loader_path={Path(args.sft_checkpoint) / 'params'}")
 
     run(cmd)
+
 
 
 def main():

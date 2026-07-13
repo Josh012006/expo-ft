@@ -55,9 +55,19 @@ def main(_):
     FLAGS.config.pi05_config_name = get_sft_config_name(cfg)
     FLAGS.config.skip_repack_transforms = cfg.skip_repack_transforms
 
+    # Read once, early — used both for the hyperparameter overrides below and
+    # for the learner-import dispatch further down. Reading it here (rather
+    # than only later, where it used to be read) does not change any
+    # behavior — FLAGS.config.model_cls is already fully populated at this
+    # point since ml_collections loads --config before main() runs.
+    model_cls = FLAGS.config.model_cls
+
     # Override FLAGS.config RL hyperparameters from the task YAML so everything
     # is configured in one place (the YAML) rather than split between YAML and
-    # configs/model/expo_ft_pi_config.py.
+    # configs/model/*.py. Each learner reads its own, differently-prefixed
+    # fields (rl_* for EXPOLearner, ppo_* for PPOLearner, grpo_* for
+    # GRPOLearner) so a single task YAML can hold tuned overrides for every
+    # algorithm at once without collisions.
     # NOTE: float() wrapping below is a deliberate defense against a PyYAML quirk —
     # bare scientific notation without a decimal point (e.g. "3e-4") is parsed as
     # a STRING, not a float (needs "3.0e-4" to parse correctly). ml_collections
@@ -65,22 +75,67 @@ def main(_):
     # float(x) is a no-op if x is already a float, and fixes it if x is a
     # not-quite-valid-YAML-float string — belt and suspenders alongside fixing
     # the YAML values themselves.
-    FLAGS.config.actor_lr         = float(getattr(cfg, "rl_lr", FLAGS.config.actor_lr))
-    FLAGS.config.critic_lr        = float(getattr(cfg, "rl_lr", FLAGS.config.critic_lr))
-    FLAGS.config.discount         = float(getattr(cfg, "rl_discount", FLAGS.config.discount))
-    FLAGS.config.tau              = float(getattr(cfg, "rl_tau", FLAGS.config.tau))
-    FLAGS.config.init_temperature = float(getattr(cfg, "rl_init_temperature", FLAGS.config.init_temperature))
-    FLAGS.config.adjust_target_entropy = getattr(cfg, "rl_adjust_target_entropy", FLAGS.config.adjust_target_entropy)
-    _rl_fixed_temperature = getattr(cfg, "rl_fixed_temperature", FLAGS.config.fixed_temperature)
-    FLAGS.config.fixed_temperature = float(_rl_fixed_temperature) if _rl_fixed_temperature is not None else None
-    _rl_critic_weight_decay = getattr(cfg, "rl_critic_weight_decay", FLAGS.config.critic_weight_decay)
-    FLAGS.config.critic_weight_decay = float(_rl_critic_weight_decay) if _rl_critic_weight_decay is not None else None
-    _rl_critic_grad_clip_norm = getattr(cfg, "rl_critic_grad_clip_norm", FLAGS.config.critic_grad_clip_norm)
-    FLAGS.config.critic_grad_clip_norm = float(_rl_critic_grad_clip_norm) if _rl_critic_grad_clip_norm is not None else None
-    FLAGS.config.freeze_critic_encoder = getattr(cfg, "rl_freeze_critic_encoder", FLAGS.config.freeze_critic_encoder)
-    if hasattr(cfg, "rl_hidden_dims"):
-        FLAGS.config.hidden_dims  = tuple(cfg.rl_hidden_dims)
-    FLAGS.config.edit_scale       = float(getattr(cfg, "rl_edit_scale", FLAGS.config.edit_scale))
+    if model_cls == "EXPOLearner":
+        # --- unchanged from before this refactor: byte-for-byte identical ---
+        FLAGS.config.actor_lr         = float(getattr(cfg, "rl_lr", FLAGS.config.actor_lr))
+        FLAGS.config.critic_lr        = float(getattr(cfg, "rl_lr", FLAGS.config.critic_lr))
+        FLAGS.config.discount         = float(getattr(cfg, "rl_discount", FLAGS.config.discount))
+        FLAGS.config.tau              = float(getattr(cfg, "rl_tau", FLAGS.config.tau))
+        FLAGS.config.init_temperature = float(getattr(cfg, "rl_init_temperature", FLAGS.config.init_temperature))
+        FLAGS.config.adjust_target_entropy = getattr(cfg, "rl_adjust_target_entropy", FLAGS.config.adjust_target_entropy)
+        _rl_fixed_temperature = getattr(cfg, "rl_fixed_temperature", FLAGS.config.fixed_temperature)
+        FLAGS.config.fixed_temperature = float(_rl_fixed_temperature) if _rl_fixed_temperature is not None else None
+        _rl_critic_weight_decay = getattr(cfg, "rl_critic_weight_decay", FLAGS.config.critic_weight_decay)
+        FLAGS.config.critic_weight_decay = float(_rl_critic_weight_decay) if _rl_critic_weight_decay is not None else None
+        _rl_critic_grad_clip_norm = getattr(cfg, "rl_critic_grad_clip_norm", FLAGS.config.critic_grad_clip_norm)
+        FLAGS.config.critic_grad_clip_norm = float(_rl_critic_grad_clip_norm) if _rl_critic_grad_clip_norm is not None else None
+        FLAGS.config.freeze_critic_encoder = getattr(cfg, "rl_freeze_critic_encoder", FLAGS.config.freeze_critic_encoder)
+        if hasattr(cfg, "rl_hidden_dims"):
+            FLAGS.config.hidden_dims  = tuple(cfg.rl_hidden_dims)
+        FLAGS.config.edit_scale       = float(getattr(cfg, "rl_edit_scale", FLAGS.config.edit_scale))
+        # --- end unchanged block ---
+    elif model_cls == "PPOLearner":
+        FLAGS.config.actor_lr  = float(getattr(cfg, "ppo_lr", FLAGS.config.actor_lr))
+        FLAGS.config.critic_lr = float(getattr(cfg, "ppo_lr", FLAGS.config.critic_lr))
+        FLAGS.config.discount  = float(getattr(cfg, "ppo_discount", FLAGS.config.discount))
+        FLAGS.config.gae_lambda        = float(getattr(cfg, "ppo_gae_lambda", FLAGS.config.gae_lambda))
+        FLAGS.config.clip_eps          = float(getattr(cfg, "ppo_clip_eps", FLAGS.config.clip_eps))
+        FLAGS.config.value_loss_coef   = float(getattr(cfg, "ppo_value_loss_coef", FLAGS.config.value_loss_coef))
+        FLAGS.config.entropy_coef      = float(getattr(cfg, "ppo_entropy_coef", FLAGS.config.entropy_coef))
+        _ppo_value_clip_eps = getattr(cfg, "ppo_value_clip_eps", FLAGS.config.value_clip_eps)
+        FLAGS.config.value_clip_eps = float(_ppo_value_clip_eps) if _ppo_value_clip_eps is not None else None
+        _ppo_max_grad_norm = getattr(cfg, "ppo_max_grad_norm", FLAGS.config.max_grad_norm)
+        FLAGS.config.max_grad_norm = float(_ppo_max_grad_norm) if _ppo_max_grad_norm is not None else None
+        FLAGS.config.num_minibatches = int(getattr(cfg, "ppo_num_minibatches", FLAGS.config.num_minibatches))
+        if hasattr(cfg, "ppo_hidden_dims"):
+            FLAGS.config.hidden_dims = tuple(cfg.ppo_hidden_dims)
+    elif model_cls == "GRPOLearner":
+        FLAGS.config.actor_lr     = float(getattr(cfg, "grpo_lr", FLAGS.config.actor_lr))
+        FLAGS.config.group_size   = int(getattr(cfg, "grpo_group_size", FLAGS.config.group_size))
+        FLAGS.config.clip_eps     = float(getattr(cfg, "grpo_clip_eps", FLAGS.config.clip_eps))
+        FLAGS.config.kl_coef      = float(getattr(cfg, "grpo_kl_coef", FLAGS.config.kl_coef))
+        FLAGS.config.entropy_coef = float(getattr(cfg, "grpo_entropy_coef", FLAGS.config.entropy_coef))
+        _grpo_max_grad_norm = getattr(cfg, "grpo_max_grad_norm", FLAGS.config.max_grad_norm)
+        FLAGS.config.max_grad_norm = float(_grpo_max_grad_norm) if _grpo_max_grad_norm is not None else None
+        FLAGS.config.num_minibatches = int(getattr(cfg, "grpo_num_minibatches", FLAGS.config.num_minibatches))
+        if hasattr(cfg, "grpo_hidden_dims"):
+            FLAGS.config.hidden_dims = tuple(cfg.grpo_hidden_dims)
+    elif model_cls == "SACLearner":
+        FLAGS.config.actor_lr  = float(getattr(cfg, "sac_lr", FLAGS.config.actor_lr))
+        FLAGS.config.critic_lr = float(getattr(cfg, "sac_lr", FLAGS.config.critic_lr))
+        FLAGS.config.discount  = float(getattr(cfg, "sac_discount", FLAGS.config.discount))
+        FLAGS.config.tau       = float(getattr(cfg, "sac_tau", FLAGS.config.tau))
+        FLAGS.config.init_temperature = float(getattr(cfg, "sac_init_temperature", FLAGS.config.init_temperature))
+        _sac_target_entropy = getattr(cfg, "sac_target_entropy", FLAGS.config.target_entropy)
+        FLAGS.config.target_entropy = float(_sac_target_entropy) if _sac_target_entropy is not None else None
+        _sac_critic_weight_decay = getattr(cfg, "sac_critic_weight_decay", FLAGS.config.critic_weight_decay)
+        FLAGS.config.critic_weight_decay = float(_sac_critic_weight_decay) if _sac_critic_weight_decay is not None else None
+        FLAGS.config.num_qs = int(getattr(cfg, "sac_num_qs", FLAGS.config.num_qs))
+        if hasattr(cfg, "sac_hidden_dims"):
+            FLAGS.config.hidden_dims = tuple(cfg.sac_hidden_dims)
+    # BCLearner: no RL hyperparameter overrides needed — imitation-only,
+    # no critic/GAE/advantage machinery to tune here.
+
     # Sync actor_success_only from the task YAML into the model config too —
     # BatchProcessor already reads it from cfg (line below, via train_pi_robo's
     # own actor_success_only variable), but the EXPOLearner agent itself reads
@@ -172,13 +227,20 @@ def main(_):
     env.reset()
     logging.info(f"Created training environment {env.env_id}")
 
-    model_cls = FLAGS.config.model_cls
+    # model_cls already read near the top of main() (see hyperparameter
+    # override block above) — reused here for the learner-import dispatch.
     # BCLearner uses human-intervention chunks for the actor batch only (no critic).
     use_dagger_hil_sampling = model_cls == "BCLearner"
     if model_cls == "BCLearner":
         from expo_ft.agents.alg.bc import load_agent, restore_checkpoint, save_checkpoint
     elif model_cls == "EXPOLearner":
         from expo_ft.agents.alg.expo_ft import load_agent, restore_checkpoint, save_checkpoint
+    elif model_cls == "PPOLearner":
+        from expo_ft.agents.alg.ppo import load_agent, restore_checkpoint, save_checkpoint
+    elif model_cls == "GRPOLearner":
+        from expo_ft.agents.alg.grpo import load_agent, restore_checkpoint, save_checkpoint
+    elif model_cls == "SACLearner":
+        from expo_ft.agents.alg.sac import load_agent, restore_checkpoint, save_checkpoint
     else:
         raise ValueError(f"Unsupported model class: {model_cls}")
 

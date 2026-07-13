@@ -1,8 +1,12 @@
-# configs/task/maniskill/pick_cube.yaml
+# configs/task/maniskill/stack_cube_expo_ft.yaml
 
+# NOTE: the Environment/Data/Run-Logging sections below are shared
+# (kept identical) across all *_sft.yaml / *_expo_ft.yaml / *_ppo.yaml /
+# *_grpo.yaml / *_sac.yaml files for this task. If you change an env or
+# data setting, update it in all five files to keep them in sync.
 # ── Environment ────────────────────────────────────────────────
-env_id: "PickCube-v1"
-language_instruction: "pick up the red cube and bring it to the green point"
+env_id: "StackCube-v1"
+language_instruction: "stack the red cube on top of the green cube"
 control_hz: 10
 max_episode_steps: 120
 env_type: "sim"  # "sim" for simulation, "droid" for real robot
@@ -35,8 +39,8 @@ robot_uids: "panda_wristcam"
 # (--stage demos, a one-time upfront step). Different from num_data_sft/
 # num_data_rl below, which control how many of these to LOAD for SFT/RL.
 num_demos_generate: 550
-lerobot_repo_id: "expo_ft/pick_cube"
-droid_format_dir: "demos/PickCube-v1/droid_format"
+lerobot_repo_id: "expo_ft/stack_cube"
+droid_format_dir: "demos/StackCube-v1/droid_format"
 # Skip RepackTransform in replay buffer — our observations already have the
 # correct keys for DroidInputs (observation/cartesian_position, etc.)
 skip_repack_transforms: true
@@ -44,26 +48,18 @@ skip_repack_transforms: true
 
 # ── Run / Logging ──────────────────────────────────────────────
 project_name: "expo-ft"
-run_name: "pick_cube_expo_ft"
-output_dir: "logs/pick_cube"  # a timestamped subdir is created automatically per run
+run_name: "stack_cube_expo_ft"
+output_dir: "logs/stack_cube"  # a timestamped subdir is created automatically per run
 
 
-# ── SFT warmup ─────────────────────────────────────────────────
-sft_exp_name: "pick_cube_sft"
-sft_num_workers: 12
-sft_num_train_steps: 4000
-sft_batch_size: 64
+
+# sft_use_lora is needed here (not the rest of SFT warmup config) purely to
+# resolve which openpi SFT TrainConfig matches the checkpoint being loaded —
+# see get_sft_config_name(). Full SFT training hyperparameters live in
+# stack_cube_sft.yaml instead.
 sft_use_lora: true         # use LoRA fine-tuning (faster, less memory than full fine-tune)
-sft_peak_lr: 2.5e-5
-sft_save_interval: 200
-sft_log_interval: 100
-sft_resume: true
-sft_resume_dir: null #"logs/pick_cube/pick_cube_expo_ft_2026-07-05_01-06-12"
-num_data_sft: 50
-
 
 # ── RL Algorithm ──────────────────────────────────────────────────
-model_cls: "EXPOLearner"  
 seed: 42
 max_episodes: 1000
 max_steps_per_episode: 120
@@ -79,6 +75,8 @@ fsdp_devices: 1            # number of GPUs for FSDP sharding (1 = single GPU, n
 num_data_rl: 50
 rl_resume_dir: null
 
+model_cls: "EXPOLearner"  # selects both configs/model/*.py (via run_pipeline.py) and the FLAGS.config path used by train_pi_robo.py
+
 # ── RL Checkpointing ──────────────────────────────────────────────
 checkpoint_model: true
 checkpoint_interval: 1000  # save checkpoint every N steps (0 = only save at end)
@@ -86,6 +84,9 @@ checkpoint_buffer: false   # save replay buffer transitions to disk at each step
 keep_period: 20000         # keep one checkpoint every N steps (older ones are deleted)
 max_to_keep: 1
 
+
+
+actor_success_only: true        # if true, actor batch is sampled only from successful transitions
 
 # ── RL hyperparameters (EXPOLearner) ───────────────────────────
 rl_lr: 3.0e-4                     # learning rate for critic and edit policy
@@ -106,4 +107,3 @@ rl_edit_scale: 0.05              # max magnitude of residual action added by edi
 rl_critic_weight_decay: null    # if set (e.g. 1.0e-4), L2 weight decay on critic + encoder params (adamw)
 rl_critic_grad_clip_norm: null  # if set (e.g. 1.0), clips critic + encoder grads to this global norm
 rl_freeze_critic_encoder: false # if true, ResNet-34 image encoder frozen for the critic (Q uses embeddings only)
-actor_success_only: true        # if true, actor batch is sampled only from successful transitions

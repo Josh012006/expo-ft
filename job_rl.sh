@@ -22,7 +22,7 @@
 #SBATCH --output=logs/rl_%j.out
 #SBATCH --no-requeue
 VENV=${1:-.venv}
-CONFIG=${2:-configs/task/maniskill/stack_cube.yaml}
+CONFIG=${2:-configs/task/maniskill/stack_cube_expo_ft.yaml}
 SFT_CHECKPOINT=${3:-}
 cd ~/projects/expo-ft
 source scripts/setup_env.sh "$VENV"

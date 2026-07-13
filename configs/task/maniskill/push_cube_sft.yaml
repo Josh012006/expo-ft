@@ -1,0 +1,66 @@
+# configs/task/maniskill/push_cube_sft.yaml
+
+# NOTE: the Environment/Data/Run-Logging sections below are shared
+# (kept identical) across all *_sft.yaml / *_expo_ft.yaml / *_ppo.yaml /
+# *_grpo.yaml / *_sac.yaml files for this task. If you change an env or
+# data setting, update it in all five files to keep them in sync.
+# ── Environment ────────────────────────────────────────────────
+env_id: "PushCube-v1"
+language_instruction: "push the cube to the goal region"
+control_hz: 10
+max_episode_steps: 120
+env_type: "sim"  # "sim" for simulation, "droid" for real robot
+env_wrapper: "maniskill"  # "maniskill" ou "droid" (real robot)
+sim_backend: "physx_cpu"
+
+# Control mode config
+control_mode: "pd_joint_delta_pos"
+normalize_action: true
+use_cartesian_state: false
+output_action_dim: 8
+action_space: "joint_position" # Action space keys for DROID format reader
+gripper_action_space: "position"
+
+# Observation config
+state_obs_key: "observation/joint_position"
+state_obs_dim: 7
+
+# Camera config
+camera_width: 224
+camera_height: 224
+camera_eye_pos: [0.6, 0.7, 0.6]      # default is [0.3, 0, 0.6]
+camera_target_pos: [0.0, 0.0, 0.35]  # default is [-0.1, 0, 0.1]
+camera_fov: 1.0
+robot_uids: "panda_wristcam"
+
+
+# ── Data ───────────────────────────────────────────────────────
+# How many successful demo episodes to GENERATE via motion planning
+# (--stage demos, a one-time upfront step). Different from num_data_sft/
+# num_data_rl below, which control how many of these to LOAD for SFT/RL.
+num_demos_generate: 550
+lerobot_repo_id: "expo_ft/push_cube"
+droid_format_dir: "demos/PushCube-v1/droid_format"
+# Skip RepackTransform in replay buffer — our observations already have the
+# correct keys for DroidInputs (observation/cartesian_position, etc.)
+skip_repack_transforms: true
+
+
+# ── Run / Logging ──────────────────────────────────────────────
+project_name: "expo-ft"
+run_name: "push_cube_sft"
+output_dir: "logs/push_cube"  # a timestamped subdir is created automatically per run
+
+
+# ── SFT warmup ─────────────────────────────────────────────────
+sft_exp_name: "push_cube_sft"
+sft_num_workers: 12
+sft_num_train_steps: 4000
+sft_batch_size: 64
+sft_use_lora: true         # use LoRA fine-tuning (faster, less memory than full fine-tune)
+sft_peak_lr: 2.5e-5
+sft_save_interval: 200
+sft_log_interval: 100
+sft_resume: false
+sft_resume_dir: null
+num_data_sft: 50

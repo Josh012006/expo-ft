@@ -18,7 +18,7 @@
 #SBATCH --output=logs/sft_%j.out
 #SBATCH --no-requeue
 VENV=${1:-.venv}
-CONFIG=${2:-configs/task/maniskill/stack_cube.yaml}
+CONFIG=${2:-configs/task/maniskill/stack_cube_sft.yaml}
 cd ~/projects/expo-ft
 source scripts/setup_env.sh "$VENV"
 python3 scripts/run_pipeline.py \
