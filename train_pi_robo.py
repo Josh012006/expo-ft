@@ -154,7 +154,11 @@ def main(_):
     # so it's visually distinguishable from an SFT run directory at a glance.
     run_dir, resuming = resolve_run_dir(cfg, resume_dir=cfg.rl_resume_dir, suffix="rl")
 
-    assert 0.0 <= cfg.offline_ratio <= 1.0
+    # getattr with a default here since offline_ratio no longer exists at all
+    # in the PPO/GRPO task YAMLs (removed — it was dead for them regardless,
+    # see is_on_policy_algo below) whereas EXPOLearner/SACLearner/BCLearner
+    # YAMLs still define it and this assert still validates their real value.
+    assert 0.0 <= getattr(cfg, "offline_ratio", 0.0) <= 1.0
 
     if cfg.batch_size % jax.device_count() != 0:
         raise ValueError(
@@ -260,12 +264,12 @@ def main(_):
     # Force zero demo contamination for these two model classes, regardless of
     # whatever offline_ratio happens to be set to in the task YAML.
     is_on_policy_algo = model_cls in ("PPOLearner", "GRPOLearner")
-    if is_on_policy_algo and cfg.offline_ratio != 0:
+    if is_on_policy_algo and getattr(cfg, "offline_ratio", 0.0) != 0:
         logging.warning(
             "model_cls=%s is on-policy — ignoring offline_ratio=%s from the task "
             "YAML and forcing zero demo contamination (no dataset inserted into "
             "either replay buffer for actual training sampling).",
-            model_cls, cfg.offline_ratio,
+            model_cls, getattr(cfg, "offline_ratio", 0.0),
         )
 
     from expo_ft.agents.vla.pi05 import build_pi05
