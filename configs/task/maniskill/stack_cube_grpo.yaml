@@ -63,9 +63,8 @@ sft_use_lora: true         # use LoRA fine-tuning (faster, less memory than full
 seed: 42
 max_episodes: 1000
 max_steps_per_episode: 120
-batch_size: 24             # number of transitions sampled from replay buffer per gradient update
-utd_ratio: 2              # gradient updates performed per new transition collected
-offline_ratio: 0.5         # fraction of batch from offline demo buffer (0 = demos inserted into online buffer)
+batch_size: 128             # number of transitions sampled from replay buffer per gradient update
+utd_ratio: 10              # gradient updates performed per new transition collected
 update_type: "episode"     # when to trigger updates: "episode", "step", or "batch"
 num_updates: 1             # number of gradient updates per trigger
 num_batch: 1               # number of episodes to accumulate before updating (only used when update_type="batch")
@@ -92,10 +91,10 @@ actor_success_only: true        # if true, actor batch is sampled only from succ
 # Uncomment a line and give it a real value to override that default
 # from grpo_pi_config.py. Do NOT set the commented fields to `null` —
 # they are plain floats/ints, not Optional.
-# grpo_group_size: 4              # number of rollouts per group
-# grpo_clip_eps: 0.2              # GRPO clip ratio
-# grpo_kl_coef: 0.04              # KL penalty weight
-# grpo_entropy_coef: 0.01         # entropy bonus weight
-# grpo_num_minibatches: 4         # number of GRPO minibatches per update
-# grpo_hidden_dims: [256, 256, 256]  # actor MLP widths
+grpo_group_size: 4              # number of rollouts per group
+grpo_clip_eps: 0.2              # GRPO clip ratio
+grpo_kl_coef: 0.04              # KL penalty weight
+grpo_entropy_coef: 0.01         # entropy bonus weight
+grpo_num_minibatches: 4         # number of GRPO minibatches per update
+grpo_hidden_dims: [256, 256, 256]  # actor MLP widths
 grpo_max_grad_norm: null          # Optional[float] — null means "no grad clipping"; set e.g. 0.5 to enable

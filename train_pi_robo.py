@@ -93,7 +93,10 @@ def main(_):
         if hasattr(cfg, "rl_hidden_dims"):
             FLAGS.config.hidden_dims  = tuple(cfg.rl_hidden_dims)
         FLAGS.config.edit_scale       = float(getattr(cfg, "rl_edit_scale", FLAGS.config.edit_scale))
-        # --- end unchanged block ---
+        # --- end of original ExpoFT block; critic_pretrain_steps added below is
+        # a new, default-off (0) field — behavior for existing configs that
+        # don't set rl_critic_pretrain_steps is unchanged ---
+        FLAGS.config.critic_pretrain_steps = int(getattr(cfg, "rl_critic_pretrain_steps", FLAGS.config.critic_pretrain_steps))
     elif model_cls == "PPOLearner":
         FLAGS.config.actor_lr  = float(getattr(cfg, "ppo_lr", FLAGS.config.actor_lr))
         FLAGS.config.critic_lr = float(getattr(cfg, "ppo_lr", FLAGS.config.critic_lr))
@@ -244,6 +247,27 @@ def main(_):
     else:
         raise ValueError(f"Unsupported model class: {model_cls}")
 
+    # PPO/GRPO are genuinely on-policy — their update() math (importance ratio
+    # against old_log_probs, GAE bootstrap, GRPO's group-relative advantage
+    # over CONTIGUOUS same-group rollouts) assumes every transition in a batch
+    # was actually sampled from a known, recent version of the CURRENT policy.
+    # Demo transitions (scripted motion-planning actions) were never sampled
+    # from any version of the trained policy, so mixing them in — whether via
+    # offline_ratio>0 (a separate offline buffer blended into every batch) or
+    # via offline_ratio==0 (which instead seeds them permanently into the
+    # ONLINE replay buffer, where uniform sampling would keep resurfacing them
+    # indefinitely) — silently breaks that assumption and any group structure.
+    # Force zero demo contamination for these two model classes, regardless of
+    # whatever offline_ratio happens to be set to in the task YAML.
+    is_on_policy_algo = model_cls in ("PPOLearner", "GRPOLearner")
+    if is_on_policy_algo and cfg.offline_ratio != 0:
+        logging.warning(
+            "model_cls=%s is on-policy — ignoring offline_ratio=%s from the task "
+            "YAML and forcing zero demo contamination (no dataset inserted into "
+            "either replay buffer for actual training sampling).",
+            model_cls, cfg.offline_ratio,
+        )
+
     from expo_ft.agents.vla.pi05 import build_pi05
     actor, actor_train_state, target_actor_params, agent_kwargs, vla_metadata = build_pi05(
         FLAGS.config, cfg.seed, mesh, data_sharding, replicated_sharding,
@@ -268,11 +292,22 @@ def main(_):
         data_sharding=data_sharding,
         batch_size=cfg.batch_size,
         utd_ratio=cfg.utd_ratio,
-        offline_ratio=cfg.offline_ratio,
+        offline_ratio=0.0 if is_on_policy_algo else cfg.offline_ratio,
         actor_success_only=actor_success_only,
         use_dagger_hil_sampling=use_dagger_hil_sampling,
-        dataset=dataset,
+        dataset=None if is_on_policy_algo else dataset,
     )
+
+    if is_on_policy_algo:
+        # offline_replay_buffer still needs at least one transition inserted
+        # so the shape-inference call just below (convert_to_critic_format on
+        # offline_replay_buffer.dataset_dict[...]) has something to read.
+        # This is ONLY for shape inference — BatchProcessor above got
+        # dataset=None and offline_ratio=0.0, so it never samples from this
+        # buffer for actual training batches; replay_buffer (the online one)
+        # stays completely free of demo data too, filled only by genuine
+        # on-policy rollout transitions collected from here on.
+        offline_replay_buffer.insert_dataset(dataset)
 
     agent_example_observation, agent_example_state, agent_example_action = offline_replay_buffer.convert_to_critic_format(
     {
@@ -312,6 +347,56 @@ def main(_):
             start_step = latest_step
             logging.info("Resuming from step %d", start_step)
         batch_processor.restore(checkpoint_dir_path, up_to_step=latest_step)
+
+    # ── Critic pretraining (XQCfD-style critic/actor coherence warmup) ──────
+    # Only on a fresh run — a resumed run's critic has already been through
+    # this (or through real online training), so redoing it here would be
+    # meaningless and could even undo real progress.
+    #
+    # Trains the critic ONLY (residual actor, base VLA, and temperature are
+    # left untouched) on offline demo data, using the exact same
+    # update_critic() logic as normal training — same argmax-over-candidates
+    # target computation, same masking, nothing algorithmically different.
+    # The point is purely to get the critic roughly "coherent" with the SFT
+    # policy's own actions before the online loop starts pulling the residual
+    # policy toward whatever a still-randomly-initialized critic prefers.
+    critic_pretrain_steps = int(getattr(FLAGS.config, "critic_pretrain_steps", 0) or 0)
+    if not resuming and model_cls == "EXPOLearner" and critic_pretrain_steps > 0:
+        # Demos live in offline_replay_buffer when offline_ratio > 0 (the
+        # normal ExpoFT setup); BatchProcessor's constructor instead seeds
+        # them into the online replay_buffer when offline_ratio == 0 — follow
+        # whichever buffer actually received the dataset.
+        pretrain_buffer = offline_replay_buffer if cfg.offline_ratio > 0 else replay_buffer
+        logging.info(
+            "Pretraining critic for %d steps on demo data (%s buffer)...",
+            critic_pretrain_steps,
+            "offline" if cfg.offline_ratio > 0 else "online (offline_ratio=0, demos live there instead)",
+        )
+        pretrain_iterator = pretrain_buffer.get_iterator(
+            sample_args={"batch_size": cfg.batch_size},
+            data_sharding=data_sharding,
+        )
+        for pretrain_step in tqdm.tqdm(
+            range(critic_pretrain_steps), desc="Critic pretraining", disable=not FLAGS.tqdm
+        ):
+            pretrain_batch = next(pretrain_iterator)
+            pretrain_batch = pretrain_buffer.apply_data_sharding(pretrain_batch, data_sharding)
+            agent = agent.replace(rng=jax.device_put(agent.rng, replicated_sharding))
+            agent, pretrain_info = agent.update_critic(pretrain_batch)
+            # Logged on a negative step axis (-N .. -1) so it renders as a
+            # warm-up phase preceding step 0 of the real training curve, in
+            # the SAME wandb/tensorboard run, rather than colliding with
+            # steps 0..N logged by the main loop below (the full sequence
+            # -N, ..., -1, 0, 1, 2, ... is strictly increasing, so there's no
+            # step-monotonicity issue either).
+            log_step = pretrain_step - critic_pretrain_steps
+            for k, v in pretrain_info.items():
+                try:
+                    tb_writer.add_scalar(f"pretrain/{k}", float(v), global_step=log_step)
+                except (TypeError, ValueError):
+                    pass
+            wandb.log({f"pretrain/{k}": v for k, v in pretrain_info.items()}, step=log_step)
+        logging.info("Critic pretraining complete.")
 
     episode_log = EpisodeState()
     training_log = TrainingStats(

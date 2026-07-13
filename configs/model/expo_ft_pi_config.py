@@ -19,6 +19,7 @@ def get_config():
     config.edit_scale = 0.2
     config.fixed_temperature = config_dict.placeholder(float)  # if set, bypasses the learned SAC temperature entirely
     config.critic_grad_clip_norm = config_dict.placeholder(float)  # if set, clips critic + encoder grads to this global norm before adam/adamw
+    config.critic_pretrain_steps = 0  # if >0, run this many critic-only update_critic() steps on offline demo data before RL starts (XQCfD-style critic/actor coherence warmup). 0 = disabled (default, matches pre-existing behavior).
     config.actor_drop = 0.0
     config.actor_lr = 3e-4
     config.critic_lr = 3e-4
