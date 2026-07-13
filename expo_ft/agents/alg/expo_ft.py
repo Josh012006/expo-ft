@@ -142,7 +142,14 @@ def load_agent(seed, example_observation, example_action, example_state,
 def decay_mask_fn(params):
     flat_params = flax.traverse_util.flatten_dict(params)
     flat_mask = {path: path[-1] != "bias" for path in flat_params}
-    return flax.core.FrozenDict(flax.traverse_util.unflatten_dict(flat_mask))
+    # NOTE: previously wrapped in flax.core.FrozenDict(...) here, which crashes
+    # optax.masked's internal jax.tree.map — actual params (critic_params,
+    # batch_encoder_params) are plain dicts in this flax version, not
+    # FrozenDict, so mask and params pytree structures didn't match
+    # ("Custom node type mismatch"). Latent bug, never triggered before
+    # since critic_weight_decay had never actually been set to a non-null
+    # value in any prior run.
+    return flax.traverse_util.unflatten_dict(flat_mask)
 
 @partial(jax.jit, static_argnames=('critic_fn', 'num_min_qs'))
 def compute_q(critic_fn, critic_params, observations, actions, states, num_min_qs=None):
@@ -203,6 +210,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
     freeze_critic_encoder: bool = struct.field(pytree_node=False)
     actor_success_only: bool = struct.field(pytree_node=False)
     fixed_temperature: Optional[float] = struct.field(pytree_node=False, default=None)
+    critic_grad_clip_norm: Optional[float] = struct.field(pytree_node=False, default=None)
     _infer_cache: Optional[dict] = struct.field(pytree_node=False, default=None)
 
     @classmethod
@@ -300,12 +308,18 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         )
 
         batch_encoder_params = batch_encoder_def.init(encoder_key, observations)["params"]
-        # Same clip norm as the critic head — the encoder's gradients come from
-        # the same critic loss, so an unclipped encoder would defeat the point
-        # of clipping the head on top of it (Albert's hypothesis: an unfrozen,
-        # unclipped ResNet-34 inflating its own feature magnitudes to chase a
-        # rising Q target).
-        encoder_tx = optax.adam(learning_rate=critic_lr)
+        # Same weight decay + clip norm as the critic head — the encoder's
+        # gradients come from the same critic loss, so leaving it out here
+        # would make this test regularize only half of what actually feeds
+        # the exploding Q (same reasoning as the clip norm above).
+        if critic_weight_decay is not None:
+            encoder_tx = optax.adamw(
+                learning_rate=critic_lr,
+                weight_decay=critic_weight_decay,
+                mask=decay_mask_fn,
+            )
+        else:
+            encoder_tx = optax.adam(learning_rate=critic_lr)
         if critic_grad_clip_norm is not None:
             encoder_tx = optax.chain(
                 optax.clip_by_global_norm(critic_grad_clip_norm),
@@ -461,6 +475,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             num_qs=num_qs,
             num_min_qs=num_min_qs,
             fixed_temperature=fixed_temperature,
+            critic_grad_clip_norm=critic_grad_clip_norm,
             data_augmentation_fn=make_data_augmentation_fn(use_full_augmentation),
 
             action_dim=action_dim,
@@ -890,6 +905,21 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
 
         critic_grad_norm = optax.global_norm(grads["critic"])
         info["critic_grad_norm"] = critic_grad_norm
+        # The line above logs the RAW gradient norm — computed from `grads`
+        # BEFORE `apply_gradients` (above) runs it through the clipping
+        # transform internally. It will show values above the clip threshold
+        # even when clipping is working correctly; it only tells you what the
+        # gradient looked like pre-clip, not what actually got applied.
+        # This second metric recomputes the clip explicitly (pure, no side
+        # effects on the real update) so the two can be compared directly —
+        # post-clip should hard-ceiling at critic_grad_clip_norm whenever
+        # pre-clip exceeds it.
+        if self.critic_grad_clip_norm is not None:
+            _clip_tx = optax.clip_by_global_norm(self.critic_grad_clip_norm)
+            _clipped_critic_grads, _ = _clip_tx.update(grads["critic"], _clip_tx.init(grads["critic"]))
+            info["critic_grad_norm_post_clip"] = optax.global_norm(_clipped_critic_grads)
+        else:
+            info["critic_grad_norm_post_clip"] = critic_grad_norm
         info["critic_param_norm"] = optax.global_norm(critic.params)
         info["next_q_nan_ratio"] = next_q_nan_ratio
         

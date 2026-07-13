@@ -103,7 +103,7 @@ rl_fixed_temperature: null      # if set (e.g. 0.1), bypasses the learned SAC
                                   # to test whether the unconverged/climbing alpha itself
                                   # contributes to instability (see July 2026 notes)
 rl_edit_scale: 0.2              # max magnitude of residual action added by edit policy
-rl_critic_weight_decay: null    # if set (e.g. 1.0e-4), L2 weight decay on critic + encoder params (adamw)
+rl_critic_weight_decay: 1.0e-4    # if set (e.g. 1.0e-4), L2 weight decay on critic + encoder params (adamw)
 rl_critic_grad_clip_norm: null  # if set (e.g. 1.0), clips critic + encoder grads to this global norm
 rl_freeze_critic_encoder: false # if true, ResNet-34 image encoder frozen for the critic (Q uses embeddings only)
 actor_success_only: true        # if true, actor batch is sampled only from successful transitions
