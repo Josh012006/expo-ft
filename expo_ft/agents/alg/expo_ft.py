@@ -782,15 +782,23 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
 
             actions = residual_scaled + batch["actions"]
 
-            qs = self.critic.apply_fn(
-                {"params": self.critic.params},
+            logits = self.critic.apply_fn(
+                {"params": self.critic.params, "batch_stats": self.critic.batch_stats},
                 observations,
                 actions,
-                True,
-                p=batch['critic_states'], 
-                rngs={"dropout": key2},
-            )  # training=True
-            q = qs.mean(axis=0)
+                False,
+                p=batch['critic_states'],
+            )
+            # train=False here: this call SCORES the residual actor's
+            # proposed action (its output feeds the actor's own gradient) —
+            # it doesn't train the critic itself, so it should use the
+            # critic's stable running BatchNorm statistics, exactly like
+            # every other place the critic is queried (rather than trained)
+            # elsewhere in this file (compute_q, sample_actions,
+            # sample_batch_actions). No more dropout rng either — the new
+            # categorical critic architecture has no dropout layer (XQC's
+            # own recipe doesn't include one).
+            q = q_from_logits(logits, self.atoms)
             # Use a manually fixed temperature when configured (bypasses the learned
             # temperature entirely) — a quick diagnostic Jesse suggested to see if the
             # runaway/unconverged alpha behavior is itself contributing to instability,

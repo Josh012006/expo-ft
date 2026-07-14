@@ -1,4 +1,11 @@
-"""Config for GRPOLearner: group-relative on-policy finetuning of the VLA.
+"""Config for GRPOLearner: group-relative on-policy finetuning.
+
+IMPORTANT: GRPOLearner's actor is a SEPARATE, small TanhNormal network (+
+its own batch_encoder) — not the Pi0.5/SFT VLA itself. Same situation as
+PPOLearner (see ppo_pi_config.py's docstring for the full rationale): the
+loaded VLA is used only for input preprocessing / output denormalization,
+never to initialize this network's own weights. See actor_pretrain_steps
+below.
 
 No critic/value baseline at all — advantage is computed relative to a group
 of sampled rollouts from the same state, so there's no discount factor,
@@ -27,5 +34,11 @@ def get_config():
     config.entropy_coef = 0.01
     config.max_grad_norm = 0.5
     config.num_minibatches = 4
+
+    # If >0, run this many behavior-cloning (imitation) steps on offline
+    # demo data to warm-start the actor (+ its own batch_encoder) BEFORE any
+    # GRPO training starts — see grpo.py's pretrain_actor_bc(). 0 = disabled
+    # (default; matches the pre-existing from-scratch-random-init behavior).
+    config.actor_pretrain_steps = 0
 
     return config

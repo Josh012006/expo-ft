@@ -116,6 +116,7 @@ def main(_):
         FLAGS.config.num_minibatches = int(getattr(cfg, "ppo_num_minibatches", FLAGS.config.num_minibatches))
         if hasattr(cfg, "ppo_hidden_dims"):
             FLAGS.config.hidden_dims = tuple(cfg.ppo_hidden_dims)
+        FLAGS.config.actor_pretrain_steps = int(getattr(cfg, "ppo_actor_pretrain_steps", FLAGS.config.actor_pretrain_steps))
     elif model_cls == "GRPOLearner":
         FLAGS.config.actor_lr     = float(getattr(cfg, "grpo_lr", FLAGS.config.actor_lr))
         FLAGS.config.group_size   = int(getattr(cfg, "grpo_group_size", FLAGS.config.group_size))
@@ -127,6 +128,7 @@ def main(_):
         FLAGS.config.num_minibatches = int(getattr(cfg, "grpo_num_minibatches", FLAGS.config.num_minibatches))
         if hasattr(cfg, "grpo_hidden_dims"):
             FLAGS.config.hidden_dims = tuple(cfg.grpo_hidden_dims)
+        FLAGS.config.actor_pretrain_steps = int(getattr(cfg, "grpo_actor_pretrain_steps", FLAGS.config.actor_pretrain_steps))
     elif model_cls == "SACLearner":
         FLAGS.config.actor_lr  = float(getattr(cfg, "sac_lr", FLAGS.config.actor_lr))
         FLAGS.config.critic_lr = float(getattr(cfg, "sac_lr", FLAGS.config.critic_lr))
@@ -438,6 +440,70 @@ def main(_):
                 **{f"pretrain/{k}": v for k, v in pretrain_info.items()},
             })
         logging.info("Critic pretraining complete.")
+
+    # ── Actor behavior-cloning pretraining (PPO/GRPO only) ──────────────────
+    # Same rationale as the critic pretraining above, but for a different
+    # gap: PPOLearner/GRPOLearner's actor is a separate, randomly-initialized
+    # TanhNormal network (+ its own batch_encoder) — the loaded VLA is used
+    # only for input preprocessing / output denormalization, never to
+    # initialize this network's own weights (see ppo.py/grpo.py's
+    # load_agent() docstrings). Without this warm-start, on-policy PPO/GRPO
+    # starts from a random policy and reproduces this project's own Phase 1
+    # finding (on-policy from a random/pre-SFT start = 0% success, no
+    # learning signal) despite intending to test on-policy FROM an SFT
+    # checkpoint.
+    #
+    # Only on a fresh run, same as critic pretraining. Trains actor +
+    # batch_encoder ONLY (never the value network — nothing SFT-relevant for
+    # it to imitate) via maximum-likelihood behavior cloning on offline demo
+    # data, using pretrain_actor_bc() — not part of the PPO/GRPO objective
+    # itself, purely a warm-start executed before it.
+    actor_pretrain_steps = int(getattr(FLAGS.config, "actor_pretrain_steps", 0) or 0)
+    if not resuming and model_cls in ("PPOLearner", "GRPOLearner") and actor_pretrain_steps > 0:
+        # For PPO/GRPO, offline_replay_buffer always holds the demo dataset
+        # regardless of cfg.offline_ratio (which is forced to 0 for these
+        # on-policy algos and doesn't reflect where the dataset was
+        # inserted — see the is_on_policy_algo block above, which explicitly
+        # seeds offline_replay_buffer for shape-inference purposes; that
+        # same data serves this pretraining loop).
+        actor_pretrain_buffer = offline_replay_buffer
+        logging.info("Pretraining actor (behavior cloning) for %d steps on demo data...", actor_pretrain_steps)
+        actor_pretrain_iterator = actor_pretrain_buffer.get_iterator(
+            sample_args={"batch_size": cfg.batch_size},
+            data_sharding=data_sharding,
+        )
+        wandb.define_metric("actor_pretrain_step")
+        wandb.define_metric("actor_pretrain/*", step_metric="actor_pretrain_step")
+        for actor_pretrain_step in tqdm.tqdm(
+            range(actor_pretrain_steps), desc="Actor BC pretraining", disable=not FLAGS.tqdm
+        ):
+            actor_pretrain_batch = next(actor_pretrain_iterator)
+            actor_pretrain_batch = actor_pretrain_buffer.apply_data_sharding(actor_pretrain_batch, data_sharding)
+            actor_pretrain_batch = dict(actor_pretrain_batch)
+            rng, key1 = jax.random.split(agent.rng)
+            rng, key2 = jax.random.split(rng)
+            actor_pretrain_batch["image"] = agent.data_augmentation_fn(key1, actor_pretrain_batch["image"])
+            actor_pretrain_batch["next_image"] = agent.data_augmentation_fn(key2, actor_pretrain_batch["next_image"])
+            actor_pretrain_batch = prepare_critic_batch(
+                actor_pretrain_batch,
+                agent.vla.model_config.action_dim,
+                agent.action_dim,
+                agent.state_dim,
+                agent.action_horizon,
+                agent.replan_steps,
+            )
+            agent = agent.replace(rng=jax.device_put(rng, replicated_sharding))
+            agent, actor_pretrain_info = agent.pretrain_actor_bc(actor_pretrain_batch)
+            for k, v in actor_pretrain_info.items():
+                try:
+                    tb_writer.add_scalar(f"actor_pretrain/{k}", float(v), global_step=actor_pretrain_step)
+                except (TypeError, ValueError):
+                    pass
+            wandb.log({
+                "actor_pretrain_step": actor_pretrain_step,
+                **{f"actor_pretrain/{k}": v for k, v in actor_pretrain_info.items()},
+            })
+        logging.info("Actor BC pretraining complete.")
 
     episode_log = EpisodeState()
     training_log = TrainingStats(

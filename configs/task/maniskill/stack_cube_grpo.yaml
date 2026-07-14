@@ -98,3 +98,9 @@ grpo_entropy_coef: 0.01         # entropy bonus weight
 grpo_num_minibatches: 4         # number of GRPO minibatches per update
 grpo_hidden_dims: [256, 256, 256]  # actor MLP widths
 grpo_max_grad_norm: null          # Optional[float] — null means "no grad clipping"; set e.g. 0.5 to enable
+
+# ── Actor BC pretraining (warm-start from demos before GRPO starts) ───
+# See grpo.py's pretrain_actor_bc() — GRPOLearner's actor is a separate,
+# randomly-initialized network with no connection to the SFT VLA's
+# competence otherwise (see grpo_pi_config.py's docstring).
+grpo_actor_pretrain_steps: 0    # if >0, run this many BC steps on offline demos before GRPO starts. 0 = disabled.
