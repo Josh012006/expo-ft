@@ -17,15 +17,18 @@ def get_config():
     config.critic_layer_norm = True
 
     # Categorical (C51-style, bounded support) critic — EXPOLearner only, per
-    # XQC (arXiv 2509.25174) / XQCfD (arXiv 2605.10734). v_min/v_max are
-    # domain-specific and NOT empirically validated against this project's
-    # actual reward scale yet — treat these as a starting point, and check
-    # target_q_max/target_q_min against them (if Q is pinned at exactly
-    # v_min or v_max for a meaningful fraction of training, the support is
-    # too narrow and needs widening).
+    # XQC (arXiv 2509.25174) / XQCfD (arXiv 2605.10734). v_min/v_max apply to
+    # NORMALIZED reward units (rewards are divided by a running RMS estimate
+    # before the Bellman projection — see reward_scale_decay and
+    # expo_ft.py's update_critic()), so they should be domain-agnostic and
+    # NOT need per-task hand-tuning. Still watch target_q_max/min (the
+    # normalized ones, not the _denorm logging variants): if Q is pinned at
+    # exactly v_min or v_max for a meaningful fraction of training even in
+    # normalized units, the support itself is too narrow and needs widening.
     config.num_atoms = 101
     config.v_min = -10.0
-    config.v_max = 100.0
+    config.v_max = 20.0
+    config.reward_scale_decay = 0.99  # EMA decay for the running reward-RMS estimate; higher = slower-adapting, more stable
     config.critic_hidden_dims = (512, 512, 512, 512)
 
     config.N = 8

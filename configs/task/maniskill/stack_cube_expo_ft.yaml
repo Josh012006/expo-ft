@@ -113,10 +113,14 @@ rl_critic_pretrain_steps: 500     # if >0, pretrain the critic for N steps on of
                                   # untouched) — XQCfD-style critic/actor coherence warmup. 0 = disabled.
 
 # ── Categorical critic (XQC/XQCfD-style, bounded support) ─────────────
-# v_min/v_max are NOT empirically validated against this task's actual
-# reward scale yet. Watch target_q_max/target_q_min: if Q sits pinned at
-# exactly v_min or v_max for a meaningful fraction of training, the
-# support is too narrow and needs widening.
+# v_min/v_max apply to NORMALIZED reward units (rewards are divided by a
+# running RMS estimate before the Bellman projection — see
+# rl_reward_scale_decay), so they should be domain-agnostic and not need
+# per-task hand-tuning. Still watch target_q_max/target_q_min (the
+# normalized ones, not the _denorm logging variants): if Q sits pinned
+# at exactly v_min or v_max for a meaningful fraction of training even
+# in normalized units, the support itself is too narrow.
 rl_num_atoms: 101               # number of fixed support bins for the categorical critic
-rl_v_min: -10.0                 # lower bound of the critic's fixed support
-rl_v_max: 100.0                 # upper bound of the critic's fixed support
+rl_v_min: -10.0                 # lower bound of the critic's fixed support (normalized reward units)
+rl_v_max: 20.0                  # upper bound of the critic's fixed support (normalized reward units)
+rl_reward_scale_decay: 0.99     # EMA decay for the running reward-RMS estimate; higher = slower-adapting, more stable

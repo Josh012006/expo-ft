@@ -235,6 +235,8 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
     v_min: float = struct.field(pytree_node=False)
     v_max: float = struct.field(pytree_node=False)
     atoms: jnp.ndarray  # fixed support values, e.g. linspace(v_min, v_max, num_atoms) — a pytree leaf (JAX arrays can't be static/hashable fields), but never trained, never changes after create()
+    reward_scale_decay: float = struct.field(pytree_node=False)
+    reward_ms: jnp.ndarray  # running mean-square of rewards (EMA), used to normalize rewards before the Bellman projection so the FIXED [v_min, v_max] support stays meaningful regardless of a task's absolute reward scale — see update_critic()
     action_dim: int = struct.field(pytree_node=False)
     state_dim: int = struct.field(pytree_node=False)
     full_action_dim: int = struct.field(pytree_node=False)
@@ -276,14 +278,23 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         # Categorical (C51-style, bounded support) critic — replaces the old
         # ensemble-of-scalars critic (num_qs/num_min_qs/critic_layer_norm/
         # critic_dropout_rate/use_critic_resnet are gone; see
-        # expo_ft/networks/categorical_value.py). v_min/v_max are domain-
-        # specific and NOT validated against this project's actual reward
-        # scale — start from the defaults below, but check target_q_max/min
-        # against them (if Q is pinned at exactly v_min or v_max for a
-        # meaningful fraction of training, the support is too narrow).
+        # expo_ft/networks/categorical_value.py).
+        #
+        # v_min/v_max apply to NORMALIZED reward units, not raw task reward
+        # scale — rewards are divided by a running RMS estimate
+        # (reward_scale_decay controls the EMA) before the Bellman
+        # projection, so this fixed support stays meaningful across any
+        # task's absolute reward scale without per-task hand-tuning (the
+        # atoms themselves never move/reproject — only the reward's
+        # normalization does, avoiding any instability from redefining a
+        # trained distributional head's support mid-training). Still watch
+        # target_q_max/min: if Q sits pinned at exactly v_min or v_max for a
+        # meaningful fraction of training even in normalized units, the
+        # support itself (not just the normalization) is too narrow.
         num_atoms: int = 101,
         v_min: float = -10.0,
-        v_max: float = 100.0,
+        v_max: float = 20.0,
+        reward_scale_decay: float = 0.99,
         critic_hidden_dims: Sequence[int] = (512, 512, 512, 512),
         critic_weight_decay: Optional[float] = None,
         critic_grad_clip_norm: Optional[float] = None,
@@ -437,6 +448,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         critic_params = critic_variables["params"]
         critic_batch_stats = critic_variables["batch_stats"]
         atoms = make_atoms(num_atoms, v_min, v_max)
+        reward_ms = jnp.array(1.0)  # start at scale=1.0 (no normalization effect) until enough real data accumulates
 
         if critic_weight_decay is not None:
             tx = optax.adamw(
@@ -522,6 +534,8 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             v_min=v_min,
             v_max=v_max,
             atoms=atoms,
+            reward_scale_decay=reward_scale_decay,
+            reward_ms=reward_ms,
             fixed_temperature=fixed_temperature,
             critic_grad_clip_norm=critic_grad_clip_norm,
             data_augmentation_fn=make_data_augmentation_fn(use_full_augmentation),
@@ -894,12 +908,23 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         uniform_probs = jnp.ones_like(next_probs) / self.num_atoms
         next_probs = jnp.where(next_probs_nan_mask[:, None], uniform_probs, next_probs)
 
+        # Normalize rewards by a running RMS estimate BEFORE the Bellman
+        # projection, keeping the fixed [v_min, v_max] support meaningful
+        # regardless of this task's absolute reward scale — see create()'s
+        # docstring for reward_scale_decay. Uses the scale from BEFORE this
+        # batch updates it (below), so there's no within-batch leakage.
+        reward_scale = jnp.sqrt(self.reward_ms + 1e-6)
+        normalized_rewards = batch["rewards"] / reward_scale
+
         discount_k = self.discount ** self.replan_steps
         target_probs = categorical_bellman_projection(
-            next_probs, batch["rewards"], batch["masks"], discount_k,
+            next_probs, normalized_rewards, batch["masks"], discount_k,
             self.atoms, self.v_min, self.v_max,
         )
-        target_q = jnp.sum(target_probs * self.atoms, axis=-1)  # E[atoms] under the projected target distribution — for logging only, not part of the loss (the loss uses the full distribution, not this scalar summary)
+        target_q = jnp.sum(target_probs * self.atoms, axis=-1)  # E[atoms] in NORMALIZED units, for logging — not part of the loss (the loss uses the full distribution, not this scalar summary)
+        target_q_denorm = target_q * reward_scale  # same quantity, rescaled back to this task's raw reward units, purely for human-readable logging
+
+        new_reward_ms = self.reward_scale_decay * self.reward_ms + (1 - self.reward_scale_decay) * jnp.mean(batch["rewards"] ** 2)
 
         key, rng = jax.random.split(rng)
 
@@ -941,6 +966,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             per_sample_loss = categorical_cross_entropy_loss(logits, target_probs)
             critic_loss = (per_sample_loss * batch["valids"]).mean()
             q = q_from_logits(logits, self.atoms)
+            q_denorm = q * reward_scale  # rescaled back to raw reward units, for human-readable logging only
             return critic_loss, {
                 "critic_loss": critic_loss,
                 "q": q.mean(),
@@ -949,6 +975,17 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
                 "target_q_min": target_q.min(),
                 "target_q_max": target_q.max(),
                 "target_q_mean": target_q.mean(),
+                # Same quantities rescaled back to this task's raw reward
+                # units — NOT bounded (reward_scale itself changes over
+                # training), purely for human interpretability. The
+                # normalized q/target_q above are the ones that are
+                # structurally guaranteed to stay within [v_min, v_max].
+                "q_denorm": q_denorm.mean(),
+                "q_min_denorm": q_denorm.min(),
+                "q_max_denorm": q_denorm.max(),
+                "target_q_max_denorm": target_q_denorm.max(),
+                "target_q_min_denorm": target_q_denorm.min(),
+                "reward_scale": reward_scale,
                 "encoder_feature_norm_mean": encoder_feature_norms.mean(),
                 "encoder_feature_norm_max": encoder_feature_norms.max(),
                 "_new_critic_batch_stats": model_state["batch_stats"],
@@ -1002,7 +1039,9 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
 
         info.update(sample_info)
 
-        return self.replace(critic=critic, target_critic=target_critic, batch_encoder=batch_encoder, rng=rng), info
+        info["reward_ms"] = new_reward_ms
+
+        return self.replace(critic=critic, target_critic=target_critic, batch_encoder=batch_encoder, reward_ms=new_reward_ms, rng=rng), info
 
 
     def update(self, agent, batch: DatasetDict, utd_ratio: int, actor_batch: DatasetDict = None):
