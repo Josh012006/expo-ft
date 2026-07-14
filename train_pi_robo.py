@@ -17,6 +17,7 @@ import wandb
 from expo_ft.agents import initialize_checkpoint_dir, save_replay_buffer_transition
 from expo_ft.data.replay_buffer import create_replay_buffer
 from expo_ft.data.batch_processor import BatchProcessor
+from expo_ft.agents.alg.batch_utils import prepare_critic_batch
 from expo_ft.env.droid_utils import process_droid_dataset
 from expo_ft.utils.log_utils import EpisodeState, TrainingStats
 from expo_ft.utils.train_utils import get_batch_info, init_logging, init_wandb
@@ -385,7 +386,27 @@ def main(_):
         ):
             pretrain_batch = next(pretrain_iterator)
             pretrain_batch = pretrain_buffer.apply_data_sharding(pretrain_batch, data_sharding)
-            agent = agent.replace(rng=jax.device_put(agent.rng, replicated_sharding))
+            # update_critic() expects a batch already run through the same two
+            # steps _update_jit() normally applies before ever calling it —
+            # augmentation, then prepare_critic_batch() (raw "image"/
+            # "next_image" -> the structured "observations"/"next_observations"
+            # format update_critic actually reads). Skipping these is what
+            # crashed the first version of this loop with a bare
+            # KeyError('next_observations').
+            pretrain_batch = dict(pretrain_batch)
+            rng, key1 = jax.random.split(agent.rng)
+            rng, key2 = jax.random.split(rng)
+            pretrain_batch["image"] = agent.data_augmentation_fn(key1, pretrain_batch["image"])
+            pretrain_batch["next_image"] = agent.data_augmentation_fn(key2, pretrain_batch["next_image"])
+            pretrain_batch = prepare_critic_batch(
+                pretrain_batch,
+                agent.actor.model_config.action_dim,
+                agent.action_dim,
+                agent.state_dim,
+                agent.action_horizon,
+                agent.replan_steps,
+            )
+            agent = agent.replace(rng=jax.device_put(rng, replicated_sharding))
             agent, pretrain_info = agent.update_critic(pretrain_batch)
             # Logged on a negative step axis (-N .. -1) so it renders as a
             # warm-up phase preceding step 0 of the real training curve, in

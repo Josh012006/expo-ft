@@ -52,7 +52,7 @@ from expo_ft.agents.alg.agent import AgentLearner, initialize_checkpoint_dir
 from expo_ft.agents.alg.batch_utils import prepare_critic_batch
 from expo_ft.data.dataset import DatasetDict
 from expo_ft.distributions import TanhNormal
-from expo_ft.networks import MLP, BatchEncoder
+from expo_ft.networks import MLP, BatchEncoder, Ensemble
 from expo_ft.networks.pixel_multiplexer import PixelTanhNormalMultiplexer
 from expo_ft.networks.state_action_value import StateValue
 from expo_ft.networks.encoders import ResNetV2Encoder
@@ -260,7 +260,7 @@ class PPOLearner(AgentLearner, struct.PyTreeNode):
         # (not PixelTanhNormalMultiplexer, which is distribution-specific) fits this.
         from expo_ft.networks import PixelMultiplexer
 
-        value_net_cls = partial(StateValue, base_cls=value_base_cls)
+        value_net_cls = partial(Ensemble, net_cls=partial(StateValue, base_cls=value_base_cls), num=1)
         value_def = PixelMultiplexer(network_cls=value_net_cls, latent_dim=latent_dim_state, include_state=include_state)
         value_params = value_def.init(value_key, critic_observations, p=critic_states)["params"]
         value_tx = optax.chain(
