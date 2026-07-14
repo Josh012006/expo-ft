@@ -340,7 +340,21 @@ class GRPOLearner(AgentLearner, struct.PyTreeNode):
             log_ratio_ref = ref_log_probs - log_probs
             kl_penalty = (jnp.exp(log_ratio_ref) - log_ratio_ref - 1.0).mean()
 
-            entropy = dist.entropy().mean() if hasattr(dist, "entropy") else -log_probs.mean()
+            # hasattr(dist, "entropy") only checks the METHOD exists, not that
+            # calling it succeeds — TanhNormal is a TFP TransformedDistribution,
+            # which always exposes .entropy() (inherited from the base
+            # Distribution class) but raises NotImplementedError when called,
+            # since a Tanh-squashed Gaussian has no closed-form entropy. Use
+            # try/except to actually test computability; this resolves once
+            # during tracing (dist's type is static, not a traced value), so
+            # it's exactly as cheap as the hasattr check it replaces — just
+            # correct. Falls back to the standard sample-based entropy proxy
+            # (-log_probs.mean()) used throughout this codebase for exactly
+            # this situation.
+            try:
+                entropy = dist.entropy().mean()
+            except NotImplementedError:
+                entropy = -log_probs.mean()
             loss = policy_loss + self.kl_coef * kl_penalty - self.entropy_coef * entropy
 
             approx_kl = (batch["old_log_probs"] - log_probs).mean()

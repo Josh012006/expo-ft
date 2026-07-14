@@ -363,7 +363,7 @@ class PPOLearner(AgentLearner, struct.PyTreeNode):
             surr2 = jnp.clip(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
             policy_loss = -jnp.minimum(surr1, surr2).mean()
 
-            values = self.value.apply_fn({"params": params["value"]}, observations, p=batch["states"])
+            values = self.value.apply_fn({"params": params["value"]}, observations, p=batch["states"])[0]
             if self.value_clip_eps is not None:
                 clipped_values = batch["old_values"] + jnp.clip(
                     values - batch["old_values"], -self.value_clip_eps, self.value_clip_eps
@@ -374,7 +374,21 @@ class PPOLearner(AgentLearner, struct.PyTreeNode):
             else:
                 value_loss = 0.5 * ((values - batch["returns"]) ** 2).mean()
 
-            entropy = dist.entropy().mean() if hasattr(dist, "entropy") else -log_probs.mean()
+            # hasattr(dist, "entropy") only checks the METHOD exists, not that
+            # calling it succeeds — TanhNormal is a TFP TransformedDistribution,
+            # which always exposes .entropy() (inherited from the base
+            # Distribution class) but raises NotImplementedError when called,
+            # since a Tanh-squashed Gaussian has no closed-form entropy. Use
+            # try/except to actually test computability; this resolves once
+            # during tracing (dist's type is static, not a traced value), so
+            # it's exactly as cheap as the hasattr check it replaces — just
+            # correct. Falls back to the standard sample-based entropy proxy
+            # (-log_probs.mean()) used throughout this codebase for exactly
+            # this situation.
+            try:
+                entropy = dist.entropy().mean()
+            except NotImplementedError:
+                entropy = -log_probs.mean()
             loss = policy_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy
 
             approx_kl = (batch["old_log_probs"] - log_probs).mean()
@@ -419,10 +433,10 @@ class PPOLearner(AgentLearner, struct.PyTreeNode):
         encoded_obs = batch_encode(self.batch_encoder.apply_fn, self.batch_encoder.params, batch["observations"], stop_gradient=True)
         dist = self.actor.apply_fn({"params": self.actor.params}, encoded_obs, p=batch["states"])
         old_log_probs = dist.log_prob(batch["actions"])
-        old_values = self.value.apply_fn({"params": self.value.params}, encoded_obs, p=batch["states"])
+        old_values = self.value.apply_fn({"params": self.value.params}, encoded_obs, p=batch["states"])[0]
 
         next_encoded_obs = batch_encode(self.batch_encoder.apply_fn, self.batch_encoder.params, batch["next_observations"], stop_gradient=True)
-        next_values = self.value.apply_fn({"params": self.value.params}, next_encoded_obs, p=batch["next_states"])
+        next_values = self.value.apply_fn({"params": self.value.params}, next_encoded_obs, p=batch["next_states"])[0]
         # Bootstrap from the LAST step's own next_value (standard GAE convention).
         next_value = next_values[-1]
 
