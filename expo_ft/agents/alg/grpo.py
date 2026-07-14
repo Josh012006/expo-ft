@@ -324,7 +324,15 @@ class GRPOLearner(AgentLearner, struct.PyTreeNode):
             observations = jax.lax.with_sharding_constraint(observations, self.data_sharding)
 
             dist = self.actor.apply_fn({"params": params["actor"]}, observations, p=batch["states"])
-            log_probs = dist.log_prob(batch["actions"])
+            # Stored actions are already tanh-squashed (in [-1, 1]). If one
+            # landed at EXACTLY ±1.0 (a real float32 rounding outcome once
+            # the pre-tanh Gaussian sample gets large enough), the Tanh
+            # bijector's log-det-Jacobian correction term diverges, and so
+            # does ITS GRADIENT — turning an entire gradient step (and
+            # therefore the whole actor) into NaN. Clipping to a safe margin
+            # strictly inside (-1, 1) before log_prob is the standard fix.
+            safe_actions = jnp.clip(batch["actions"], -1.0 + 1e-6, 1.0 - 1e-6)
+            log_probs = dist.log_prob(safe_actions)
             ratio = jnp.exp(log_probs - batch["old_log_probs"])
 
             adv = batch["advantages"]
@@ -336,7 +344,7 @@ class GRPOLearner(AgentLearner, struct.PyTreeNode):
             # log-ratio estimator, the standard low-variance GRPO KL estimator:
             # KL(pi || pi_ref) ~= exp(log_pi_ref - log_pi) - (log_pi_ref - log_pi) - 1).
             ref_dist = self.actor.apply_fn({"params": self.ref_actor_params}, observations, p=batch["states"])
-            ref_log_probs = ref_dist.log_prob(batch["actions"])
+            ref_log_probs = ref_dist.log_prob(safe_actions)
             log_ratio_ref = ref_log_probs - log_probs
             kl_penalty = (jnp.exp(log_ratio_ref) - log_ratio_ref - 1.0).mean()
 
@@ -364,13 +372,35 @@ class GRPOLearner(AgentLearner, struct.PyTreeNode):
                 "grpo_loss": loss, "policy_loss": policy_loss, "kl_penalty": kl_penalty,
                 "entropy": entropy, "approx_kl": approx_kl, "clip_frac": clip_frac,
                 "ratio_mean": ratio.mean(),
+                "diag_ratio_finite": jnp.isfinite(ratio).all().astype(jnp.float32),
+                "diag_kl_penalty_finite": jnp.isfinite(kl_penalty).astype(jnp.float32),
+                "diag_loss_finite": jnp.isfinite(loss).astype(jnp.float32),
             }
 
         params = {"actor": self.actor.params, "batch_encoder": self.batch_encoder.params}
         grads, info = jax.grad(loss_fn, has_aux=True)(params)
 
-        actor = self.actor.apply_gradients(grads=grads["actor"])
-        batch_encoder = self.batch_encoder.apply_gradients(grads=grads["batch_encoder"])
+        # Defensive safety net (independent of finding/fixing the root cause):
+        # if this update's gradient is non-finite for ANY reason, applying it
+        # would corrupt actor/batch_encoder params permanently (and Adam's
+        # running moment estimates too) — the corruption doesn't crash HERE,
+        # it silently propagates until the next sample_actions() call emits a
+        # NaN action, crashing training much later with little indication of
+        # where things actually went wrong. Skip the update entirely when
+        # this happens — params and optimizer state both stay exactly as they
+        # were — and surface it via grad_skipped so it's visible in the logs.
+        grad_is_finite = jnp.isfinite(optax.global_norm(grads))
+
+        def _apply(_):
+            actor = self.actor.apply_gradients(grads=grads["actor"])
+            batch_encoder = self.batch_encoder.apply_gradients(grads=grads["batch_encoder"])
+            return actor, batch_encoder
+
+        def _skip(_):
+            return self.actor, self.batch_encoder
+
+        actor, batch_encoder = jax.lax.cond(grad_is_finite, _apply, _skip, operand=None)
+        info["grad_skipped"] = jnp.logical_not(grad_is_finite).astype(jnp.float32)
         info["actor_param_norm"] = optax.global_norm(actor.params)
 
         return self.replace(actor=actor, batch_encoder=batch_encoder), info
@@ -395,9 +425,19 @@ class GRPOLearner(AgentLearner, struct.PyTreeNode):
 
         encoded_obs = batch_encode(self.batch_encoder.apply_fn, self.batch_encoder.params, batch["observations"], stop_gradient=True)
         dist = self.actor.apply_fn({"params": self.actor.params}, encoded_obs, p=batch["states"])
-        old_log_probs = dist.log_prob(batch["actions"])
+        # Same tanh-boundary safety clip as in update_actor's loss_fn.
+        safe_actions = jnp.clip(batch["actions"], -1.0 + 1e-6, 1.0 - 1e-6)
+        old_log_probs = dist.log_prob(safe_actions)
 
         advantages = compute_group_relative_advantage(batch["episode_returns"], self.group_size)
+
+        # Diagnostics: which upstream quantity is non-finite FIRST, computed
+        # once on the whole rollout batch before any minibatching/gradients.
+        pre_update_diagnostics = {
+            "diag_episode_returns_finite": jnp.isfinite(batch["episode_returns"]).all().astype(jnp.float32),
+            "diag_old_log_probs_finite": jnp.isfinite(old_log_probs).all().astype(jnp.float32),
+            "diag_advantages_finite": jnp.isfinite(advantages).all().astype(jnp.float32),
+        }
 
         batch["old_log_probs"] = old_log_probs
         batch["advantages"] = advantages
@@ -433,5 +473,6 @@ class GRPOLearner(AgentLearner, struct.PyTreeNode):
         epoch_keys = jax.random.split(key2, num_epochs)
         (new_agent,), epoch_infos = jax.lax.scan(epoch_step, (new_agent,), epoch_keys)
         info = jax.tree_util.tree_map(lambda x: x[-1], epoch_infos)
+        info = {**info, **pre_update_diagnostics}
 
         return new_agent, info

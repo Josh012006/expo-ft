@@ -7,9 +7,26 @@ def get_config():
 
     config.model_cls = "EXPOLearner"
 
+    # NOTE: num_qs/num_min_qs/critic_layer_norm below are dead for EXPOLearner
+    # as of the categorical-critic rewrite (expo_ft.py) — kept here only
+    # because SACLearner (sac.py, which also extends this same base config)
+    # still uses the old ensemble-of-scalars critic architecture and reads
+    # these fields directly. Do not remove.
     config.num_qs = 10
     config.num_min_qs = 2
     config.critic_layer_norm = True
+
+    # Categorical (C51-style, bounded support) critic — EXPOLearner only, per
+    # XQC (arXiv 2509.25174) / XQCfD (arXiv 2605.10734). v_min/v_max are
+    # domain-specific and NOT empirically validated against this project's
+    # actual reward scale yet — treat these as a starting point, and check
+    # target_q_max/target_q_min against them (if Q is pinned at exactly
+    # v_min or v_max for a meaningful fraction of training, the support is
+    # too narrow and needs widening).
+    config.num_atoms = 101
+    config.v_min = -10.0
+    config.v_max = 100.0
+    config.critic_hidden_dims = (512, 512, 512, 512)
 
     config.N = 8
     config.n_edit_samples = 8

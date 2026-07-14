@@ -98,6 +98,9 @@ def main(_):
         # a new, default-off (0) field — behavior for existing configs that
         # don't set rl_critic_pretrain_steps is unchanged ---
         FLAGS.config.critic_pretrain_steps = int(getattr(cfg, "rl_critic_pretrain_steps", FLAGS.config.critic_pretrain_steps))
+        FLAGS.config.num_atoms = int(getattr(cfg, "rl_num_atoms", FLAGS.config.num_atoms))
+        FLAGS.config.v_min = float(getattr(cfg, "rl_v_min", FLAGS.config.v_min))
+        FLAGS.config.v_max = float(getattr(cfg, "rl_v_max", FLAGS.config.v_max))
     elif model_cls == "PPOLearner":
         FLAGS.config.actor_lr  = float(getattr(cfg, "ppo_lr", FLAGS.config.actor_lr))
         FLAGS.config.critic_lr = float(getattr(cfg, "ppo_lr", FLAGS.config.critic_lr))
