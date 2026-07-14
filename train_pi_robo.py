@@ -381,6 +381,20 @@ def main(_):
             sample_args={"batch_size": cfg.batch_size},
             data_sharding=data_sharding,
         )
+        # Give pretrain/* metrics their own independent step axis
+        # ("pretrain_step"), decoupled from the default global step counter
+        # that the main training loop below uses for training/* metrics (via
+        # wandb.log(..., step=i)). Without this, wandb treats "step" as one
+        # single global, monotonically-increasing counter shared by every
+        # metric in the run regardless of name — logging pretraining at
+        # steps 0..N-1 (or any other scheme) would collide with, and get
+        # silently dropped against, whatever the main loop logs afterward
+        # (this is what caused the "steps must be monotonically increasing"
+        # warnings that silently dropped every single pretrain data point).
+        # TensorBoard doesn't share this problem (each tag is an independent
+        # scalar stream), so no equivalent change is needed for tb_writer.
+        wandb.define_metric("pretrain_step")
+        wandb.define_metric("pretrain/*", step_metric="pretrain_step")
         for pretrain_step in tqdm.tqdm(
             range(critic_pretrain_steps), desc="Critic pretraining", disable=not FLAGS.tqdm
         ):
@@ -408,19 +422,18 @@ def main(_):
             )
             agent = agent.replace(rng=jax.device_put(rng, replicated_sharding))
             agent, pretrain_info = agent.update_critic(pretrain_batch)
-            # Logged on a negative step axis (-N .. -1) so it renders as a
-            # warm-up phase preceding step 0 of the real training curve, in
-            # the SAME wandb/tensorboard run, rather than colliding with
-            # steps 0..N logged by the main loop below (the full sequence
-            # -N, ..., -1, 0, 1, 2, ... is strictly increasing, so there's no
-            # step-monotonicity issue either).
-            log_step = pretrain_step - critic_pretrain_steps
             for k, v in pretrain_info.items():
                 try:
-                    tb_writer.add_scalar(f"pretrain/{k}", float(v), global_step=log_step)
+                    tb_writer.add_scalar(f"pretrain/{k}", float(v), global_step=pretrain_step)
                 except (TypeError, ValueError):
                     pass
-            wandb.log({f"pretrain/{k}": v for k, v in pretrain_info.items()}, step=log_step)
+            # No step= kwarg here on purpose — the custom step_metric wiring
+            # above means wandb plots these against "pretrain_step" (logged
+            # in the same call) instead of the shared global step counter.
+            wandb.log({
+                "pretrain_step": pretrain_step,
+                **{f"pretrain/{k}": v for k, v in pretrain_info.items()},
+            })
         logging.info("Critic pretraining complete.")
 
     episode_log = EpisodeState()
