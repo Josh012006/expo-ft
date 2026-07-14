@@ -19,6 +19,7 @@ import openpi.training.sharding as _sharding
 import openpi.training.utils as training_utils
 
 from expo_ft.agents.alg.agent import AgentLearner, initialize_checkpoint_dir
+from expo_ft.agents.alg.checkpoint_utils import make_checkpoint_fns
 from expo_ft.agents.alg.batch_utils import prepare_critic_batch
 from expo_ft.data.dataset import DatasetDict
 from expo_ft.utils.augmentation import make_data_augmentation_fn
@@ -47,16 +48,11 @@ def _merge_params_bc(agent: Any, params: dict[str, at.Params]) -> Any:
     return dataclasses.replace(agent, actor_train_state=actor_train_state)
 
 
+_restore_checkpoint, _save_checkpoint = make_checkpoint_fns(_split_params_bc, _merge_params_bc)
+
+
 def restore_checkpoint(checkpoint_manager, agent, step: int | None = None):
-    agent, params = _split_params_bc(agent)
-    restored = checkpoint_manager.restore(
-        step,
-        items={
-            "agent": agent,
-            "params": params,
-        },
-    )
-    return _merge_params_bc(restored["agent"], restored["params"])
+    return _restore_checkpoint(checkpoint_manager, agent, step)
 
 
 def save_checkpoint(
@@ -64,8 +60,7 @@ def save_checkpoint(
     agent: Any,
     step: int,
 ):
-    agent, params = _split_params_bc(agent)
-    checkpoint_manager.save(step, {"agent": agent, "params": params})
+    _save_checkpoint(checkpoint_manager, agent, step)
 
 def load_agent(seed, example_observation, example_action, example_state,
                actor, actor_train_state, target_actor_params, agent_kwargs, metadata,

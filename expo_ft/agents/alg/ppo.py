@@ -49,6 +49,7 @@ import openpi.shared.array_typing as at
 import openpi.training.sharding as _sharding
 
 from expo_ft.agents.alg.agent import AgentLearner, initialize_checkpoint_dir
+from expo_ft.agents.alg.checkpoint_utils import make_checkpoint_fns
 from expo_ft.agents.alg.batch_utils import prepare_critic_batch
 from expo_ft.data.dataset import DatasetDict
 from expo_ft.distributions import TanhNormal
@@ -85,15 +86,15 @@ def _merge_params(agent: Any, params: dict[str, at.Params]) -> Any:
     return dataclasses.replace(agent, batch_encoder=batch_encoder, actor=actor, value=value)
 
 
+_restore_checkpoint, _save_checkpoint = make_checkpoint_fns(_split_params, _merge_params)
+
+
 def restore_checkpoint(checkpoint_manager, agent, step: int | None = None):
-    agent, params = _split_params(agent)
-    restored = checkpoint_manager.restore(step, items={"agent": agent, "params": params})
-    return _merge_params(restored["agent"], restored["params"])
+    return _restore_checkpoint(checkpoint_manager, agent, step)
 
 
 def save_checkpoint(checkpoint_manager: ocp.CheckpointManager, agent: Any, step: int):
-    agent, params = _split_params(agent)
-    checkpoint_manager.save(step, {"agent": agent, "params": params})
+    _save_checkpoint(checkpoint_manager, agent, step)
 
 
 def load_agent(seed, example_observation, example_action, example_state,
@@ -327,7 +328,14 @@ class PPOLearner(AgentLearner, struct.PyTreeNode):
         action = dist.sample(seed=key).reshape(self.full_action_dim)
 
         action = action.reshape(1, self.replan_steps, self.action_dim)
-        padded = jnp.zeros((1, self.action_horizon, self.vla.model_config.action_dim)).at[:, : self.replan_steps, : self.action_dim].set(action)
+        # Pad only the horizon dimension here (replan_steps -> action_horizon) —
+        # process_transformed_outputs() already pads the action dimension
+        # itself internally (env action_dim -> the VLA model's padded
+        # action_dim). Padding the action dimension here too (to
+        # self.vla.model_config.action_dim) double-pads it, producing a
+        # flattened size process_transformed_outputs can't reshape back
+        # (e.g. "cannot reshape array of shape (1, 512) into shape (1, 16, 8)").
+        padded = jnp.zeros((1, self.action_horizon, self.action_dim)).at[:, : self.replan_steps, :].set(action)
         raw_action = self.vla.process_transformed_outputs(padded)[0]
         n = min(self.replan_steps, self.action_horizon)
         action = raw_action[:n].reshape(n, self.action_dim)
