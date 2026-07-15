@@ -543,7 +543,16 @@ def main(_):
         step_metrics = {}
 
         observation = env.get_observation()
-        done, success, reward, mask = env.get_info_for_step()
+        # NOTE: done/success/reward/mask are deliberately NOT fetched here.
+        # They must reflect the CONSEQUENCE of the action taken THIS
+        # iteration (env.step() below), not the previous iteration's action
+        # — fetching them here (before env.step()) was storing every
+        # transition's reward/done/mask one step out of phase with its own
+        # (observation, action) pair: transition i would get
+        # (o_i, a_i, r_{i-1}, done_{i-1}) instead of (o_i, a_i, r_i, done_i).
+        # This also delayed episode-boundary detection (the `if done:` reset
+        # check below) by one step, letting one extra action execute past
+        # the true terminal state before resetting.
 
         # Skip model inference while human is controlling.
         if not action_plan and action_type != "human":
@@ -563,6 +572,11 @@ def main(_):
         action = action_plan.popleft() if has_action else np.zeros_like(example_action.squeeze())
         real_action, action_type = env.step(action.tolist())
         start_step_time = time.time()
+        # Fetch AFTER env.step(): now reflects the consequence of
+        # `real_action` taken from `observation`, matching the (o_i, a_i,
+        # r_i, done_i) convention the rest of the pipeline (Bellman backup,
+        # GAE, ...) assumes.
+        done, success, reward, mask = env.get_info_for_step()
 
         episode_log.record_step(observation, len(action_plan), action_type, real_action, reward)
 
