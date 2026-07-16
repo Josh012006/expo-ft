@@ -149,6 +149,7 @@ def stage_sft(cfg, args, run_dir):
 
 _MODEL_CONFIG_BY_CLS = {
     "EXPOLearner": "configs/model/expo_ft_pi_config.py",
+    "EXPOLearnerOld": "configs/model/expo_ft_old_pi_config.py",
     "PPOLearner": "configs/model/ppo_pi_config.py",
     "GRPOLearner": "configs/model/grpo_pi_config.py",
     "SACLearner": "configs/model/sac_pi_config.py",

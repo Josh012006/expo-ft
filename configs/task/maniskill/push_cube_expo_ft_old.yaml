@@ -1,4 +1,4 @@
-# configs/task/maniskill/push_cube_expo_ft.yaml
+# configs/task/maniskill/push_cube_expo_ft_old.yaml
 
 # NOTE: the Environment/Data/Run-Logging sections below are shared
 # (kept identical) across all *_sft.yaml / *_expo_ft.yaml / *_ppo.yaml /
@@ -75,7 +75,7 @@ fsdp_devices: 1            # number of GPUs for FSDP sharding (1 = single GPU, n
 num_data_rl: 50
 rl_resume_dir: null
 
-model_cls: "EXPOLearner"  # selects both configs/model/*.py (via run_pipeline.py) and the FLAGS.config path used by train_pi_robo.py
+model_cls: "EXPOLearnerOld"  # selects both configs/model/*.py (via run_pipeline.py) and the FLAGS.config path used by train_pi_robo.py
 
 # ── RL Checkpointing ──────────────────────────────────────────────
 checkpoint_model: true
@@ -111,33 +111,3 @@ rl_freeze_critic_encoder: false # if true, ResNet-34 image encoder frozen for th
 rl_critic_pretrain_steps: 0     # if >0, pretrain the critic for N steps on offline demos before
                                   # RL begins (critic-only, residual actor/base VLA/temperature
                                   # untouched) — XQCfD-style critic/actor coherence warmup. 0 = disabled.
-
-# ── Categorical critic (XQC/XQCfD-style, bounded support) ─────────────
-# v_min/v_max apply to NORMALIZED reward units (rewards are divided by a
-# running RMS estimate before the Bellman projection — see
-# rl_reward_scale_decay), so they should be domain-agnostic and not need
-# per-task hand-tuning. Still watch target_q_max/target_q_min (the
-# normalized ones, not the _denorm logging variants): if Q sits pinned
-# at exactly v_min or v_max for a meaningful fraction of training even
-# in normalized units, the support itself is too narrow.
-rl_num_atoms: 101               # number of fixed support bins for the categorical critic
-rl_v_min: -10.0                 # lower bound of the critic's fixed support (normalized reward units)
-rl_v_max: 20.0                  # upper bound of the critic's fixed support (normalized reward units)
-rl_reward_scale_decay: 0.99     # EMA decay for the running reward-RMS estimate; higher = slower-adapting, more stable
-
-# ── KL regularization for the edit policy (XQCfD-style) ────────────────
-# Replaces the generic entropy bonus with a penalty for the edit
-# distribution deviating from a fixed N(0, rl_kl_ref_std) reference in
-# pre-tanh space -- "prefer staying close to zero residual unless Q
-# strongly justifies deviating". 0.0 = disabled (exact no-op).
-rl_kl_coef: 0.0                 # weight of the KL penalty; 0.0 = disabled, matches pre-existing entropy-only behavior
-rl_kl_ref_std: 1.0              # std of the fixed reference distribution in pre-tanh space
-
-# IMPORTANT: kl_coef is ADDITIVE alongside the existing entropy bonus in
-# our implementation, NOT a replacement like in the XQCfD paper (there,
-# the same "temperature" coefficient serves both roles interchangeably --
-# see Equation 1). If you want a faithful, isolated test of XQCfD's KL
-# regularization (KL only, no entropy term confounding it), set
-# rl_entropy_scale to 0.0 below. Leaving it at the default (1.0) means
-# you are testing KL + entropy together, not KL alone.
-rl_entropy_scale: 1.0           # weight of the (separate, additive) entropy bonus term -- set to 0.0 for a KL-only test matching the paper's setup

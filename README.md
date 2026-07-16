@@ -1,16 +1,26 @@
 # ExpoFT — π₀.₅ + ManiSkill RL Fine-Tuning
 
-Sample-efficient RL fine-tuning of π₀.₅ on ManiSkill simulation tasks, using
-the ExpoFT algorithm (frozen VLA + trainable residual policy + critic, trained
-via Bellman backup and a SAC-style actor update).
+Sample-efficient RL fine-tuning of π₀.₅ on ManiSkill simulation tasks. Started
+as a port of the ExpoFT algorithm (frozen VLA + trainable residual policy +
+critic) to simulation; has since grown into a broader testbed comparing
+ExpoFT against on-policy baselines (PPO, GRPO) and an off-policy baseline
+without the residual/argmax scheme (SAC), while diagnosing why RL fine-tuning
+consistently fails to beat the SFT baseline (see Current status).
 
 > This repo adapts the original real-DROID-robot ExpoFT codebase
 > ([pd-perry/expo-ft](https://github.com/pd-perry/expo-ft)) to run entirely in
 > ManiSkill simulation instead — no real robot, NUC, or spacemouse involved.
-> `train_pi_robo.py` and `expo_ft/agents/` are largely unmodified from the
-> reference (see Changelog for the exceptions); `run_pipeline.py` and
-> `expo_ft/env/maniskill_env.py` are new, replacing the original client-server
-> DROID environment with a local ManiSkill one.
+> `run_pipeline.py` and `expo_ft/env/maniskill_env.py` are new, replacing the
+> original client-server DROID environment with a local ManiSkill one.
+> `expo_ft/agents/alg/expo_ft_old.py` preserves the original, reference-faithful
+> ExpoLearner (MSE scalar critic, REDQ-style ensemble) unmodified, for
+> comparison/rollback — `expo_ft/agents/alg/expo_ft.py` (the one actually used)
+> has since diverged from it: a categorical/distributional critic architecture
+> (XQC/XQCfD-style, see Current status) replaces the original's scalar
+> regression critic. Both are directly runnable and A/B-comparable via
+> `model_cls: "EXPOLearner"` (new) vs. `"EXPOLearnerOld"` (original) in the
+> task YAML — see Pipeline. `expo_ft/agents/alg/{ppo,grpo,sac}.py` are new
+> additions, not part of the original reference at all.
 
 ## Setup
 
@@ -63,8 +73,21 @@ Everything runs through `scripts/run_pipeline.py --config <task.yaml> --stage <s
 |---|---|---|
 | `demos` | Generate + convert demonstrations (motion planning → RGB replay → DROID/LeRobot format) | `job_demos.sh` |
 | `sft` | Supervised fine-tuning warmup on demos | `job_sft.sh <venv> <config>` |
-| `rl` | ExpoFT RL fine-tuning from an SFT checkpoint | `job_rl.sh <venv> <config> [sft_checkpoint]` |
+| `rl` | RL fine-tuning from an SFT checkpoint — algorithm selected by `model_cls` in the task YAML, see below | `job_rl.sh <venv> <config> [sft_checkpoint]` |
 | `all` | All of the above in sequence | — |
+
+**Algorithms**: `model_cls` in the task YAML picks which learner
+`train_pi_robo.py` dispatches to — `EXPOLearner` (categorical critic, current
+default) / `EXPOLearnerOld` (original scalar-critic architecture, for direct
+A/B comparison — see Current status), `PPOLearner`/`GRPOLearner` (on-policy
+baselines — see Current status for an important caveat about their actor), or
+`SACLearner` (off-policy, no residual/argmax scheme). Each has its own model
+config (`configs/model/{expo_ft,expo_ft_old,ppo,grpo,sac}_pi_config.py`) and its
+own task YAML per task (`configs/task/maniskill/<task>_{sft,expo_ft,ppo,grpo,sac}.yaml`)
+— the `_sft.yaml` variant is shared across algorithms for the `demos`/`sft`
+stages; the algorithm-specific variants are used for `--stage rl`.
+`run_pipeline.py::stage_rl` reads `model_cls` from whichever task YAML is
+passed and picks the matching model config automatically.
 
 Evaluation:
 - `scripts/eval_policy.py` (single checkpoint) — `--checkpoint <sft_dir>` for an
@@ -88,19 +111,125 @@ PickCube to be usable at all).
 ## Current status (July 2026)
 
 SFT is fully validated on all three tasks (see Published checkpoints below).
-**RL fine-tuning currently degrades the SFT policy on every task and every
-hyperparameter configuration tried so far** — success rate consistently
+**RL fine-tuning still does not beat the SFT baseline on any task, with any
+of the four algorithms (ExpoFT, PPO, GRPO, SAC) tried so far** — but a lot of
+what was an open question in the previous write-up (below, kept for context)
+has since been diagnosed, and two real, independent bugs have been found and
+fixed along the way without resolving the core symptom.
+
+**Critic architecture**: replaced the original scalar-regression critic
+(REDQ-style ensemble, MSE loss against an unbounded TD target) with a
+categorical/distributional one (XQC, arXiv 2509.25174 / XQCfD, arXiv
+2605.10734 — fixed bounded support instead of a scalar, batch norm + weight
+norm on the critic MLP, no ensemble). See
+`expo_ft/networks/categorical_value.py` and `expo_ft/agents/alg/expo_ft.py`;
+the original architecture is preserved unmodified in `expo_ft_old.py`. Result:
+`target_q_max`/`target_q_min` now genuinely converge and stay bounded instead
+of climbing indefinitely (the original architecture's `critic_loss` also grew
+increasingly spiky over training; the new one stays smooth) — but
+`eval/success_rate` still collapses the same way regardless. This was an
+important negative result: it rules out critic-training instability itself as
+the primary driver of the collapse.
+
+**Reward/done/mask timing bug (found and fixed)**: in `train_pi_robo.py`'s
+main loop, `env.get_info_for_step()` (reward/done/mask) was being called
+*before* `env.step()` instead of after — so every stored transition received
+the reward resulting from the *previous* action instead of the one actually
+being stored, a systematic one-step misattribution on every transition
+collected online, across all four algorithms (they share the same loop). Also
+delayed episode-done detection by one step. Confirmed via a controlled
+synthetic reproduction (not just re-reading the code) that this is a real,
+structural mismatch between the accumulated n-step reward window and the
+observation transition it's supposed to explain — not a labeling artifact
+compensated for elsewhere. Scope: only the online RL loop; SFT, demo
+generation, and critic pretraining (all separate pipelines) were never
+affected. Fixed by reordering the fetch to happen after `env.step()`. A
+controlled before/after comparison (same hyperparameters otherwise) showed
+`target_q_max` stabilizing similarly to the categorical-critic result above,
+but again no change to `eval/success_rate`. Our tasks use ManiSkill's default
+dense (`normalized_dense`) reward, not sparse — the shaped component of the
+reward is only mildly perturbed by a one-step shift, but the discrete success
+bonus layered on top (`reward[success] += ...`) is exactly the kind of
+discontinuous value this bug would misattribute most.
+
+**Current leading hypothesis**: the argmax candidate-selection mechanism
+itself (`EXPOLearner.sample_batch_actions` — the same critic both picks its
+favorite among 16 base+edited candidates *and* evaluates that choice for the
+TD bootstrap target — classic maximization/self-reference bias, closely
+related to why Double Q-learning exists). Two independent, confirmed fixes
+(critic architecture, reward timing) each improved something real and
+measurable without touching `eval/success_rate`, which points at this
+mechanism by elimination rather than direct proof.
+
+**XQCfD mitigations being tested, in order**:
+1. Critic pretraining (BC/TD warm-start on demos before RL starts,
+   `rl_critic_pretrain_steps` in the ExpoFT task YAML) — tested, did not help
+   on its own.
+2. KL regularization against the SFT policy, replacing the generic entropy
+   bonus (`rl_kl_coef`/`rl_kl_ref_std`, computed in closed form in pre-tanh
+   Gaussian space — see `expo_ft.py`'s `update_residual_actor`). **Note:**
+   `rl_kl_coef` is additive alongside the existing entropy bonus in this
+   implementation, not a replacement like in the paper (there, one
+   coefficient serves both roles) — set `rl_entropy_scale: 0.0` for a faithful
+   isolated test. An initial confounded run (KL + entropy both active) showed
+   the most encouraging result of this whole investigation so far:
+   `eval/success_rate` consistently 5–10 points above an entropy-only
+   baseline for most of training. An isolated KL-only test is in progress to
+   confirm how much of that is attributable to KL specifically.
+3. Stationary/HetStat architecture (not yet implemented) — queued.
+
+**Also queued**: decoupled selection/evaluation for the argmax mechanism
+(Double-DQN style — use the *online* critic to select the best candidate,
+the *target* critic to evaluate that specific choice, rather than the target
+critic doing both) — no new critic needed, since ExpoFT already carries an
+online/target pair. Orthogonal to the KL/HetStat changes above (touches
+critic usage, not the residual policy's own loss), so it can be layered on
+top or tested in isolation at any point without reverting anything.
+
+**PPO/GRPO baselines**: added as on-policy comparisons, sharing the same
+`train_pi_robo.py` main loop. Important finding: their actor is a small,
+separately/randomly-initialized network (TanhNormal + its own image encoder)
+— the loaded VLA/SFT checkpoint is used only for input preprocessing/output
+denormalization, *not* to initialize this network (Pi0.5 is flow-matching
+based and doesn't expose a tractable action log-probability, which PPO/GRPO's
+math needs — this is a reasonable workaround for that constraint, but it
+means the actor otherwise starts with zero connection to the SFT policy's
+competence, reproducing this project's own Phase 1 finding — on-policy from a
+non-SFT start collapses to ~0% success — despite intending to test on-policy
+*from* an SFT checkpoint). `ppo.py`/`grpo.py`'s `pretrain_actor_bc` (toggle:
+`ppo_actor_pretrain_steps`/`grpo_actor_pretrain_steps`) behavior-clones this
+actor on demos before RL starts, to address this gap. Several unrelated,
+real numerical bugs were also found and fixed in `ppo.py`/`grpo.py` along the
+way (a `sample_num` kwarg wiring issue after adding ensemble-shape
+compatibility, a double-padding bug in action denormalization, a
+`hasattr`-based entropy check that silently took the wrong branch for
+`TanhNormal`, an unclipped-log-ratio overflow that could produce literal
+`inf`/`-inf` in the PPO/GRPO loss, and a NaN-producing singularity at the
+Tanh boundary for replayed actions) — all confirmed via direct reproduction
+with the real classes, not just code review. A defensive NaN-guard (skip an
+update entirely, params and optimizer state untouched, if its gradient is
+non-finite) was added on top as a safety net independent of root-causing any
+of these.
+
+<details>
+<summary>Previous write-up (superseded by the above, kept for history)</summary>
+
+RL fine-tuning currently degrades the SFT policy on every task and every
+hyperparameter configuration tried so far — success rate consistently
 collapses after an initial stable period, correlated in timing with growing
 instability in `training/critic_loss`. This holds even when starting from a
 strong SFT checkpoint (86% success) and even when reproducing the original
 paper's exact `utd_ratio=20` within the paper's own validated training length
 (~20k steps) — that specific test collapsed *faster* than our reduced
 `utd_ratio=2` configuration, showing `utd_ratio` itself (not total training
-duration) is the dominant driver of the instability observed here. See
-Changelog for the RL-hyperparameter fixes made along the way, and the
+duration) is the dominant driver of the instability observed here.
+</details>
+
+See Changelog for the RL-hyperparameter fixes made along the way, and the
 `configs/model/expo_ft_pi_config.py` vs. task-YAML hyperparameter comparison
-below. This is an open, unresolved research question at the time of writing —
-not a known bug.
+below. This remains an open, unresolved research question at the time of
+writing — not a known bug (though several real bugs were found and fixed
+while investigating it).
 
 ## Known issues / open items
 
@@ -142,6 +271,10 @@ Demo generation applies the same overrides via `scripts/replay_trajectory_patche
 
 ## RL hyperparameters (YAML fields)
 
+These apply to the ExpoFT task YAMLs (`<task>_expo_ft.yaml`); PPO/GRPO/SAC
+each have their own `ppo_*`/`grpo_*`/`sac_*`-prefixed fields in their own task
+YAMLs (`<task>_{ppo,grpo,sac}.yaml`), documented inline there.
+
 ```yaml
 rl_lr: 3.0e-4                    # learning rate for critic and actor (NOTE: write scientific
                                   # notation WITH a decimal point — bare "3e-4" parses as a
@@ -149,7 +282,7 @@ rl_lr: 3.0e-4                    # learning rate for critic and actor (NOTE: wri
 rl_discount: 0.99                # discount factor gamma for Bellman backup
 rl_tau: 0.005                    # polyak averaging coefficient for critic target network
 rl_init_temperature: 1.0         # initial SAC entropy temperature
-rl_hidden_dims: [256, 256, 256]  # hidden layer sizes for critic and edit policy MLPs
+rl_hidden_dims: [256, 256, 256]  # hidden layer sizes for the edit policy MLP
 rl_edit_scale: 0.2               # max magnitude of residual action (paper: 0.05–0.2 by task difficulty)
 actor_success_only: true         # if true, actor batch is sampled only from successful transitions
 utd_ratio: 2                     # gradient updates per new transition collected (paper: 20 — see Current status)
@@ -157,6 +290,24 @@ offline_ratio: 0.5               # fraction of batch from a separate offline dem
                                   # (paper actually uses 0 — demos inserted directly into the
                                   # single online buffer; 0.5 is our own deviation, tested as a
                                   # stability lever, not the paper's default)
+
+# Categorical critic (XQC/XQCfD-style, bounded support — see Current status)
+rl_num_atoms: 101                # number of fixed support bins
+rl_v_min: -10.0                  # lower bound of the fixed support (NORMALIZED reward units)
+rl_v_max: 20.0                   # upper bound of the fixed support (NORMALIZED reward units)
+rl_reward_scale_decay: 0.99      # EMA decay for the running reward-RMS estimate used to
+                                  # normalize rewards before the Bellman projection, so
+                                  # v_min/v_max stay meaningful without per-task hand-tuning
+
+# Critic pretraining (XQCfD-style warm-start on demos before RL starts)
+rl_critic_pretrain_steps: 0      # 0 = disabled
+
+# KL regularization for the edit policy (XQCfD-style, see Current status for
+# the additive-vs-replacement caveat relative to the paper)
+rl_kl_coef: 0.0                  # 0.0 = disabled (exact no-op)
+rl_kl_ref_std: 1.0               # std of the fixed N(0, ref_std) reference, pre-tanh space
+rl_entropy_scale: 1.0            # weight of the (separate, additive) entropy bonus —
+                                  # set to 0.0 alongside rl_kl_coef for an isolated KL test
 ```
 
 These are read directly by `train_pi_robo.py` and explicitly override the
@@ -187,6 +338,132 @@ run directory independently (see Changelog).
 
 These used to be CLI overrides (`--num-demos` on `run_pipeline.py`); they're
 YAML-only now so a run's full configuration lives in one place.
+
+## Changelog — research-phase fixes (July 2026)
+
+Everything below is from the investigation described in Current status —
+kept separate from the ManiSkill-adaptation changelog further down since it's
+a different phase of work (debugging *why* RL doesn't beat SFT, rather than
+getting the ManiSkill port running at all).
+
+**Categorical critic architecture** (`expo_ft/networks/categorical_value.py`,
+`expo_ft/agents/alg/expo_ft.py`): replaced the scalar MSE-regression critic
+with a C51-style categorical one (fixed bounded support, batch norm + weight
+norm, no ensemble) per XQC/XQCfD. `expo_ft_old.py` preserves the original
+architecture unmodified for comparison/rollback — a thin passthrough at
+`expo_ft.py`'s old location was used during the transition so the rest of the
+package (`__init__.py`, which every other learner's import chain went
+through) didn't hard-depend on whichever architecture was mid-rewrite.
+`checkpoint_utils.py` was factored out (generic `restore_checkpoint`/
+`save_checkpoint` mechanics, parametrized by each learner's own
+`_split_params`/`_merge_params`) so this and future architecture swaps
+wouldn't risk breaking PPO/GRPO/SAC/BC's own checkpointing, which shared the
+same code before this.
+
+**Adaptive reward normalization**: `v_min`/`v_max` apply to *normalized*
+reward units — rewards are divided by a running RMS estimate
+(`reward_scale_decay`) before the Bellman projection, so the fixed support
+stays meaningful across tasks without per-task hand-tuning of the bounds
+themselves. Verified via a synthetic test that a sudden 50× jump in a task's
+reward scale doesn't break the boundedness guarantee — the normalization
+absorbs it.
+
+**Reward/done/mask timing bug** — see Current status for the finding itself;
+`get_info_for_step()` moved from before to after `env.step()` in
+`train_pi_robo.py`'s main loop.
+
+**PPO/GRPO added** (`expo_ft/agents/alg/{ppo,grpo}.py`, pre-existing files
+from an earlier commit, not previously wired into `train_pi_robo.py`'s
+dispatch). Bugs found and fixed while actually exercising this code for the
+first time:
+- `PixelMultiplexer` always passes a `sample_num` kwarg, assuming
+  ensemble-wrapped networks (which consume and stop it) — PPO's *un*wrapped
+  value network doesn't, causing a `TypeError`. Fixed by wrapping it in a
+  trivial `Ensemble(num=1)`, which in turn required indexing `[0]` at every
+  call site to drop the resulting singleton ensemble axis (a second bug this
+  introduced, caught via a `ValueError: scan got values with different
+  leading axis sizes`).
+- `sample_actions` double-padded the action's dimension (pre-padding to the
+  VLA's internal size before `process_transformed_outputs`, which pads it
+  again itself) — fixed to only pad the horizon dimension.
+- `hasattr(dist, "entropy")` doesn't test whether calling it actually
+  succeeds — `TanhNormal` always exposes the method (inherited from the base
+  TFP `Distribution` class) but raises `NotImplementedError` when called,
+  since a Tanh-squashed Gaussian has no closed-form entropy. Fixed with
+  `try/except` instead, falling back to the sample-based proxy
+  (`-log_probs.mean()`) the code already had — just gated on the wrong check.
+- The PPO/GRPO surrogate objective's `ratio = exp(log_probs -
+  old_log_probs)` was unclipped for `surr1` (only the `clip_eps`-clipped
+  version, `surr2`, was) — if the policy drifts enough over several epochs,
+  this can overflow to literal `inf` in float32, and with a negative
+  advantage produces `-inf` that propagates through the whole batch's mean
+  loss. Fixed by clipping the log-ratio to ±20 before exponentiating (far
+  outside `clip_eps`'s own operating range, so this only prevents pure
+  numerical overflow).
+- Stored actions replayed through `log_prob()` could land at exactly the
+  Tanh boundary (±1.0, a real float32 rounding outcome once the pre-tanh
+  sample is large enough) — the bijector's log-det-Jacobian correction (and
+  its gradient) diverges there, which can turn an entire gradient step's
+  loss into `inf`/`NaN`. Fixed by clipping actions to a safe margin
+  (±(1 − 1e-6)) before every `log_prob()` call.
+- Added a defensive NaN-guard around `apply_gradients` (skip the update
+  entirely — params and optimizer state both untouched — if the gradient is
+  non-finite), independent of root-causing any specific source, plus
+  `diag_*_finite` fields at each stage of the computation so a future
+  occurrence is diagnosable rather than a bare crash.
+- `pretrain_actor_bc`: BC warm-start for PPO/GRPO's actor (+ its own
+  batch_encoder) on demos before RL starts — see Current status for why this
+  exists (their actor has no other connection to the SFT policy at all).
+
+**`offline_ratio` demo-contamination fix for on-policy algorithms**: PPO/GRPO
+are genuinely on-policy — their math assumes every batch is a fresh rollout
+under the current policy. The shared `BatchProcessor`/replay-buffer
+infrastructure (built for ExpoFT/SAC's off-policy-with-demos design) doesn't
+distinguish this; a task YAML's `offline_ratio` would silently blend demo
+transitions into PPO/GRPO's training batches. Fixed by forcing
+`offline_ratio=0.0` and `dataset=None` in `BatchProcessor`'s construction for
+these two model classes regardless of what the YAML says (with a logged
+warning if it disagrees), while still seeding `offline_replay_buffer`
+directly (bypassing `BatchProcessor`) so the one-time shape-inference call
+that needs it still has data to read.
+
+**Critic pretraining** (`rl_critic_pretrain_steps`): runs
+`update_critic()` — unmodified, same argmax mechanism — repeatedly on
+offline-only batches before the main training loop starts, to test XQCfD's
+"critic/actor coherence" warm-start idea in isolation from everything else.
+Logged under `pretrain/*` with `wandb.define_metric` giving it its own step
+axis (`pretrain_step`), so it doesn't collide with the main loop's step
+counter — an earlier version tried a negative-step convention on the shared
+axis instead, which silently dropped every logged point once wandb's
+background system-metrics logging (GPU utilization etc., independent of
+anything in this code) had already advanced the shared counter past 0.
+
+**KL regularization** (`rl_kl_coef`/`rl_kl_ref_std`) — see Current status.
+Computed in closed form in the pre-tanh Gaussian space (`dist.distribution`,
+the same attribute already used by `TanhTransformedDistribution.mode()`) —
+not the squashed action space, which has no clean closed-form KL between two
+Tanh-transformed distributions, the same underlying reason TFP can't compute
+`.entropy()` for one either.
+
+**Wandb negative-axis logging bug**: an earlier draft of the critic
+pretraining feature logged its metrics on a negative step range (`-N..-1`)
+sharing the main loop's default step axis, intending it to render as a
+warm-up phase preceding step 0. In practice, wandb's background system
+telemetry can advance its shared step counter past 0 before any of this
+code's own `wandb.log()` calls run, so every negative-step point got silently
+rejected ("steps must be monotonically increasing"). Fixed by giving
+`pretrain/*` (and later `actor_pretrain/*`) their own independent step axis
+via `wandb.define_metric(..., step_metric=...)`, decoupled from the main
+loop's default counter entirely.
+
+**`EXPOLearnerOld` toggle**: `expo_ft_old.py` was previously just a passive
+fallback file, not actually runnable. Wired it into `train_pi_robo.py`'s
+dispatch and `run_pipeline.py`'s model-config lookup as `model_cls:
+"EXPOLearnerOld"`, plus a thin `expo_ft_old_pi_config.py` (reuses
+`expo_ft_pi_config.py` as-is — `expo_ft_old.create()`'s `**kwargs` silently
+absorbs the categorical-critic-specific fields it doesn't need) and
+per-task YAMLs, so the original architecture is directly A/B-testable against
+the categorical rewrite rather than just preserved as a rollback reference.
 
 ## Changelog — key fixes made while adapting to ManiSkill (July 2026)
 
@@ -332,9 +609,11 @@ GitHub account — see Setup for the `--recurse-submodules` requirement.
 **Tooling added:** `eval_curve.py` (checkpoint sweeps, fixed episode seeds, SE
 error bars), `validate_demos_full_pipeline.py` (rigorous end-to-end demo
 replay validation), `capture_camera_comparison.py` (visual camera
-verification, supports `--seed`), `diagnose_reward_timing.py` (confirms the
-reward/action timing convention matches the original ExpoFT reference
-implementation — intentional, not a porting bug).
+verification, supports `--seed`), `diagnose_reward_timing.py` (originally
+written to document that the reward/action timing convention matched the
+original ExpoFT reference implementation; later revisited and found to be a
+real bug regardless — matching the reference doesn't establish correctness,
+just provenance — see the research-phase Changelog above for the actual fix).
 
 ## Published checkpoints
 

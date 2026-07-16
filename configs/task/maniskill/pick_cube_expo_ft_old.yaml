@@ -1,12 +1,12 @@
-# configs/task/maniskill/push_cube_expo_ft.yaml
+# configs/task/maniskill/pick_cube_expo_ft_old.yaml
 
 # NOTE: the Environment/Data/Run-Logging sections below are shared
 # (kept identical) across all *_sft.yaml / *_expo_ft.yaml / *_ppo.yaml /
 # *_grpo.yaml / *_sac.yaml files for this task. If you change an env or
 # data setting, update it in all five files to keep them in sync.
 # ── Environment ────────────────────────────────────────────────
-env_id: "PushCube-v1"
-language_instruction: "push the cube to the goal region"
+env_id: "PickCube-v1"
+language_instruction: "pick up the red cube and bring it to the green point"
 control_hz: 10
 max_episode_steps: 120
 env_type: "sim"  # "sim" for simulation, "droid" for real robot
@@ -39,8 +39,8 @@ robot_uids: "panda_wristcam"
 # (--stage demos, a one-time upfront step). Different from num_data_sft/
 # num_data_rl below, which control how many of these to LOAD for SFT/RL.
 num_demos_generate: 550
-lerobot_repo_id: "expo_ft/push_cube"
-droid_format_dir: "demos/PushCube-v1/droid_format"
+lerobot_repo_id: "expo_ft/pick_cube"
+droid_format_dir: "demos/PickCube-v1/droid_format"
 # Skip RepackTransform in replay buffer — our observations already have the
 # correct keys for DroidInputs (observation/cartesian_position, etc.)
 skip_repack_transforms: true
@@ -48,15 +48,15 @@ skip_repack_transforms: true
 
 # ── Run / Logging ──────────────────────────────────────────────
 project_name: "expo-ft"
-run_name: "push_cube_expo_ft"
-output_dir: "logs/push_cube"  # a timestamped subdir is created automatically per run
+run_name: "pick_cube_expo_ft"
+output_dir: "logs/pick_cube"  # a timestamped subdir is created automatically per run
 
 
 
 # sft_use_lora is needed here (not the rest of SFT warmup config) purely to
 # resolve which openpi SFT TrainConfig matches the checkpoint being loaded —
 # see get_sft_config_name(). Full SFT training hyperparameters live in
-# push_cube_sft.yaml instead.
+# pick_cube_sft.yaml instead.
 sft_use_lora: true         # use LoRA fine-tuning (faster, less memory than full fine-tune)
 
 # ── RL Algorithm ──────────────────────────────────────────────────
@@ -69,13 +69,13 @@ offline_ratio: 0.5         # fraction of batch from offline demo buffer (0 = dem
 update_type: "episode"     # when to trigger updates: "episode", "step", or "batch"
 num_updates: 1             # number of gradient updates per trigger
 num_batch: 1               # number of episodes to accumulate before updating (only used when update_type="batch")
-replan_steps: 4            # number of actions to execute from each action chunk before replanning (action_horizon=16)
+replan_steps: 8            # number of actions to execute from each action chunk before replanning (action_horizon=16)
 fsdp_devices: 1            # number of GPUs for FSDP sharding (1 = single GPU, no sharding)
 
 num_data_rl: 50
 rl_resume_dir: null
 
-model_cls: "EXPOLearner"  # selects both configs/model/*.py (via run_pipeline.py) and the FLAGS.config path used by train_pi_robo.py
+model_cls: "EXPOLearnerOld"  # selects both configs/model/*.py (via run_pipeline.py) and the FLAGS.config path used by train_pi_robo.py
 
 # ── RL Checkpointing ──────────────────────────────────────────────
 checkpoint_model: true
@@ -111,33 +111,3 @@ rl_freeze_critic_encoder: false # if true, ResNet-34 image encoder frozen for th
 rl_critic_pretrain_steps: 0     # if >0, pretrain the critic for N steps on offline demos before
                                   # RL begins (critic-only, residual actor/base VLA/temperature
                                   # untouched) — XQCfD-style critic/actor coherence warmup. 0 = disabled.
-
-# ── Categorical critic (XQC/XQCfD-style, bounded support) ─────────────
-# v_min/v_max apply to NORMALIZED reward units (rewards are divided by a
-# running RMS estimate before the Bellman projection — see
-# rl_reward_scale_decay), so they should be domain-agnostic and not need
-# per-task hand-tuning. Still watch target_q_max/target_q_min (the
-# normalized ones, not the _denorm logging variants): if Q sits pinned
-# at exactly v_min or v_max for a meaningful fraction of training even
-# in normalized units, the support itself is too narrow.
-rl_num_atoms: 101               # number of fixed support bins for the categorical critic
-rl_v_min: -10.0                 # lower bound of the critic's fixed support (normalized reward units)
-rl_v_max: 20.0                  # upper bound of the critic's fixed support (normalized reward units)
-rl_reward_scale_decay: 0.99     # EMA decay for the running reward-RMS estimate; higher = slower-adapting, more stable
-
-# ── KL regularization for the edit policy (XQCfD-style) ────────────────
-# Replaces the generic entropy bonus with a penalty for the edit
-# distribution deviating from a fixed N(0, rl_kl_ref_std) reference in
-# pre-tanh space -- "prefer staying close to zero residual unless Q
-# strongly justifies deviating". 0.0 = disabled (exact no-op).
-rl_kl_coef: 0.0                 # weight of the KL penalty; 0.0 = disabled, matches pre-existing entropy-only behavior
-rl_kl_ref_std: 1.0              # std of the fixed reference distribution in pre-tanh space
-
-# IMPORTANT: kl_coef is ADDITIVE alongside the existing entropy bonus in
-# our implementation, NOT a replacement like in the XQCfD paper (there,
-# the same "temperature" coefficient serves both roles interchangeably --
-# see Equation 1). If you want a faithful, isolated test of XQCfD's KL
-# regularization (KL only, no entropy term confounding it), set
-# rl_entropy_scale to 0.0 below. Leaving it at the default (1.0) means
-# you are testing KL + entropy together, not KL alone.
-rl_entropy_scale: 1.0           # weight of the (separate, additive) entropy bonus term -- set to 0.0 for a KL-only test matching the paper's setup

@@ -76,7 +76,7 @@ def main(_):
     # float(x) is a no-op if x is already a float, and fixes it if x is a
     # not-quite-valid-YAML-float string — belt and suspenders alongside fixing
     # the YAML values themselves.
-    if model_cls == "EXPOLearner":
+    if model_cls in ("EXPOLearner", "EXPOLearnerOld"):
         # --- unchanged from before this refactor: byte-for-byte identical ---
         FLAGS.config.actor_lr         = float(getattr(cfg, "rl_lr", FLAGS.config.actor_lr))
         FLAGS.config.critic_lr        = float(getattr(cfg, "rl_lr", FLAGS.config.critic_lr))
@@ -252,6 +252,15 @@ def main(_):
         from expo_ft.agents.alg.bc import load_agent, restore_checkpoint, save_checkpoint
     elif model_cls == "EXPOLearner":
         from expo_ft.agents.alg.expo_ft import load_agent, restore_checkpoint, save_checkpoint
+    elif model_cls == "EXPOLearnerOld":
+        # The original, reference-faithful architecture (MSE scalar critic,
+        # REDQ-style ensemble) preserved unmodified in expo_ft_old.py — for
+        # direct A/B comparison against the categorical (XQC/XQCfD-style)
+        # rewrite now used by "EXPOLearner". Shares the exact same config
+        # overrides above (expo_ft_old.create()'s signature ends in **kwargs,
+        # so the categorical-specific fields set there — num_atoms, v_min,
+        # kl_coef, etc. — are silently absorbed and ignored, not an error).
+        from expo_ft.agents.alg.expo_ft_old import load_agent, restore_checkpoint, save_checkpoint
     elif model_cls == "PPOLearner":
         from expo_ft.agents.alg.ppo import load_agent, restore_checkpoint, save_checkpoint
     elif model_cls == "GRPOLearner":
@@ -375,7 +384,7 @@ def main(_):
     # policy's own actions before the online loop starts pulling the residual
     # policy toward whatever a still-randomly-initialized critic prefers.
     critic_pretrain_steps = int(getattr(FLAGS.config, "critic_pretrain_steps", 0) or 0)
-    if not resuming and model_cls == "EXPOLearner" and critic_pretrain_steps > 0:
+    if not resuming and model_cls in ("EXPOLearner", "EXPOLearnerOld") and critic_pretrain_steps > 0:
         # Demos live in offline_replay_buffer when offline_ratio > 0 (the
         # normal ExpoFT setup); BatchProcessor's constructor instead seeds
         # them into the online replay_buffer when offline_ratio == 0 — follow
