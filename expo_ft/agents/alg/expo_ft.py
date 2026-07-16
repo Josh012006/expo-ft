@@ -236,6 +236,8 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
     v_max: float = struct.field(pytree_node=False)
     atoms: jnp.ndarray  # fixed support values, e.g. linspace(v_min, v_max, num_atoms) — a pytree leaf (JAX arrays can't be static/hashable fields), but never trained, never changes after create()
     reward_scale_decay: float = struct.field(pytree_node=False)
+    kl_coef: float = struct.field(pytree_node=False)  # XQCfD-style KL-to-reference regularization for the edit policy; 0.0 = disabled (default), matches pre-existing entropy-only behavior
+    kl_ref_std: float = struct.field(pytree_node=False)  # std of the fixed N(0, kl_ref_std) reference in pre-tanh space
     reward_ms: jnp.ndarray  # running mean-square of rewards (EMA), used to normalize rewards before the Bellman projection so the FIXED [v_min, v_max] support stays meaningful regardless of a task's absolute reward scale — see update_critic()
     action_dim: int = struct.field(pytree_node=False)
     state_dim: int = struct.field(pytree_node=False)
@@ -295,6 +297,14 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         v_min: float = -10.0,
         v_max: float = 20.0,
         reward_scale_decay: float = 0.99,
+        # XQCfD-style KL regularization for the edit/residual policy,
+        # replacing (when enabled) the generic entropy bonus with a penalty
+        # for deviating from a fixed N(0, kl_ref_std) reference in pre-tanh
+        # space — "prefer staying close to zero residual unless Q strongly
+        # justifies deviating". 0.0 = disabled (exact no-op), matching
+        # pre-existing behavior.
+        kl_coef: float = 0.0,
+        kl_ref_std: float = 1.0,
         critic_hidden_dims: Sequence[int] = (512, 512, 512, 512),
         critic_weight_decay: Optional[float] = None,
         critic_grad_clip_norm: Optional[float] = None,
@@ -535,6 +545,8 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             v_max=v_max,
             atoms=atoms,
             reward_scale_decay=reward_scale_decay,
+            kl_coef=kl_coef,
+            kl_ref_std=kl_ref_std,
             reward_ms=reward_ms,
             fixed_temperature=fixed_temperature,
             critic_grad_clip_norm=critic_grad_clip_norm,
@@ -813,6 +825,29 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             # categorical critic architecture has no dropout layer (XQC's
             # own recipe doesn't include one).
             q = q_from_logits(logits, self.atoms)
+            # KL regularization (XQCfD-style: replaces/augments the generic
+            # entropy bonus with a penalty for the edit distribution
+            # deviating from a fixed reference — "prefer staying close to
+            # zero residual unless Q strongly justifies deviating", a
+            # learned/adaptive analogue of the hard edit_scale cap).
+            # Computed in the PRE-TANH (Gaussian) space, not the squashed
+            # action space — KL between two tanh-squashed distributions has
+            # no clean closed form (the same reason TFP can't compute
+            # entropy() for a TanhTransformedDistribution either, which is
+            # what forced the try/except fallback in ppo.py/grpo.py). Two
+            # Gaussians DO have a closed-form KL, so we use dist.distribution
+            # (the underlying pre-squash MultivariateNormalDiag) directly.
+            # kl_coef=0.0 (the default) makes this an exact no-op — same
+            # behavior as before this was added.
+            base_dist = dist.distribution
+            residual_mean = base_dist.mean()
+            residual_std = base_dist.stddev()
+            kl_per_dim = (
+                jnp.log(self.kl_ref_std / residual_std)
+                + (residual_std ** 2 + residual_mean ** 2) / (2 * self.kl_ref_std ** 2)
+                - 0.5
+            )
+            kl_penalty = kl_per_dim.sum(axis=-1)
             # Use a manually fixed temperature when configured (bypasses the learned
             # temperature entirely) — a quick diagnostic Jesse suggested to see if the
             # runaway/unconverged alpha behavior is itself contributing to instability,
@@ -822,13 +857,14 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
                 else self.temp.apply_fn({"params": self.temp.params})
             )
             residual_actor_loss = (
-                self.entropy_scale * log_probs * temperature - q
+                self.entropy_scale * log_probs * temperature - q + self.kl_coef * kl_penalty
             ).mean()
             return residual_actor_loss, {
                 "residual_q": q.mean(),
                 "residual_actor_loss": residual_actor_loss,
                 "entropy": -log_probs.mean(),
                 "temperature": jnp.asarray(temperature),
+                "kl_penalty": kl_penalty.mean(),
             }
 
         grads, actor_info = jax.grad(residual_actor_loss_fn, has_aux=True)(self.residual_actor.params)

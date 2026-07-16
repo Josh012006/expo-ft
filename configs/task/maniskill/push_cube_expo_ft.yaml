@@ -124,3 +124,11 @@ rl_num_atoms: 101               # number of fixed support bins for the categoric
 rl_v_min: -10.0                 # lower bound of the critic's fixed support (normalized reward units)
 rl_v_max: 20.0                  # upper bound of the critic's fixed support (normalized reward units)
 rl_reward_scale_decay: 0.99     # EMA decay for the running reward-RMS estimate; higher = slower-adapting, more stable
+
+# ── KL regularization for the edit policy (XQCfD-style) ────────────────
+# Replaces the generic entropy bonus with a penalty for the edit
+# distribution deviating from a fixed N(0, rl_kl_ref_std) reference in
+# pre-tanh space -- "prefer staying close to zero residual unless Q
+# strongly justifies deviating". 0.0 = disabled (exact no-op).
+rl_kl_coef: 0.1                 # weight of the KL penalty; 0.0 = disabled, matches pre-existing entropy-only behavior
+rl_kl_ref_std: 1.0              # std of the fixed reference distribution in pre-tanh space

@@ -102,6 +102,8 @@ def main(_):
         FLAGS.config.v_min = float(getattr(cfg, "rl_v_min", FLAGS.config.v_min))
         FLAGS.config.v_max = float(getattr(cfg, "rl_v_max", FLAGS.config.v_max))
         FLAGS.config.reward_scale_decay = float(getattr(cfg, "rl_reward_scale_decay", FLAGS.config.reward_scale_decay))
+        FLAGS.config.kl_coef = float(getattr(cfg, "rl_kl_coef", FLAGS.config.kl_coef))
+        FLAGS.config.kl_ref_std = float(getattr(cfg, "rl_kl_ref_std", FLAGS.config.kl_ref_std))
     elif model_cls == "PPOLearner":
         FLAGS.config.actor_lr  = float(getattr(cfg, "ppo_lr", FLAGS.config.actor_lr))
         FLAGS.config.critic_lr = float(getattr(cfg, "ppo_lr", FLAGS.config.critic_lr))

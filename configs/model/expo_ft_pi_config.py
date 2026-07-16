@@ -29,6 +29,13 @@ def get_config():
     config.v_min = -10.0
     config.v_max = 20.0
     config.reward_scale_decay = 0.99  # EMA decay for the running reward-RMS estimate; higher = slower-adapting, more stable
+
+    # XQCfD-style KL regularization for the edit/residual policy (replaces
+    # the generic entropy bonus with a penalty for deviating from a fixed
+    # N(0, kl_ref_std) reference in pre-tanh space, when enabled).
+    # 0.0 = disabled (default, matches pre-existing entropy-only behavior).
+    config.kl_coef = 0.0
+    config.kl_ref_std = 1.0
     config.critic_hidden_dims = (512, 512, 512, 512)
 
     config.N = 8
