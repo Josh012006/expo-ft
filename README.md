@@ -623,6 +623,7 @@ PyTorch conversion is provided) are published on HuggingFace:
 - [`josh11234/ExpoFT-Pi05-StackCube-v1-SFT`](https://huggingface.co/josh11234/ExpoFT-Pi05-StackCube-v1-SFT) (41% success on 200 held-out seeds)
 - [`josh11234/ExpoFT-Pi05-PushCube-v1-SFT-62p`](https://huggingface.co/josh11234/ExpoFT-Pi05-PushCube-v1-SFT-62p) (62% success on 200 held-out seeds)
 - [`josh11234/ExpoFT-Pi05-PushCube-v1-SFT-86p`](https://huggingface.co/josh11234/ExpoFT-Pi05-PushCube-v1-SFT-86p) (86% success on 200 held-out seeds)
+- [`josh11234/ExpoFT-Pi05-PickCube-v1-SFT`](https://huggingface.co/josh11234/ExpoFT-Pi05-PickCube-v1-SFT) (22% success on 200 held-out seeds)
 
 No RL checkpoints are published — RL has not yet produced a policy that
 improves on these SFT baselines (see Current status above).
