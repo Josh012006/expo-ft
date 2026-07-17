@@ -65,7 +65,16 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
     from expo_ft.agents.vla.pi05 import build_pi05
     from expo_ft.data.replay_buffer import create_replay_buffer
     from expo_ft.env.droid_utils import make_dummy_transition
-    from expo_ft.agents.alg.expo_ft import load_agent
+    # Dispatch on cfg.model_cls rather than hardcoding the categorical
+    # architecture's load_agent — evaluating an EXPOLearnerOld-trained
+    # checkpoint with the wrong architecture's load_agent/restore_checkpoint
+    # would construct an incompatible critic structure (categorical logits +
+    # batch_stats vs. the old scalar/ensemble critic) before ever touching
+    # the checkpoint on disk.
+    if getattr(cfg, "model_cls", "EXPOLearner") == "EXPOLearnerOld":
+        from expo_ft.agents.alg.expo_ft_old import load_agent
+    else:
+        from expo_ft.agents.alg.expo_ft import load_agent
 
     # CRITIQUE : ManiSkill DOIT clupper et rescale les deltas en [-0.1, 0.1]
     cfg.normalize_action = True
@@ -188,7 +197,10 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
     only_base_actions = True
     if rl_checkpoint_path is not None:
         import orbax.checkpoint as ocp
-        from expo_ft.agents.alg.expo_ft import restore_checkpoint
+        if getattr(cfg, "model_cls", "EXPOLearner") == "EXPOLearnerOld":
+            from expo_ft.agents.alg.expo_ft_old import restore_checkpoint
+        else:
+            from expo_ft.agents.alg.expo_ft import restore_checkpoint
 
         rl_ckpt_path = Path(rl_checkpoint_path).resolve()
         rl_step = int(rl_ckpt_path.name)
