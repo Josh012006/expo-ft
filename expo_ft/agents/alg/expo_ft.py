@@ -865,6 +865,14 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
                 "entropy": -log_probs.mean(),
                 "temperature": jnp.asarray(temperature),
                 "kl_penalty": kl_penalty.mean(),
+                # Pre-tanh Gaussian stats (already computed above for the KL
+                # formula itself) — logged so kl_ref_std can be calibrated
+                # against the actual equilibrium std under entropy alone,
+                # rather than guessed. mean_residual_scaled_norm (elsewhere)
+                # is POST-tanh and POST-edit_scale, so it saturates and
+                # doesn't directly show this.
+                "residual_mean_norm": jnp.linalg.norm(residual_mean, axis=-1).mean(),
+                "residual_std_mean": residual_std.mean(),
             }
 
         grads, actor_info = jax.grad(residual_actor_loss_fn, has_aux=True)(self.residual_actor.params)
