@@ -108,7 +108,7 @@ rl_critic_weight_decay: null    # if set (e.g. 1.0e-4), L2 weight decay on criti
 rl_critic_grad_clip_norm: null  # if set (e.g. 1.0), clips critic + encoder grads to this global norm
 rl_freeze_critic_encoder: false # if true, ResNet-34 image encoder frozen for the critic (Q uses embeddings only)
 
-rl_critic_pretrain_steps: 1000     # if >0, pretrain the critic for N steps on offline demos before
+rl_critic_pretrain_steps: 3000     # if >0, pretrain the critic for N steps on offline demos before
                                   # RL begins (critic-only, residual actor/base VLA/temperature
                                   # untouched) — XQCfD-style critic/actor coherence warmup. 0 = disabled.
 
@@ -131,7 +131,7 @@ rl_reward_scale_decay: 0.99     # EMA decay for the running reward-RMS estimate;
 # pre-tanh space -- "prefer staying close to zero residual unless Q
 # strongly justifies deviating". 0.0 = disabled (exact no-op).
 rl_kl_coef: 0.1                 # weight of the KL penalty; 0.0 = disabled, matches pre-existing entropy-only behavior
-rl_kl_ref_std: 0.3              # std of the fixed reference distribution in pre-tanh space
+rl_kl_ref_std: 1.0              # std of the fixed reference distribution in pre-tanh space
 
 # IMPORTANT: kl_coef is ADDITIVE alongside the existing entropy bonus in
 # our implementation, NOT a replacement like in the XQCfD paper (there,
