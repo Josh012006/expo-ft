@@ -105,6 +105,8 @@ def main(_):
         FLAGS.config.kl_coef = float(getattr(cfg, "rl_kl_coef", FLAGS.config.kl_coef))
         FLAGS.config.entropy_scale = float(getattr(cfg, "rl_entropy_scale", FLAGS.config.entropy_scale))
         FLAGS.config.kl_ref_std = float(getattr(cfg, "rl_kl_ref_std", FLAGS.config.kl_ref_std))
+        FLAGS.config.use_hetstat_policy = bool(getattr(cfg, "rl_use_hetstat_policy", FLAGS.config.use_hetstat_policy))
+        FLAGS.config.hetstat_num_rff_features = int(getattr(cfg, "rl_hetstat_num_rff_features", FLAGS.config.hetstat_num_rff_features))
     elif model_cls == "PPOLearner":
         FLAGS.config.actor_lr  = float(getattr(cfg, "ppo_lr", FLAGS.config.actor_lr))
         FLAGS.config.critic_lr = float(getattr(cfg, "ppo_lr", FLAGS.config.critic_lr))

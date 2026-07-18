@@ -36,6 +36,12 @@ def get_config():
     # 0.0 = disabled (default, matches pre-existing entropy-only behavior).
     config.kl_coef = 0.0
     config.kl_ref_std = 1.0
+
+    # HetStat (heteroscedastic + stationary) residual-policy architecture,
+    # per XQCfD Section 3.1 -- see expo_ft/distributions/hetstat.py.
+    # False = disabled (default, matches pre-existing TanhNormal behavior).
+    config.use_hetstat_policy = False
+    config.hetstat_num_rff_features = 256
     config.critic_hidden_dims = (512, 512, 512, 512)
 
     config.N = 8

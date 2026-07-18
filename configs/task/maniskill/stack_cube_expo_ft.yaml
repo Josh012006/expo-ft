@@ -130,7 +130,7 @@ rl_reward_scale_decay: 0.99     # EMA decay for the running reward-RMS estimate;
 # distribution deviating from a fixed N(0, rl_kl_ref_std) reference in
 # pre-tanh space -- "prefer staying close to zero residual unless Q
 # strongly justifies deviating". 0.0 = disabled (exact no-op).
-rl_kl_coef: 0.0                 # weight of the KL penalty; 0.0 = disabled, matches pre-existing entropy-only behavior
+rl_kl_coef: 0.1                 # weight of the KL penalty; 0.0 = disabled, matches pre-existing entropy-only behavior
 rl_kl_ref_std: 1.0              # std of the fixed reference distribution in pre-tanh space
 
 # IMPORTANT: kl_coef is ADDITIVE alongside the existing entropy bonus in
@@ -140,4 +140,12 @@ rl_kl_ref_std: 1.0              # std of the fixed reference distribution in pre
 # regularization (KL only, no entropy term confounding it), set
 # rl_entropy_scale to 0.0 below. Leaving it at the default (1.0) means
 # you are testing KL + entropy together, not KL alone.
-rl_entropy_scale: 1.0           # weight of the (separate, additive) entropy bonus term -- set to 0.0 for a KL-only test matching the paper's setup
+rl_entropy_scale: 0.0           # weight of the (separate, additive) entropy bonus term -- set to 0.0 for a KL-only test matching the paper's setup
+
+# ── HetStat policy architecture (XQCfD-style, last missing piece) ──────
+# Heteroscedastic + stationary residual policy -- reverts to a wide,
+# near-uniform distribution when out of the demos' distribution, so
+# rl_kl_coef's regularization doesn't fight the network's own OOD
+# behavior. See expo_ft/distributions/hetstat.py for the mechanism.
+rl_use_hetstat_policy: false    # false = disabled (default), matches pre-existing TanhNormal architecture exactly
+rl_hetstat_num_rff_features: 256  # dimensionality K of the fixed stationary feature space

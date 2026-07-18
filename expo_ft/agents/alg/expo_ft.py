@@ -34,7 +34,7 @@ from expo_ft.agents.alg.checkpoint_utils import make_checkpoint_fns
 from expo_ft.agents.alg.batch_utils import prepare_critic_batch, prepare_actor_sampling_batch, extract_critic_fields
 from expo_ft.networks.temperature import Temperature
 from expo_ft.data.dataset import DatasetDict
-from expo_ft.distributions import TanhNormal
+from expo_ft.distributions import TanhNormal, HetStatTanhNormal
 from expo_ft.networks import (
     MLP,
     PixelMultiplexer,
@@ -305,6 +305,16 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         # pre-existing behavior.
         kl_coef: float = 0.0,
         kl_ref_std: float = 1.0,
+        # HetStat (heteroscedastic + stationary) residual-policy architecture,
+        # per XQCfD Section 3.1 -- see expo_ft/distributions/hetstat.py for
+        # the full mechanism. Replaces TanhNormal's usual MLP-head-directly
+        # architecture with one that reverts to a wide, near-uniform
+        # distribution when out of the demos' distribution, so kl_coef's
+        # regularization doesn't fight the network's own OOD behavior.
+        # False = disabled (default; matches pre-existing TanhNormal
+        # behavior exactly, no change unless explicitly turned on).
+        use_hetstat_policy: bool = False,
+        hetstat_num_rff_features: int = 256,
         critic_hidden_dims: Sequence[int] = (512, 512, 512, 512),
         critic_weight_decay: Optional[float] = None,
         critic_grad_clip_norm: Optional[float] = None,
@@ -415,7 +425,11 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         residual_actor_base_cls = partial(
             MLP, hidden_dims=hidden_dims, dropout_rate=actor_drop, activate_final=True, use_pnorm=use_pnorm
         )
-        residual_actor_cls= TanhNormal(residual_actor_base_cls, full_action_dim)
+        residual_actor_cls = (
+            HetStatTanhNormal(residual_actor_base_cls, full_action_dim, num_rff_features=hetstat_num_rff_features)
+            if use_hetstat_policy
+            else TanhNormal(residual_actor_base_cls, full_action_dim)
+        )
         residual_actor_def = PixelEditMultiplexer(
             network_cls=residual_actor_cls,
             latent_dim=latent_dim_state,

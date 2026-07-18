@@ -141,3 +141,11 @@ rl_kl_ref_std: 1.0              # std of the fixed reference distribution in pre
 # rl_entropy_scale to 0.0 below. Leaving it at the default (1.0) means
 # you are testing KL + entropy together, not KL alone.
 rl_entropy_scale: 0.0           # weight of the (separate, additive) entropy bonus term -- set to 0.0 for a KL-only test matching the paper's setup
+
+# ── HetStat policy architecture (XQCfD-style, last missing piece) ──────
+# Heteroscedastic + stationary residual policy -- reverts to a wide,
+# near-uniform distribution when out of the demos' distribution, so
+# rl_kl_coef's regularization doesn't fight the network's own OOD
+# behavior. See expo_ft/distributions/hetstat.py for the mechanism.
+rl_use_hetstat_policy: true    # false = disabled (default), matches pre-existing TanhNormal architecture exactly
+rl_hetstat_num_rff_features: 256  # dimensionality K of the fixed stationary feature space
