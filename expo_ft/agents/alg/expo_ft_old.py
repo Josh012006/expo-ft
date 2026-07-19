@@ -176,6 +176,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
     N: int = struct.field(pytree_node=False)
     n_edit_samples: int = struct.field(pytree_node=False)
     edit_scale: float = struct.field(pytree_node=False)
+    use_double_q_selection: bool = struct.field(pytree_node=False)
     residual_action_xyzg: bool = struct.field(pytree_node=False)
     batch_split: int = struct.field(pytree_node=False)
     encode_batch_split: int = struct.field(pytree_node=False)
@@ -245,6 +246,22 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         encode_batch_split: int = 1,
         n_edit_samples: int = 0,
         edit_scale: float = 1.0,
+        # False = disabled (default; matches pre-existing behavior exactly:
+        # sample_batch_actions' argmax-candidate-selection draws its
+        # subsample from target_critic's ensemble, the SAME ensemble
+        # update_critic then bootstraps from downstream -- a single
+        # estimator both picking its own favorite candidate and having
+        # that pick trusted as the Bellman target, the classic
+        # maximization-bias setup Double Q-learning exists to fix). True =
+        # decouple: selection draws its subsample from self.critic's
+        # ensemble (online), evaluation still draws its own fresh subsample
+        # from self.target_critic downstream in update_critic (unchanged
+        # either way). No new network needed -- reuses the existing
+        # online/target ensembles. Mirrors the same mechanism added to the
+        # categorical-critic EXPOLearner in expo_ft.py, adapted here for
+        # REDQ's ensemble-subsampling (subsample_image_ensemble) instead of
+        # a single critic head.
+        use_double_q_selection: bool = False,
         residual_action_xyzg: bool = False,
         actor_tau: float = 0.001,
         include_state: bool = True,
@@ -452,6 +469,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             n_edit_samples=n_edit_samples,
             encode_batch_split=encode_batch_split,
             edit_scale=edit_scale,
+            use_double_q_selection=use_double_q_selection,
             residual_action_xyzg=residual_action_xyzg,
             batch_split=batch_split,
             actor_tau=actor_tau,
@@ -677,15 +695,34 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         # Select best actions via Q-values
         if self.N > 1:
             key, rng = jax.random.split(rng)
-            target_params = subsample_image_ensemble(
-                key, self.target_critic.params, self.num_min_qs, self.num_qs
+
+            # Double-Q-style decoupled selection/evaluation, togglable via
+            # use_double_q_selection. Legacy behavior (False, default): this
+            # argmax draws its subsample from self.target_critic's ensemble
+            # -- the SAME ensemble update_critic then bootstraps from
+            # downstream (next_qs = self.target_critic.apply_fn(...) on
+            # this exact next_actions, itself another fresh subsample) -- a
+            # single estimator both picking its own favorite candidate and
+            # having that pick trusted as the Bellman target is exactly the
+            # classic maximization-bias setup Double Q-learning exists to
+            # fix. When True: selecting here from a subsample of
+            # self.critic's ensemble (online) while update_critic's
+            # evaluation still draws its own fresh subsample from
+            # self.target_critic (unchanged, downstream) decorrelates the
+            # two steps between two independently-varying estimators. No
+            # new network needed either way -- reuses the existing
+            # online/target ensembles, matching subsample size (num_min_qs
+            # out of num_qs) for direct comparability.
+            selection_critic = self.critic if self.use_double_q_selection else self.target_critic
+            selection_params = subsample_image_ensemble(
+                key, selection_critic.params, self.num_min_qs, self.num_qs
             )
 
             obs_flat = jax.device_put(jnp.repeat(encoded_obs, total_candidates, axis=0), self.data_sharding)
             states_flat = jax.device_put(jnp.repeat(states, total_candidates, axis=0), self.data_sharding)
             actions_flat = jax.device_put(actions.reshape(-1, actions.shape[-1]), self.data_sharding)
 
-            qs = self._compute_q_split(self.target_critic.apply_fn, target_params, obs_flat, actions_flat, states_flat)
+            qs = self._compute_q_split(selection_critic.apply_fn, selection_params, obs_flat, actions_flat, states_flat)
             qs = qs.reshape(batch_size, total_candidates)
 
             best_indices = jnp.argmax(qs, axis=1)
@@ -697,16 +734,40 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             with_residual_mask = (best_indices >= self.N) & (best_indices < total_candidates)
             vf_select_ratio_without_residual = jnp.mean(without_residual_mask.astype(jnp.float32))
             vf_select_ratio_with_residual = jnp.mean(with_residual_mask.astype(jnp.float32))
+
+            # Diagnostic: quantify the online/target disagreement on
+            # whichever action actually got selected -- meaningful and
+            # logged the same way regardless of the toggle above. qs
+            # already holds the SELECTING ensemble's opinion; we only need
+            # one more (freshly subsampled) Q pass, from the OTHER
+            # ensemble, on the same picks. A consistently positive
+            # (online - target) gap is direct evidence of the
+            # overestimation bias use_double_q_selection is meant to
+            # address.
+            key, rng = jax.random.split(rng)
+            if self.use_double_q_selection:
+                online_q_at_argmax = qs[batch_indices, best_indices]
+                other_params = subsample_image_ensemble(key, self.target_critic.params, self.num_min_qs, self.num_qs)
+                other_qs_flat = self._compute_q_split(self.target_critic.apply_fn, other_params, obs_flat, actions_flat, states_flat)
+                target_q_at_argmax = other_qs_flat.reshape(batch_size, total_candidates)[batch_indices, best_indices]
+            else:
+                target_q_at_argmax = qs[batch_indices, best_indices]
+                other_params = subsample_image_ensemble(key, self.critic.params, self.num_min_qs, self.num_qs)
+                other_qs_flat = self._compute_q_split(self.critic.apply_fn, other_params, obs_flat, actions_flat, states_flat)
+                online_q_at_argmax = other_qs_flat.reshape(batch_size, total_candidates)[batch_indices, best_indices]
+            overestimation_gap = jnp.mean(online_q_at_argmax - target_q_at_argmax)
         else:
             best_actions = actions[:, 0]
             vf_select_ratio_without_residual = 1
             vf_select_ratio_with_residual = 0
+            overestimation_gap = jnp.array(0.0, dtype=jnp.float32)
 
         sample_info_extra = {
             "select_ratio_without_residual": vf_select_ratio_without_residual,
             "select_ratio_with_residual": vf_select_ratio_with_residual,
             "mean_d_actions_norm": mean_d_actions_norm,
             "mean_residual_scaled_norm": mean_residual_scaled_norm,
+            "double_q_overestimation_gap": overestimation_gap,
         }
 
         rng, _ = jax.random.split(rng, 2)
