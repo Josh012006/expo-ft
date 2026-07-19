@@ -4,6 +4,7 @@ from typing import Optional, Type
 import tensorflow_probability.substrates.jax as tfp
 
 from expo_ft.distributions.tanh_transformed import TanhTransformedDistribution
+from expo_ft.distributions.bounded_log_std import smooth_log_std_bound
 tfd = tfp.distributions
 
 import flax.linen as nn
@@ -38,7 +39,7 @@ class Normal(nn.Module):
                 "OutpuLogStd", nn.initializers.zeros, (self.action_dim,), jnp.float32
             )
 
-        log_stds = jnp.clip(log_stds, self.log_std_min, self.log_std_max)
+        log_stds = smooth_log_std_bound(log_stds, self.log_std_min, self.log_std_max)
 
         m = jnp.asarray(self.pre_tanh_scale, dtype=means.dtype)
         distribution = tfd.MultivariateNormalDiag(

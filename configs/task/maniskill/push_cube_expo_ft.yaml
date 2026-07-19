@@ -103,11 +103,12 @@ rl_fixed_temperature: null      # if set (e.g. 0.1), bypasses the learned SAC
                                   # temperature entirely — a diagnostic Jesse suggested
                                   # to test whether the unconverged/climbing alpha itself
                                   # contributes to instability (see July 2026 notes)
-rl_edit_scale: 0.05              # max magnitude of residual action added by edit policy
+rl_edit_scale: 0.2              # max magnitude of residual action added by edit policy (derived from measured bc_demo_vs_base_action_gap ~0.73 with a 1.5x margin, full_action_dim=32: 1.5*0.73/sqrt(32) ~= 0.194 -> rounded to 0.2)
 rl_critic_weight_decay: null    # if set (e.g. 1.0e-4), L2 weight decay on critic + encoder params (adamw)
 rl_critic_grad_clip_norm: null  # if set (e.g. 1.0), clips critic + encoder grads to this global norm
 rl_freeze_critic_encoder: false # if true, ResNet-34 image encoder frozen for the critic (Q uses embeddings only)
 
+rl_actor_bc_pretrain_steps: 1000     # if >0, BC-warm-start the residual actor for N steps on offline demos before critic pretraining (XQCfD-style policy pretraining)
 rl_critic_pretrain_steps: 1000     # if >0, pretrain the critic for N steps on offline demos before
                                   # RL begins (critic-only, residual actor/base VLA/temperature
                                   # untouched) — XQCfD-style critic/actor coherence warmup. 0 = disabled.
@@ -149,3 +150,4 @@ rl_entropy_scale: 0.0           # weight of the (separate, additive) entropy bon
 # behavior. See expo_ft/distributions/hetstat.py for the mechanism.
 rl_use_hetstat_policy: true    # false = disabled (default), matches pre-existing TanhNormal architecture exactly
 rl_hetstat_num_rff_features: 256  # dimensionality K of the fixed stationary feature space
+rl_hetstat_var_lr_multiplier: 40   # effective LR multiplier for HetStat's variance-scale param (first-pass estimate; retune per observed training/hetstat_log_sigma_sq_shift_mean)

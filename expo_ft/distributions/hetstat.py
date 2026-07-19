@@ -83,6 +83,7 @@ import flax.linen as nn
 import tensorflow_probability.substrates.jax as tfp
 
 from expo_ft.distributions.tanh_transformed import TanhTransformedDistribution
+from expo_ft.distributions.bounded_log_std import smooth_log_std_bound
 from expo_ft.networks import default_init
 
 tfd = tfp.distributions
@@ -108,6 +109,7 @@ class HetStatNormal(nn.Module):
     pre_tanh_scale: float = 1.0
     num_rff_features: int = 256   # K -- dimensionality of the stationary feature space phi(s)
     rff_seed: int = 0             # fixes V, b forever -- see module docstring for why this needs no Flax param/variable
+    var_lr_multiplier: float = 40.0  # see reparameterization note below, near HetStatLogVarScaleRaw
 
     @nn.compact
     def __call__(self, inputs, *args, **kwargs) -> tfd.Distribution:
@@ -143,16 +145,38 @@ class HetStatNormal(nn.Module):
         # ~= c * 1 = c directly -- no division by num_rff_features needed.
         init_var_per_feature = jnp.maximum(jnp.exp(2.0 * self.log_std_max), 1e-6)
         init_log_sigma_sq = jnp.log(jnp.expm1(init_var_per_feature))  # softplus^-1, so softplus(init) recovers init_var_per_feature
-        log_sigma_sq = self.param(
-            "HetStatLogVarScale",
-            nn.initializers.constant(init_log_sigma_sq),
+
+        # Reparameterized: learn a zero-init, "normal-scale" raw parameter
+        # instead of log_sigma_sq directly. log_sigma_sq's own natural scale
+        # (~54.6 with the default log_std_max=2) is far larger than a
+        # typical network weight, so under the shared learning rate tuned
+        # for the rest of the network, it moves far too slowly to matter
+        # within any realistic training budget -- empirically, ~8e-6/step
+        # observed under a direct parameterization with lr=3e-4, i.e.
+        # millions of steps needed for a meaningful shift. Adam's per-step
+        # update on a parameter is roughly ~lr regardless of that
+        # parameter's own scale (it normalizes by the RMS of recent
+        # gradients, including the chain-rule factor introduced by
+        # var_lr_multiplier below, so the raw param's own step size stays
+        # ~lr rather than also being suppressed) -- so learning a
+        # zero-init "delta" and amplifying it by var_lr_multiplier before
+        # adding it back gives log_sigma_sq an effective learning rate
+        # var_lr_multiplier times higher, without touching the optimizer or
+        # any other parameter group. raw=0 at init reproduces the exact
+        # same init_log_sigma_sq as before -- no change to the paper's
+        # "start at max entropy" behavior (Eq. 3/Fig. 1), only to how fast
+        # it can move away from it.
+        raw_log_sigma_sq = self.param(
+            "HetStatLogVarScaleRaw",
+            nn.initializers.zeros,
             (self.action_dim, self.num_rff_features),
             jnp.float32,
         )
+        log_sigma_sq = init_log_sigma_sq + raw_log_sigma_sq * self.var_lr_multiplier
         sigma_sq = jax.nn.softplus(log_sigma_sq)  # (action_dim, K), each >= 0 -- this IS diag(Sigma), per output dim
         variance = jnp.einsum("ik,...k->...i", sigma_sq, phi_for_var ** 2)  # phi^T diag(Sigma) phi, per action dim
         log_stds = 0.5 * jnp.log(variance + 1e-8)
-        log_stds = jnp.clip(log_stds, self.log_std_min, self.log_std_max)
+        log_stds = smooth_log_std_bound(log_stds, self.log_std_min, self.log_std_max)
 
         m = jnp.asarray(self.pre_tanh_scale, dtype=means.dtype)
         distribution = tfd.MultivariateNormalDiag(loc=means * m, scale_diag=jnp.exp(log_stds) * m)

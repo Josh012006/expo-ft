@@ -31,7 +31,7 @@ import numpy as np
 
 from expo_ft.agents.alg.agent import AgentLearner, initialize_checkpoint_dir
 from expo_ft.agents.alg.checkpoint_utils import make_checkpoint_fns
-from expo_ft.agents.alg.batch_utils import prepare_critic_batch, prepare_actor_sampling_batch, extract_critic_fields
+from expo_ft.agents.alg.batch_utils import prepare_critic_batch, prepare_actor_sampling_batch, prepare_actor_sampling_batch_current, extract_critic_fields
 from expo_ft.networks.temperature import Temperature
 from expo_ft.data.dataset import DatasetDict
 from expo_ft.distributions import TanhNormal, HetStatTanhNormal
@@ -209,6 +209,29 @@ def _sample_actions(rng, apply_fn, params, observations: jnp.ndarray, states, ac
     return dist.sample(seed=key), rng
 
 
+def _find_param_by_name(params_tree, name):
+    """Recursively search a (possibly nested) Flax params dict for a leaf
+    keyed by `name` and return it, or None if not found.
+
+    Used to pull out HetStat's raw "HetStatLogVarScale" parameter directly
+    from the params pytree for diagnostics, without needing to know or
+    hardcode exactly how many modules deep PixelEditMultiplexer/HetStatNormal
+    happen to nest it (and without changing HetStatNormal's __call__ return
+    signature via sow/mutable=['intermediates'], which would ripple into
+    every call site of the residual actor). Returns None (rather than
+    raising) for architectures that don't have this param at all (plain
+    TanhNormal, EXPOLearnerOld) so callers can log the metric conditionally.
+    """
+    if isinstance(params_tree, dict):
+        if name in params_tree:
+            return params_tree[name]
+        for v in params_tree.values():
+            found = _find_param_by_name(v, name)
+            if found is not None:
+                return found
+    return None
+
+
 class EXPOLearner(AgentLearner, struct.PyTreeNode):
     rng: jax.random.PRNGKey
     data_augmentation_fn: Callable = struct.field(pytree_node=False)
@@ -223,6 +246,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
     N: int = struct.field(pytree_node=False)
     n_edit_samples: int = struct.field(pytree_node=False)
     edit_scale: float = struct.field(pytree_node=False)
+    hetstat_var_lr_multiplier: float = struct.field(pytree_node=False, default=40.0)
     residual_action_xyzg: bool = struct.field(pytree_node=False)
     batch_split: int = struct.field(pytree_node=False)
     encode_batch_split: int = struct.field(pytree_node=False)
@@ -315,6 +339,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         # behavior exactly, no change unless explicitly turned on).
         use_hetstat_policy: bool = False,
         hetstat_num_rff_features: int = 256,
+        hetstat_var_lr_multiplier: float = 40.0,
         critic_hidden_dims: Sequence[int] = (512, 512, 512, 512),
         critic_weight_decay: Optional[float] = None,
         critic_grad_clip_norm: Optional[float] = None,
@@ -426,7 +451,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             MLP, hidden_dims=hidden_dims, dropout_rate=actor_drop, activate_final=True, use_pnorm=use_pnorm
         )
         residual_actor_cls = (
-            HetStatTanhNormal(residual_actor_base_cls, full_action_dim, num_rff_features=hetstat_num_rff_features)
+            HetStatTanhNormal(residual_actor_base_cls, full_action_dim, num_rff_features=hetstat_num_rff_features, var_lr_multiplier=hetstat_var_lr_multiplier)
             if use_hetstat_policy
             else TanhNormal(residual_actor_base_cls, full_action_dim)
         )
@@ -543,6 +568,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             n_edit_samples=n_edit_samples,
             encode_batch_split=encode_batch_split,
             edit_scale=edit_scale,
+            hetstat_var_lr_multiplier=hetstat_var_lr_multiplier,
             residual_action_xyzg=residual_action_xyzg,
             batch_split=batch_split,
             actor_tau=actor_tau,
@@ -892,8 +918,156 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         grads, actor_info = jax.grad(residual_actor_loss_fn, has_aux=True)(self.residual_actor.params)
         residual_actor = self.residual_actor.apply_gradients(grads=grads)
 
+        # Diagnostic: HetStat's raw, PRE-bound variance-scale parameter,
+        # read directly from the params tree (not derived from the already
+        # tanh/smooth-bound-transformed residual_std_mean above). Lets us
+        # tell directly whether this parameter is actually moving under
+        # gradient pressure (e.g. from kl_coef pulling std toward
+        # kl_ref_std) or effectively stuck near its init value, instead of
+        # inferring it indirectly through the heavily compressed
+        # log -> smooth-bound -> exp chain that residual_std_mean goes
+        # through. None (and simply omitted) for architectures without this
+        # param (plain TanhNormal, EXPOLearnerOld).
+        # Diagnostic: HetStat's raw variance-scale parameter, read directly
+        # from the params tree (not derived from the already
+        # tanh/smooth-bound-transformed residual_std_mean above). Lets us
+        # tell directly whether this parameter is actually moving under
+        # gradient pressure (e.g. from kl_coef pulling std toward
+        # kl_ref_std) or effectively stuck near its init value, instead of
+        # inferring it indirectly through the heavily compressed
+        # log -> smooth-bound -> exp chain that residual_std_mean goes
+        # through. Post-reparameterization (see hetstat.py's
+        # HetStatLogVarScaleRaw), this is logged as the EFFECTIVE shift in
+        # log_sigma_sq units (raw * var_lr_multiplier) -- 0 = exactly at
+        # init, negative = moving the direction kl_coef pulls toward --
+        # directly comparable to the pre-reparameterization absolute-value
+        # tracking, just relative to init instead of absolute. None (and
+        # simply omitted) for architectures without this param (plain
+        # TanhNormal, EXPOLearnerOld).
+        hetstat_raw_var = _find_param_by_name(self.residual_actor.params, "HetStatLogVarScaleRaw")
+        if hetstat_raw_var is not None:
+            actor_info = dict(actor_info)
+            actor_info["hetstat_log_sigma_sq_shift_mean"] = hetstat_raw_var.mean() * self.hetstat_var_lr_multiplier
+
         return self.replace(residual_actor=residual_actor, rng=rng), actor_info
-    
+
+    def pretrain_actor_bc(self, batch: DatasetDict) -> Tuple["EXPOLearner", Dict[str, float]]:
+        """
+        BC warm-start for the residual actor (XQCfD-style "policy pretraining"),
+        run BEFORE critic pretraining so that the argmax-over-candidates
+        mechanism used by critic pretraining sees sensible "edited" candidates
+        instead of the residual actor's fresh (random / HetStat-max-entropy)
+        initialization. Mirrors the paper's own ordering: policy pretraining
+        to BC-level first, THEN critic pretraining for actor/critic coherence.
+
+        Target: base_VLA(s) + residual_actor(s) ~= demo_action. base_VLA is
+        frozen, so this only trains the residual actor. Uses the
+        deterministic dist.mode() (= tanh(dist.distribution.mode()), same
+        approximation SAC-style implementations use for a greedy action)
+        rather than the reparameterized sample used by the Q-maximizing actor
+        loss elsewhere -- standard for BC pretraining, and it sidesteps
+        needing to invert the tanh squashing (numerically unstable near
+        saturation when the required correction exceeds edit_scale).
+        """
+        key, rng = jax.random.split(self.rng)
+        noise_key, rng = jax.random.split(rng)
+        dropout_key, rng = jax.random.split(rng)
+
+        observations = batch_encode(
+            self.batch_encoder.apply_fn, self.batch_encoder.params,
+            batch["observations"], stop_gradient=True,
+        )
+        observations = jax.device_put(observations, self.data_sharding)
+        states = jax.device_put(batch["states"], self.data_sharding)
+        batch_size = batch["states"].shape[0]
+
+        # Base VLA action for the CURRENT state -- one deterministic candidate
+        # per row (num_samples=1), not the N-candidate set used for argmax
+        # elsewhere.
+        transformed_inputs = prepare_actor_sampling_batch_current(batch)
+        base_actions, _ = self.actor.sample_training_actions(
+            transformed_inputs=transformed_inputs,
+            train_state=self.actor_train_state,
+            rng=key,
+            train=False,
+            num_samples=1,
+        )
+        base_actions = base_actions[:, :self.replan_steps, :]
+        base_actions = base_actions.reshape(batch_size, self.full_action_dim)
+        base_actions = jax.lax.stop_gradient(base_actions)
+
+        # Diagnostic: resample the base VLA action a SECOND time, same
+        # states, independent rng key. pi_0.5 is a flow-matching model --
+        # sample_training_actions runs a stochastic integration, not a
+        # deterministic function of the state -- so two calls for the same
+        # state won't generally agree. This measures that intrinsic
+        # resampling noise directly, in the same L2-norm units as
+        # bc_demo_vs_base_action_gap, so it's directly comparable: it's a
+        # floor under bc_residual_vs_demo_gap that no amount of edit_scale,
+        # learning rate, or BC steps can push below, since the residual
+        # actor is implicitly chasing a target (demo - base) that jitters
+        # from one base_action draw to the next by roughly this much.
+        base_actions_2, _ = self.actor.sample_training_actions(
+            transformed_inputs=transformed_inputs,
+            train_state=self.actor_train_state,
+            rng=noise_key,
+            train=False,
+            num_samples=1,
+        )
+        base_actions_2 = base_actions_2[:, :self.replan_steps, :]
+        base_actions_2 = base_actions_2.reshape(batch_size, self.full_action_dim)
+        base_action_resample_noise = jnp.linalg.norm(base_actions - base_actions_2, axis=-1).mean()
+
+        demo_actions = batch["actions"]
+
+        def bc_loss_fn(actor_params):
+            dist = self.residual_actor.apply_fn(
+                {"params": actor_params}, observations, actions=base_actions,
+                training=True, p=states, rngs={"dropout": dropout_key},
+            )
+            residual_squashed = dist.mode()
+            residual_scaled = self._apply_residual_xyzg_mask(residual_squashed * self.edit_scale)
+            predicted_action = residual_scaled + base_actions
+
+            bc_loss = jnp.mean(jnp.sum((predicted_action - demo_actions) ** 2, axis=-1))
+            return bc_loss, {
+                "bc_loss": bc_loss,
+                "bc_residual_norm": jnp.linalg.norm(residual_scaled, axis=-1).mean(),
+                "bc_demo_vs_base_action_gap": jnp.linalg.norm(demo_actions - base_actions, axis=-1).mean(),
+                # Same L2-norm scale as bc_demo_vs_base_action_gap (unlike
+                # bc_loss, which is a sum-of-squares) -- lets you directly
+                # compare "gap before correction" vs "gap after correction"
+                # in the same units, rather than inferring it from a
+                # squared-scale loss.
+                "bc_residual_vs_demo_gap": jnp.linalg.norm(predicted_action - demo_actions, axis=-1).mean(),
+                "base_action_resample_noise": base_action_resample_noise,
+            }
+
+        grads, bc_info = jax.grad(bc_loss_fn, has_aux=True)(self.residual_actor.params)
+        residual_actor = self.residual_actor.apply_gradients(grads=grads)
+
+        # Same diagnostic as update_residual_actor -- see that docstring.
+        # Expected to stay essentially unchanged here specifically, since
+        # dist.mode() = tanh(dist.distribution.mode()) doesn't depend on
+        # std at all, so bc_loss's gradient shouldn't touch this parameter.
+        # Logged anyway as a clean baseline: confirms what value online RL
+        # actually starts from, and rules out BC warm-start itself as an
+        # explanation if it turns out NOT to have moved during BC either.
+        # Same diagnostic as update_residual_actor -- see that docstring.
+        # Expected to stay essentially unchanged (shift ~0) here
+        # specifically, since dist.mode() = tanh(dist.distribution.mode())
+        # doesn't depend on std at all, so bc_loss's gradient shouldn't
+        # touch this parameter. Logged anyway as a clean baseline: confirms
+        # what value online RL actually starts from, and rules out BC
+        # warm-start itself as an explanation if it turns out NOT to have
+        # moved during BC either.
+        hetstat_raw_var = _find_param_by_name(self.residual_actor.params, "HetStatLogVarScaleRaw")
+        if hetstat_raw_var is not None:
+            bc_info = dict(bc_info)
+            bc_info["hetstat_log_sigma_sq_shift_mean"] = hetstat_raw_var.mean() * self.hetstat_var_lr_multiplier
+
+        return self.replace(residual_actor=residual_actor, rng=rng), bc_info
+
     def update_actor(self, batch: DatasetDict) -> Tuple[AgentLearner, Dict[str, float]]:
         actor_batch = self.actor.prepare_batch_for_actor(batch)
         

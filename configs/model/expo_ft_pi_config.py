@@ -42,6 +42,7 @@ def get_config():
     # False = disabled (default, matches pre-existing TanhNormal behavior).
     config.use_hetstat_policy = False
     config.hetstat_num_rff_features = 256
+    config.hetstat_var_lr_multiplier = 40.0  # amplifies gradient-driven movement of HetStat's variance-scale param -- see hetstat.py's HetStatLogVarScaleRaw docstring. First-pass estimate (~8e-6/step observed under a direct/unamplified parameterization, would need millions of steps to matter) -- validate empirically and retune per the next run's training/hetstat_log_sigma_sq_shift_mean.
     config.critic_hidden_dims = (512, 512, 512, 512)
 
     config.N = 8
@@ -53,6 +54,7 @@ def get_config():
     config.fixed_temperature = config_dict.placeholder(float)  # if set, bypasses the learned SAC temperature entirely
     config.critic_grad_clip_norm = config_dict.placeholder(float)  # if set, clips critic + encoder grads to this global norm before adam/adamw
     config.critic_pretrain_steps = 0  # if >0, run this many critic-only update_critic() steps on offline demo data before RL starts (XQCfD-style critic/actor coherence warmup). 0 = disabled (default, matches pre-existing behavior).
+    config.actor_bc_pretrain_steps = 0  # if >0, run this many BC-warm-start steps on the residual actor (XQCfD-style policy pretraining) BEFORE critic pretraining. 0 = disabled (default).
     config.actor_drop = 0.0
     config.actor_lr = 3e-4
     config.critic_lr = 3e-4

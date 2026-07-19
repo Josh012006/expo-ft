@@ -41,6 +41,25 @@ def prepare_actor_sampling_batch(batch):
     }
 
 
+def prepare_actor_sampling_batch_current(batch):
+    """Select current-state fields from a batch for actor action sampling.
+
+    Current-state analog of prepare_actor_sampling_batch (which selects
+    next-state fields, used for Bellman-target action sampling). Used by
+    pretrain_actor_bc's BC warm-start, which needs the base VLA's action for
+    the CURRENT demo state rather than the next state.
+    """
+    return {
+        "image": batch["image"],
+        "image_mask": batch["image_mask"],
+        "state": batch["states"],
+        "tokenized_prompt": batch['tokenized_prompt'],
+        "tokenized_prompt_mask": batch['tokenized_prompt_mask'],
+        "token_ar_mask": batch.get('token_ar_mask', None),
+        "token_loss_mask": batch.get('token_loss_mask', None),
+    }
+
+
 def extract_critic_fields(processed_inputs, padded_dim, state_dim):
     """Add critic_obs and critic_states keys to a processed inputs dict."""
     processed_inputs["critic_obs"] = jnp.concatenate([

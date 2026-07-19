@@ -98,6 +98,7 @@ def main(_):
         # a new, default-off (0) field — behavior for existing configs that
         # don't set rl_critic_pretrain_steps is unchanged ---
         FLAGS.config.critic_pretrain_steps = int(getattr(cfg, "rl_critic_pretrain_steps", FLAGS.config.critic_pretrain_steps))
+        FLAGS.config.actor_bc_pretrain_steps = int(getattr(cfg, "rl_actor_bc_pretrain_steps", FLAGS.config.actor_bc_pretrain_steps))
         FLAGS.config.num_atoms = int(getattr(cfg, "rl_num_atoms", FLAGS.config.num_atoms))
         FLAGS.config.v_min = float(getattr(cfg, "rl_v_min", FLAGS.config.v_min))
         FLAGS.config.v_max = float(getattr(cfg, "rl_v_max", FLAGS.config.v_max))
@@ -107,6 +108,7 @@ def main(_):
         FLAGS.config.kl_ref_std = float(getattr(cfg, "rl_kl_ref_std", FLAGS.config.kl_ref_std))
         FLAGS.config.use_hetstat_policy = bool(getattr(cfg, "rl_use_hetstat_policy", FLAGS.config.use_hetstat_policy))
         FLAGS.config.hetstat_num_rff_features = int(getattr(cfg, "rl_hetstat_num_rff_features", FLAGS.config.hetstat_num_rff_features))
+        FLAGS.config.hetstat_var_lr_multiplier = float(getattr(cfg, "rl_hetstat_var_lr_multiplier", FLAGS.config.hetstat_var_lr_multiplier))
     elif model_cls == "PPOLearner":
         FLAGS.config.actor_lr  = float(getattr(cfg, "ppo_lr", FLAGS.config.actor_lr))
         FLAGS.config.critic_lr = float(getattr(cfg, "ppo_lr", FLAGS.config.critic_lr))
@@ -373,6 +375,65 @@ def main(_):
             logging.info("Resuming from step %d", start_step)
         batch_processor.restore(checkpoint_dir_path, up_to_step=latest_step)
 
+    # Demos live in offline_replay_buffer when offline_ratio > 0 (the normal
+    # ExpoFT setup); BatchProcessor's constructor instead seeds them into the
+    # online replay_buffer when offline_ratio == 0 — follow whichever buffer
+    # actually received the dataset. Shared by both pretraining stages below.
+    critic_pretrain_steps = int(getattr(FLAGS.config, "critic_pretrain_steps", 0) or 0)
+    actor_bc_pretrain_steps = int(getattr(FLAGS.config, "actor_bc_pretrain_steps", 0) or 0)
+    pretrain_buffer = offline_replay_buffer if cfg.offline_ratio > 0 else replay_buffer
+
+    # ── Actor BC warm-start (XQCfD-style "policy pretraining") ──────────────
+    # Only on a fresh run, same rationale as critic pretraining below. Runs
+    # BEFORE critic pretraining — see pretrain_actor_bc()'s docstring for why
+    # the ordering matters. EXPOLearnerOld doesn't have pretrain_actor_bc
+    # (legacy baseline, frozen on purpose) — only the current
+    # categorical-critic EXPOLearner does.
+    if not resuming and model_cls == "EXPOLearner" and actor_bc_pretrain_steps > 0:
+        logging.info(
+            "BC warm-start: pretraining residual actor for %d steps on demo data (%s buffer)...",
+            actor_bc_pretrain_steps,
+            "offline" if cfg.offline_ratio > 0 else "online (offline_ratio=0, demos live there instead)",
+        )
+        bc_iterator = pretrain_buffer.get_iterator(
+            sample_args={"batch_size": cfg.batch_size},
+            data_sharding=data_sharding,
+        )
+        wandb.define_metric("bc_pretrain_step")
+        wandb.define_metric("bc_pretrain/*", step_metric="bc_pretrain_step")
+        for bc_step in tqdm.tqdm(
+            range(actor_bc_pretrain_steps), desc="Actor BC warm-start", disable=not FLAGS.tqdm
+        ):
+            bc_batch = next(bc_iterator)
+            bc_batch = pretrain_buffer.apply_data_sharding(bc_batch, data_sharding)
+            bc_batch = dict(bc_batch)
+            rng, key1 = jax.random.split(agent.rng)
+            bc_batch["image"] = agent.data_augmentation_fn(key1, bc_batch["image"])
+            # next_image left unaugmented on purpose: pretrain_actor_bc never
+            # reads next_observations, but prepare_critic_batch still builds
+            # that key from whatever's in next_image — passing it through raw
+            # is harmless and saves an augmentation call.
+            bc_batch = prepare_critic_batch(
+                bc_batch,
+                agent.actor.model_config.action_dim,
+                agent.action_dim,
+                agent.state_dim,
+                agent.action_horizon,
+                agent.replan_steps,
+            )
+            agent = agent.replace(rng=jax.device_put(rng, replicated_sharding))
+            agent, bc_info = agent.pretrain_actor_bc(bc_batch)
+            for k, v in bc_info.items():
+                try:
+                    tb_writer.add_scalar(f"bc_pretrain/{k}", float(v), global_step=bc_step)
+                except (TypeError, ValueError):
+                    pass
+            wandb.log({
+                "bc_pretrain_step": bc_step,
+                **{f"bc_pretrain/{k}": v for k, v in bc_info.items()},
+            })
+        logging.info("Actor BC warm-start complete.")
+
     # ── Critic pretraining (XQCfD-style critic/actor coherence warmup) ──────
     # Only on a fresh run — a resumed run's critic has already been through
     # this (or through real online training), so redoing it here would be
@@ -385,13 +446,7 @@ def main(_):
     # The point is purely to get the critic roughly "coherent" with the SFT
     # policy's own actions before the online loop starts pulling the residual
     # policy toward whatever a still-randomly-initialized critic prefers.
-    critic_pretrain_steps = int(getattr(FLAGS.config, "critic_pretrain_steps", 0) or 0)
     if not resuming and model_cls in ("EXPOLearner", "EXPOLearnerOld") and critic_pretrain_steps > 0:
-        # Demos live in offline_replay_buffer when offline_ratio > 0 (the
-        # normal ExpoFT setup); BatchProcessor's constructor instead seeds
-        # them into the online replay_buffer when offline_ratio == 0 — follow
-        # whichever buffer actually received the dataset.
-        pretrain_buffer = offline_replay_buffer if cfg.offline_ratio > 0 else replay_buffer
         logging.info(
             "Pretraining critic for %d steps on demo data (%s buffer)...",
             critic_pretrain_steps,
