@@ -246,7 +246,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
     N: int = struct.field(pytree_node=False)
     n_edit_samples: int = struct.field(pytree_node=False)
     edit_scale: float = struct.field(pytree_node=False)
-    hetstat_var_lr_multiplier: float = struct.field(pytree_node=False, default=40.0)
+    hetstat_var_lr_multiplier: float = struct.field(pytree_node=False)
     residual_action_xyzg: bool = struct.field(pytree_node=False)
     batch_split: int = struct.field(pytree_node=False)
     encode_batch_split: int = struct.field(pytree_node=False)
