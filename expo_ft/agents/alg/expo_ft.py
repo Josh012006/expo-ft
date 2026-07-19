@@ -800,7 +800,19 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             states_flat = jax.device_put(jnp.repeat(states, total_candidates, axis=0), self.data_sharding)
             actions_flat = jax.device_put(actions.reshape(-1, actions.shape[-1]), self.data_sharding)
 
-            qs = self._compute_q_split(self.target_critic.apply_fn, self.target_critic.params, self.target_critic.batch_stats, obs_flat, actions_flat, states_flat)
+            # Double-Q-style decoupled selection/evaluation. Previously,
+            # this argmax used self.target_critic -- the SAME network whose
+            # Q-estimate update_critic then bootstraps from downstream
+            # (next_logits = self.target_critic.apply_fn(...) on this exact
+            # next_actions) -- a single estimator both picking its own
+            # favorite candidate AND having that pick trusted as the
+            # Bellman target is exactly the classic maximization-bias setup
+            # Double Q-learning exists to fix. No new network needed: the
+            # online/target pair already exists, so selecting here with
+            # self.critic (online) while update_critic's evaluation still
+            # uses self.target_critic (unchanged, downstream) decorrelates
+            # the two steps between two independently-varying estimators.
+            qs = self._compute_q_split(self.critic.apply_fn, self.critic.params, self.critic.batch_stats, obs_flat, actions_flat, states_flat)
             qs = qs.reshape(batch_size, total_candidates)
 
             best_indices = jnp.argmax(qs, axis=1)
@@ -812,16 +824,35 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             with_residual_mask = (best_indices >= self.N) & (best_indices < total_candidates)
             vf_select_ratio_without_residual = jnp.mean(without_residual_mask.astype(jnp.float32))
             vf_select_ratio_with_residual = jnp.mean(with_residual_mask.astype(jnp.float32))
+
+            # Diagnostic: quantify the overestimation this decoupling is
+            # meant to fix. online_q_at_argmax is the online critic's own
+            # (usually optimistic, since it's what picked this candidate in
+            # the first place) opinion of the action it selected -- i.e.
+            # what a single-critic (non-Double-Q) setup would effectively
+            # have bootstrapped from. target_q_at_argmax is the target
+            # critic's opinion of that SAME action -- what update_critic
+            # actually bootstraps from now. A consistently positive gap
+            # means the online critic systematically rates its own picks
+            # higher than the (lagging, Polyak-averaged) target critic does
+            # -- direct evidence of the bias this change addresses.
+            online_q_at_argmax = qs[batch_indices, best_indices]
+            target_qs_flat = self._compute_q_split(self.target_critic.apply_fn, self.target_critic.params, self.target_critic.batch_stats, obs_flat, actions_flat, states_flat)
+            target_qs = target_qs_flat.reshape(batch_size, total_candidates)
+            target_q_at_argmax = target_qs[batch_indices, best_indices]
+            overestimation_gap = jnp.mean(online_q_at_argmax - target_q_at_argmax)
         else:
             best_actions = actions[:, 0]
             vf_select_ratio_without_residual = 1
             vf_select_ratio_with_residual = 0
+            overestimation_gap = jnp.array(0.0, dtype=jnp.float32)
 
         sample_info_extra = {
             "select_ratio_without_residual": vf_select_ratio_without_residual,
             "select_ratio_with_residual": vf_select_ratio_with_residual,
             "mean_d_actions_norm": mean_d_actions_norm,
             "mean_residual_scaled_norm": mean_residual_scaled_norm,
+            "double_q_overestimation_gap": overestimation_gap,
         }
 
         rng, _ = jax.random.split(rng, 2)

@@ -148,6 +148,6 @@ rl_entropy_scale: 0.0           # weight of the (separate, additive) entropy bon
 # near-uniform distribution when out of the demos' distribution, so
 # rl_kl_coef's regularization doesn't fight the network's own OOD
 # behavior. See expo_ft/distributions/hetstat.py for the mechanism.
-rl_use_hetstat_policy: true    # false = disabled (default), matches pre-existing TanhNormal architecture exactly
+rl_use_hetstat_policy: false    # false = disabled (default), matches pre-existing TanhNormal architecture exactly
 rl_hetstat_num_rff_features: 256  # dimensionality K of the fixed stationary feature space
 rl_hetstat_var_lr_multiplier: 40   # effective LR multiplier for HetStat's variance-scale param (first-pass estimate; retune per observed training/hetstat_log_sigma_sq_shift_mean)
