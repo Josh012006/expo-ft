@@ -103,9 +103,9 @@ rl_fixed_temperature: null      # if set (e.g. 0.1), bypasses the learned SAC
                                   # temperature entirely — a diagnostic Jesse suggested
                                   # to test whether the unconverged/climbing alpha itself
                                   # contributes to instability (see July 2026 notes)
-rl_edit_scale: 1.0e-5              # max magnitude of residual action added by edit policy (derived from measured bc_demo_vs_base_action_gap ~0.73 with a 1.5x margin, full_action_dim=32: 1.5*0.73/sqrt(32) ~= 0.194 -> rounded to 0.2)
-rl_N: 8                          # number of base-VLA (no-edit) candidates compared per argmax step
-rl_n_edit_samples: 8              # number of edited (residual-corrected) candidates compared per argmax step
+rl_edit_scale: 0.2              # max magnitude of residual action added by edit policy (derived from measured bc_demo_vs_base_action_gap ~0.73 with a 1.5x margin, full_action_dim=32: 1.5*0.73/sqrt(32) ~= 0.194 -> rounded to 0.2)
+rl_N: 2                          # number of base-VLA (no-edit) candidates compared per argmax step
+rl_n_edit_samples: 2              # number of edited (residual-corrected) candidates compared per argmax step
 rl_critic_weight_decay: null    # if set (e.g. 1.0e-4), L2 weight decay on critic + encoder params (adamw)
 rl_critic_grad_clip_norm: null  # if set (e.g. 1.0), clips critic + encoder grads to this global norm
 rl_freeze_critic_encoder: false # if true, ResNet-34 image encoder frozen for the critic (Q uses embeddings only)
@@ -155,4 +155,4 @@ rl_hetstat_num_rff_features: 256  # dimensionality K of the fixed stationary fea
 rl_hetstat_var_lr_multiplier: 40   # effective LR multiplier for HetStat's variance-scale param (first-pass estimate; retune per observed training/hetstat_log_sigma_sq_shift_mean)
 
 
-rl_use_double_q_selection: true    # decouple candidate selection (online critic) from evaluation (target critic, unchanged) -- addresses the argmax self-referential overestimation mechanism. Unrelated to HetStat -- set rl_use_hetstat_policy independently for the two planned runs (decoupling alone / decoupling+HetStat).
+rl_use_double_q_selection: false    # decouple candidate selection (online critic) from evaluation (target critic, unchanged) -- addresses the argmax self-referential overestimation mechanism. Unrelated to HetStat -- set rl_use_hetstat_policy independently for the two planned runs (decoupling alone / decoupling+HetStat).

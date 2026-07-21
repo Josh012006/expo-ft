@@ -89,7 +89,7 @@ max_to_keep: 1
 actor_success_only: true        # if true, actor batch is sampled only from successful transitions
 
 # ── RL hyperparameters (EXPOLearner) ───────────────────────────
-rl_lr: 3.0e-4                     # learning rate for critic and edit policy
+rl_lr: 0.2                     # learning rate for critic and edit policy
 rl_discount: 0.99               # discount factor gamma for Bellman backup
 rl_tau: 0.005                   # polyak averaging coefficient for target network soft update
 rl_init_temperature: 1.0        # initial entropy temperature (controls exploration vs exploitation)
