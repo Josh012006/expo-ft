@@ -73,7 +73,7 @@ replan_steps: 4            # number of actions to execute from each action chunk
 fsdp_devices: 1            # number of GPUs for FSDP sharding (1 = single GPU, no sharding)
 
 num_data_rl: 50
-rl_resume_dir: null
+rl_resume_dir: null #"logs/push_cube/push_cube_expo_ft_2026-07-19_00-46-50_rl"
 
 model_cls: "EXPOLearner"  # selects both configs/model/*.py (via run_pipeline.py) and the FLAGS.config path used by train_pi_robo.py
 
@@ -103,13 +103,13 @@ rl_fixed_temperature: null      # if set (e.g. 0.1), bypasses the learned SAC
                                   # temperature entirely — a diagnostic Jesse suggested
                                   # to test whether the unconverged/climbing alpha itself
                                   # contributes to instability (see July 2026 notes)
-rl_edit_scale: 0.2              # max magnitude of residual action added by edit policy (derived from measured bc_demo_vs_base_action_gap ~0.73 with a 1.5x margin, full_action_dim=32: 1.5*0.73/sqrt(32) ~= 0.194 -> rounded to 0.2)
+rl_edit_scale: 1.0e-5              # max magnitude of residual action added by edit policy (derived from measured bc_demo_vs_base_action_gap ~0.73 with a 1.5x margin, full_action_dim=32: 1.5*0.73/sqrt(32) ~= 0.194 -> rounded to 0.2)
 rl_critic_weight_decay: null    # if set (e.g. 1.0e-4), L2 weight decay on critic + encoder params (adamw)
 rl_critic_grad_clip_norm: null  # if set (e.g. 1.0), clips critic + encoder grads to this global norm
 rl_freeze_critic_encoder: false # if true, ResNet-34 image encoder frozen for the critic (Q uses embeddings only)
 
-rl_actor_bc_pretrain_steps: 1000     # if >0, BC-warm-start the residual actor for N steps on offline demos before critic pretraining (XQCfD-style policy pretraining)
-rl_critic_pretrain_steps: 1000     # if >0, pretrain the critic for N steps on offline demos before
+rl_actor_bc_pretrain_steps: 0     # if >0, BC-warm-start the residual actor for N steps on offline demos before critic pretraining (XQCfD-style policy pretraining)
+rl_critic_pretrain_steps: 0     # if >0, pretrain the critic for N steps on offline demos before
                                   # RL begins (critic-only, residual actor/base VLA/temperature
                                   # untouched) — XQCfD-style critic/actor coherence warmup. 0 = disabled.
 
@@ -141,7 +141,7 @@ rl_kl_ref_std: 1.0              # std of the fixed reference distribution in pre
 # regularization (KL only, no entropy term confounding it), set
 # rl_entropy_scale to 0.0 below. Leaving it at the default (1.0) means
 # you are testing KL + entropy together, not KL alone.
-rl_entropy_scale: 0.1           # weight of the (separate, additive) entropy bonus term -- set to 0.0 for a KL-only test matching the paper's setup
+rl_entropy_scale: 1.0           # weight of the (separate, additive) entropy bonus term -- set to 0.0 for a KL-only test matching the paper's setup
 
 # ── HetStat policy architecture (XQCfD-style, last missing piece) ──────
 # Heteroscedastic + stationary residual policy -- reverts to a wide,
