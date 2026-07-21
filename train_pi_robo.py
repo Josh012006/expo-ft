@@ -94,6 +94,8 @@ def main(_):
         if hasattr(cfg, "rl_hidden_dims"):
             FLAGS.config.hidden_dims  = tuple(cfg.rl_hidden_dims)
         FLAGS.config.edit_scale       = float(getattr(cfg, "rl_edit_scale", FLAGS.config.edit_scale))
+        FLAGS.config.N = int(getattr(cfg, "rl_N", FLAGS.config.N))
+        FLAGS.config.n_edit_samples = int(getattr(cfg, "rl_n_edit_samples", FLAGS.config.n_edit_samples))
         # --- end of original ExpoFT block; critic_pretrain_steps added below is
         # a new, default-off (0) field — behavior for existing configs that
         # don't set rl_critic_pretrain_steps is unchanged ---

@@ -104,6 +104,8 @@ rl_fixed_temperature: null      # if set (e.g. 0.1), bypasses the learned SAC
                                   # to test whether the unconverged/climbing alpha itself
                                   # contributes to instability (see July 2026 notes)
 rl_edit_scale: 1.0e-5              # max magnitude of residual action added by edit policy
+rl_N: 8                          # number of base-VLA (no-edit) candidates compared per argmax step
+rl_n_edit_samples: 8              # number of edited (residual-corrected) candidates compared per argmax step
 rl_use_double_q_selection: true # decouple candidate selection (online critic ensemble) from evaluation (target critic ensemble, unchanged) -- addresses the argmax self-referential overestimation mechanism, adapted for REDQ ensemble-subsampling. Same mechanism as EXPOLearner, off by default here too (matches pre-existing behavior). Set true to test its separate contribution on this architecture.
 rl_critic_weight_decay: null    # if set (e.g. 1.0e-4), L2 weight decay on critic + encoder params (adamw)
 rl_critic_grad_clip_norm: null  # if set (e.g. 1.0), clips critic + encoder grads to this global norm
