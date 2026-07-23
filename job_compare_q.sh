@@ -8,13 +8,16 @@
 #   the sampled batch of states are all loaded ONCE and reused across every
 #   checkpoint listed, so passing several here is much cheaper than
 #   separate submissions.
-# reference_checkpoint: path to the reference SFT checkpoint's "params" dir
-#   (e.g. the 96% SR checkpoint) -- a SEPARATE π₀.₅, not the RL checkpoint's own frozen VLA.
+# reference_checkpoint: path to the reference SFT checkpoint's STEP directory
+#   (e.g. the 96% SR checkpoint, .../push_cube_sft_demos50/3200) -- a SEPARATE
+#   π₀.₅, not the RL checkpoint's own frozen VLA. Same convention as
+#   rl_checkpoints below: pass the step dir, the "params" item inside it is
+#   loaded automatically -- do NOT append /params yourself.
 #
 # Examples:
 #   sbatch job_compare_q.sh .venv configs/task/maniskill/push_cube_expo_ft.yaml \
 #       logs/push_cube/.../checkpoints/20000,logs/push_cube/.../checkpoints/118000 \
-#       logs/push_cube/.../sft/.../params
+#       logs/push_cube/.../sft/.../push_cube_sft_demos50/3200
 #
 #SBATCH --job-name=expo_compare_q
 #SBATCH --ntasks=1

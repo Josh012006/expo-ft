@@ -13,6 +13,11 @@ checkpoint (whatever it was actually trained against), and a separate one
 loaded fresh from the reference checkpoint's own weights -- these are two
 different sets of weights, not the same model reused.
 
+--reference-checkpoint takes a checkpoint STEP directory (e.g.
+.../push_cube_sft_demos50/3200), same convention as --rl-checkpoint -- the
+"params" item inside it is loaded automatically, no need to append it
+yourself.
+
 Accepts MULTIPLE --rl-checkpoint values (e.g. an early and a late step from
 the same run) in one process: demo data, the reference checkpoint, and the
 sampled batch of states are all loaded/drawn ONCE and reused across every
@@ -26,7 +31,7 @@ Usage:
         --config configs/task/maniskill/push_cube_expo_ft.yaml \
         --rl-checkpoint logs/push_cube/<run>/checkpoints/20000 \
         --rl-checkpoint logs/push_cube/<run>/checkpoints/118000 \
-        --reference-checkpoint /path/to/96pct/params \
+        --reference-checkpoint /path/to/96pct/checkpoints/<step> \
         --n-states 100 \
         --output-json q_comparison.json
 """
@@ -46,7 +51,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, help="Path to task YAML (e.g. configs/task/maniskill/push_cube_expo_ft.yaml)")
     parser.add_argument("--rl-checkpoint", required=True, action="append", help="Path to an RL/EXPOLearner checkpoint STEP directory (e.g. .../checkpoints/40000) -- the critic being examined. Repeat this flag to evaluate multiple checkpoints (e.g. an early and a late step) in one process, reusing everything else.")
-    parser.add_argument("--reference-checkpoint", required=True, help="Path to the reference SFT checkpoint's 'params' directory (e.g. the 96%% SR checkpoint) -- NOT the RL checkpoint's own frozen VLA")
+    parser.add_argument("--reference-checkpoint", required=True, help="Path to the reference SFT checkpoint's STEP directory (e.g. .../push_cube_sft_demos50/3200, the 96%% SR checkpoint) -- NOT the RL checkpoint's own frozen VLA. The 'params' item is loaded from inside it automatically, same convention as --rl-checkpoint.")
     parser.add_argument("--n-states", type=int, default=200, help="Number of demo states to evaluate")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-json", default=None, help="Optional path to dump per-state results + summary (per checkpoint) as JSON")
@@ -74,6 +79,28 @@ def main():
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(openpi_sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
+    # ── Load model config for the RL checkpoints' architecture (used to
+    # build both the RL agent structure and the reference checkpoint below --
+    # same pi05 config, just different weights). Built BEFORE the replay
+    # buffer below: create_replay_buffer's `config` argument must be this
+    # ml_collections model config -- it needs .discount/.skip_repack_transforms
+    # (and dict()-convertibility inside build_pi05_config), which the
+    # task-YAML SimpleNamespace `cfg` doesn't provide -- same pattern as
+    # eval_policy.py (see its "Load algorithm config" section). ──
+    import importlib.util
+    model_cls_name = getattr(cfg, "model_cls", "EXPOLearner")
+    model_config_path = REPO_ROOT / (
+        "configs/model/expo_ft_old_pi_config.py" if model_cls_name == "EXPOLearnerOld" else "configs/model/expo_ft_pi_config.py"
+    )
+    spec = importlib.util.spec_from_file_location("model_config", str(model_config_path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    model_config = mod.get_config()
+    model_config.pi05_config_name = get_sft_config_name(cfg)
+    model_config.skip_repack_transforms = cfg.skip_repack_transforms
+    model_config.pi05_weight_loader_path = None
+
     # ── Real demo data (not the synthetic shapes-only dataset eval_policy.py
     # uses -- we need genuine states here, not just an env to roll out in).
     # Loaded ONCE, reused for every RL checkpoint below. ──
@@ -82,7 +109,7 @@ def main():
     example_action = dataset[0]['actions'][np.newaxis]
 
     replay_buffer = create_replay_buffer(
-        config=cfg,
+        config=model_config,
         example_action=example_action,
         capacity=len(dataset),
         task_description=cfg.language_instruction,
@@ -99,26 +126,9 @@ def main():
             "actions":          replay_buffer.dataset_dict['actions'][0][np.newaxis],
         })
 
-    # ── Load model config for the RL checkpoints' architecture (used to
-    # build both the RL agent structure and the reference checkpoint below --
-    # same pi05 config, just different weights). ──
-    import importlib.util
-    model_cls_name = getattr(cfg, "model_cls", "EXPOLearner")
-    model_config_path = REPO_ROOT / (
-        "configs/model/expo_ft_old_pi_config.py" if model_cls_name == "EXPOLearnerOld" else "configs/model/expo_ft_pi_config.py"
-    )
-    spec = importlib.util.spec_from_file_location("model_config", str(model_config_path))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
     # ── Build the RL agent STRUCTURE once (architecture only -- restore_checkpoint
     # below overwrites the actual weights per checkpoint, so this build is just a
     # structural placeholder, same as eval_policy.py). Reused across all --rl-checkpoint values. ──
-    model_config = mod.get_config()
-    model_config.pi05_config_name = get_sft_config_name(cfg)
-    model_config.skip_repack_transforms = cfg.skip_repack_transforms
-    model_config.pi05_weight_loader_path = None
-
     print("Building RL agent structure...")
     actor, actor_train_state, target_actor_params, agent_kwargs, vla_metadata = build_pi05(
         model_config, args.seed, mesh, data_sharding, replicated_sharding,
@@ -153,7 +163,14 @@ def main():
     ref_model_config = mod.get_config()
     ref_model_config.pi05_config_name = get_sft_config_name(cfg)
     ref_model_config.skip_repack_transforms = cfg.skip_repack_transforms
-    ref_model_config.pi05_weight_loader_path = str(Path(args.reference_checkpoint))
+    # openpi's CheckpointWeightLoader expects params_path to point directly at
+    # the "params" item dir (its own docstring: ".../<step>/params"), not the
+    # step directory itself (which also holds train_state/assets/etc as
+    # separate orbax items with no _METADATA file at that level) -- same
+    # convention as eval_policy.py's `Path(checkpoint_path) / "params"` and as
+    # --rl-checkpoint above, so --reference-checkpoint also takes a plain
+    # checkpoint STEP directory rather than needing "/params" appended by hand.
+    ref_model_config.pi05_weight_loader_path = str(Path(args.reference_checkpoint) / "params")
     reference_actor, reference_actor_train_state, _, _, _ = build_pi05(
         ref_model_config, args.seed, mesh, data_sharding, replicated_sharding,
         resume=False, default_prompt=cfg.language_instruction,
@@ -231,15 +248,25 @@ def main():
         agent_actions = agent_actions.reshape(batch_size, -1)
 
         # ── Query THIS checkpoint's critic on both action sets, at the
-        # current state -- no next_-hack needed here, batch['observations']
-        # /['critic_states'] are already the genuine current-state fields. ──
+        # current state. PixelMultiplexer expects ALREADY-ENCODED
+        # observations (it just concatenates them with the state embedding,
+        # see pixel_multiplexer.py) -- batch["observations"] is still the
+        # raw (B, 224, 224, 6) pixel tensor, so it must go through the same
+        # _encode_observations() step sample_batch_actions uses internally
+        # (encoded_obs = self._encode_observations(critic_obs, ...)) before
+        # being passed to _compute_q_split. Encoded per-checkpoint (not
+        # hoisted out of the loop) since it depends on THIS checkpoint's own
+        # batch_encoder params, same as sample_batch_actions above. No
+        # next_-hack needed for states/critic_states -- those are already
+        # the genuine current-state fields. ──
+        encoded_obs = agent._encode_observations(batch["observations"], stop_gradient=True)
         q_agent_pick = agent._compute_q_split(
             agent.target_critic.apply_fn, agent.target_critic.params, agent.target_critic.batch_stats,
-            batch["observations"], agent_actions, batch["critic_states"],
+            encoded_obs, agent_actions, batch["critic_states"],
         )
         q_reference = agent._compute_q_split(
             agent.target_critic.apply_fn, agent.target_critic.params, agent.target_critic.batch_stats,
-            batch["observations"], reference_actions, batch["critic_states"],
+            encoded_obs, reference_actions, batch["critic_states"],
         )
 
         q_agent_pick = np.asarray(q_agent_pick).reshape(-1)
