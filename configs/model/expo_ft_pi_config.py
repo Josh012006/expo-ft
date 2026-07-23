@@ -44,6 +44,7 @@ def get_config():
     config.hetstat_num_rff_features = 256
     config.hetstat_var_lr_multiplier = 40.0  # amplifies gradient-driven movement of HetStat's variance-scale param -- see hetstat.py's HetStatLogVarScaleRaw docstring. First-pass estimate (~8e-6/step observed under a direct/unamplified parameterization, would need millions of steps to matter) -- validate empirically and retune per the next run's training/hetstat_log_sigma_sq_shift_mean.
     config.use_double_q_selection = False  # False = disabled (default, matches pre-existing behavior: candidate selection in sample_batch_actions uses target_critic, same network update_critic then bootstraps from). True = decouple selection (self.critic) from evaluation (self.target_critic, unchanged) -- addresses the classic Double-Q maximization-bias setup. Unrelated to HetStat.
+    config.use_clipped_double_q = False  # False = disabled (default, matches pre-existing behavior: Bellman target uses target_critic's distribution alone). True = use whichever of target_critic/critic predicts the lower expected value for next_actions, every step (TD3-style clipped double-Q). Orthogonal to use_double_q_selection.
     config.critic_hidden_dims = (512, 512, 512, 512)
 
     config.N = 8

@@ -248,6 +248,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
     edit_scale: float = struct.field(pytree_node=False)
     hetstat_var_lr_multiplier: float = struct.field(pytree_node=False)
     use_double_q_selection: bool = struct.field(pytree_node=False)
+    use_clipped_double_q: bool = struct.field(pytree_node=False)
     residual_action_xyzg: bool = struct.field(pytree_node=False)
     batch_split: int = struct.field(pytree_node=False)
     encode_batch_split: int = struct.field(pytree_node=False)
@@ -353,6 +354,17 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         # reuses the existing online/target pair. Unrelated to HetStat;
         # independently togglable.
         use_double_q_selection: bool = False,
+        # False = disabled (default; matches pre-existing behavior exactly:
+        # the Bellman target's next-state evaluation uses target_critic
+        # alone). True = at every update_critic step, use whichever of
+        # target_critic/critic (online) predicts the LOWER expected value
+        # for next_actions -- TD3-style "clipped double-Q", applied
+        # continuously rather than only correcting after the two drift far
+        # apart (which is what use_double_q_selection above does instead).
+        # Orthogonal to and stackable with use_double_q_selection -- that
+        # flag picks who SELECTS next_actions; this one picks how that pick
+        # gets EVALUATED for the target.
+        use_clipped_double_q: bool = False,
         critic_hidden_dims: Sequence[int] = (512, 512, 512, 512),
         critic_weight_decay: Optional[float] = None,
         critic_grad_clip_norm: Optional[float] = None,
@@ -583,6 +595,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             edit_scale=edit_scale,
             hetstat_var_lr_multiplier=hetstat_var_lr_multiplier,
             use_double_q_selection=use_double_q_selection,
+            use_clipped_double_q=use_clipped_double_q,
             residual_action_xyzg=residual_action_xyzg,
             batch_split=batch_split,
             actor_tau=actor_tau,
@@ -1180,6 +1193,38 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         )
         next_probs = jax.nn.softmax(next_logits, axis=-1)
 
+        # Clipped Double-Q (TD3-style), togglable via use_clipped_double_q,
+        # independent of (and stackable with) use_double_q_selection above.
+        # That flag decides WHO SELECTS next_actions (target vs online
+        # critic's argmax); this one decides how next_actions gets
+        # EVALUATED for the Bellman target -- unconditionally on
+        # target_critic alone (legacy, False) vs the more conservative of
+        # target_critic AND critic (online), every single step, rather than
+        # only correcting after the two have already drifted far apart.
+        # Since this is a distributional (categorical) critic rather than a
+        # scalar one, "minimum" means picking whichever NETWORK's full
+        # predicted distribution has the lower expectation for this
+        # (next_state, next_action) -- the projection needs an entire
+        # distribution to project, not just a scalar -- so the "losing"
+        # network's distribution is discarded whole, not blended in.
+        if self.use_clipped_double_q:
+            next_logits_online = self.critic.apply_fn(
+                {"params": self.critic.params, "batch_stats": self.critic.batch_stats},
+                next_observations,
+                next_actions,
+                False,
+                p=batch['next_critic_states'],
+            )
+            next_probs_online = jax.nn.softmax(next_logits_online, axis=-1)
+
+            next_q_target_raw = jnp.sum(next_probs * self.atoms, axis=-1)
+            next_q_online_raw = jnp.sum(next_probs_online * self.atoms, axis=-1)
+            use_target_dist = next_q_target_raw <= next_q_online_raw
+            clipped_double_q_gap = jnp.mean(next_q_online_raw - next_q_target_raw)
+            next_probs = jnp.where(use_target_dist[:, None], next_probs, next_probs_online)
+        else:
+            clipped_double_q_gap = jnp.array(0.0, dtype=jnp.float32)
+
         # Same defensive NaN handling as the old scalar critic (there
         # replacing a NaN Q with 0.0) — replace a NaN row's distribution with
         # a uniform one (maximum entropy, Q = midpoint of the support) rather
@@ -1308,6 +1353,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             info["critic_grad_norm_post_clip"] = critic_grad_norm
         info["critic_param_norm"] = optax.global_norm(critic.params)
         info["next_q_nan_ratio"] = next_q_nan_ratio
+        info["clipped_double_q_gap"] = clipped_double_q_gap
         
         target_critic_params = optax.incremental_update(
             critic.params, self.target_critic.params, self.tau

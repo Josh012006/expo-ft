@@ -112,6 +112,7 @@ def main(_):
         FLAGS.config.hetstat_num_rff_features = int(getattr(cfg, "rl_hetstat_num_rff_features", FLAGS.config.hetstat_num_rff_features))
         FLAGS.config.hetstat_var_lr_multiplier = float(getattr(cfg, "rl_hetstat_var_lr_multiplier", FLAGS.config.hetstat_var_lr_multiplier))
         FLAGS.config.use_double_q_selection = bool(getattr(cfg, "rl_use_double_q_selection", FLAGS.config.use_double_q_selection))
+        FLAGS.config.use_clipped_double_q = bool(getattr(cfg, "rl_use_clipped_double_q", FLAGS.config.use_clipped_double_q))
     elif model_cls == "PPOLearner":
         FLAGS.config.actor_lr  = float(getattr(cfg, "ppo_lr", FLAGS.config.actor_lr))
         FLAGS.config.critic_lr = float(getattr(cfg, "ppo_lr", FLAGS.config.critic_lr))

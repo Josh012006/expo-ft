@@ -106,6 +106,8 @@ rl_fixed_temperature: null      # if set (e.g. 0.1), bypasses the learned SAC
 rl_edit_scale: 0.2              # max magnitude of residual action added by edit policy
 rl_N: 8                          # number of base-VLA (no-edit) candidates compared per argmax step
 rl_n_edit_samples: 8              # number of edited (residual-corrected) candidates compared per argmax step
+rl_use_double_q_selection: false  # decouple candidate selection (online critic) from evaluation (target critic, unchanged) -- addresses the argmax self-referential overestimation mechanism. Unrelated to HetStat.
+rl_use_clipped_double_q: false    # TD3-style: use whichever of target_critic/critic predicts the lower expected value for next_actions, every step, instead of target_critic alone. Orthogonal to rl_use_double_q_selection (that picks who SELECTS next_actions; this picks how the pick gets EVALUATED).
 rl_critic_weight_decay: null    # if set (e.g. 1.0e-4), L2 weight decay on critic + encoder params (adamw)
 rl_critic_grad_clip_norm: null  # if set (e.g. 1.0), clips critic + encoder grads to this global norm
 rl_freeze_critic_encoder: false # if true, ResNet-34 image encoder frozen for the critic (Q uses embeddings only)
