@@ -73,7 +73,7 @@ replan_steps: 4            # number of actions to execute from each action chunk
 fsdp_devices: 1            # number of GPUs for FSDP sharding (1 = single GPU, no sharding)
 
 num_data_rl: 50
-rl_resume_dir: null #"logs/push_cube/push_cube_expo_ft_2026-07-19_00-46-50_rl"
+rl_resume_dir: "logs/push_cube/push_cube_expo_ft_2026-07-24_15-15-02_rl"
 
 model_cls: "EXPOLearner"  # selects both configs/model/*.py (via run_pipeline.py) and the FLAGS.config path used by train_pi_robo.py
 
@@ -133,7 +133,7 @@ rl_reward_scale_decay: 0.99     # EMA decay for the running reward-RMS estimate;
 # distribution deviating from a fixed N(0, rl_kl_ref_std) reference in
 # pre-tanh space -- "prefer staying close to zero residual unless Q
 # strongly justifies deviating". 0.0 = disabled (exact no-op).
-rl_kl_coef: 0.0                 # weight of the KL penalty; 0.0 = disabled, matches pre-existing entropy-only behavior
+rl_kl_coef: 0.1                 # weight of the KL penalty; 0.0 = disabled, matches pre-existing entropy-only behavior
 rl_kl_ref_std: 1.0              # std of the fixed reference distribution in pre-tanh space
 
 # IMPORTANT: kl_coef is ADDITIVE alongside the existing entropy bonus in
@@ -143,7 +143,7 @@ rl_kl_ref_std: 1.0              # std of the fixed reference distribution in pre
 # regularization (KL only, no entropy term confounding it), set
 # rl_entropy_scale to 0.0 below. Leaving it at the default (1.0) means
 # you are testing KL + entropy together, not KL alone.
-rl_entropy_scale: 1.0           # weight of the (separate, additive) entropy bonus term -- set to 0.0 for a KL-only test matching the paper's setup
+rl_entropy_scale: 0.0           # weight of the (separate, additive) entropy bonus term -- set to 0.0 for a KL-only test matching the paper's setup
 
 # ── HetStat policy architecture (XQCfD-style, last missing piece) ──────
 # Heteroscedastic + stationary residual policy -- reverts to a wide,
@@ -155,5 +155,5 @@ rl_hetstat_num_rff_features: 256  # dimensionality K of the fixed stationary fea
 rl_hetstat_var_lr_multiplier: 40   # effective LR multiplier for HetStat's variance-scale param (first-pass estimate; retune per observed training/hetstat_log_sigma_sq_shift_mean)
 
 
-rl_use_double_q_selection: false    # decouple candidate selection (online critic) from evaluation (target critic, unchanged) -- addresses the argmax self-referential overestimation mechanism. Unrelated to HetStat -- set rl_use_hetstat_policy independently for the two planned runs (decoupling alone / decoupling+HetStat).
+rl_use_double_q_selection: true    # decouple candidate selection (online critic) from evaluation (target critic, unchanged) -- addresses the argmax self-referential overestimation mechanism. Unrelated to HetStat -- set rl_use_hetstat_policy independently for the two planned runs (decoupling alone / decoupling+HetStat).
 rl_use_clipped_double_q: false    # TD3-style: use whichever of target_critic/critic predicts the lower expected value for next_actions, every step, instead of target_critic alone. Orthogonal to rl_use_double_q_selection (that picks who SELECTS next_actions; this picks how the pick gets EVALUATED).
