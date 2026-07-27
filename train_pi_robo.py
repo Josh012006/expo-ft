@@ -383,9 +383,15 @@ def main(_):
     # ExpoFT setup); BatchProcessor's constructor instead seeds them into the
     # online replay_buffer when offline_ratio == 0 — follow whichever buffer
     # actually received the dataset. Shared by both pretraining stages below.
+    # Guarded by model_cls: offline_ratio/this whole pretraining mechanism is
+    # ExpoFT-specific (EXPOLearner/EXPOLearnerOld) -- PPO/GRPO/SAC task YAMLs
+    # don't define offline_ratio at all, so this must not run unconditionally.
     critic_pretrain_steps = int(getattr(FLAGS.config, "critic_pretrain_steps", 0) or 0)
     actor_bc_pretrain_steps = int(getattr(FLAGS.config, "actor_bc_pretrain_steps", 0) or 0)
-    pretrain_buffer = offline_replay_buffer if cfg.offline_ratio > 0 else replay_buffer
+    if model_cls in ("EXPOLearner", "EXPOLearnerOld"):
+        pretrain_buffer = offline_replay_buffer if cfg.offline_ratio > 0 else replay_buffer
+    else:
+        pretrain_buffer = None
 
     # ── Actor BC warm-start (XQCfD-style "policy pretraining") ──────────────
     # Only on a fresh run, same rationale as critic pretraining below. Runs

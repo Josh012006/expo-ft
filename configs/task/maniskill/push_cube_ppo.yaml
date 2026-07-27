@@ -106,4 +106,4 @@ ppo_max_grad_norm: null           # Optional[float] — null means "no grad clip
 # See ppo.py's pretrain_actor_bc() — PPOLearner's actor is a separate,
 # randomly-initialized network with no connection to the SFT VLA's
 # competence otherwise (see ppo_pi_config.py's docstring).
-ppo_actor_pretrain_steps: 0     # if >0, run this many BC steps on offline demos before PPO starts. 0 = disabled.
+ppo_actor_pretrain_steps: 1000     # if >0, run this many BC steps on offline demos before PPO starts. 0 = disabled.

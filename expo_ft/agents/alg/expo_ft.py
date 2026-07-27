@@ -1082,6 +1082,27 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
 
         demo_actions = batch["actions"]
 
+        def _per_action_dim_gap(diff: jnp.ndarray) -> jnp.ndarray:
+            """diff: (batch, full_action_dim) -> (action_dim,), one scalar per
+            PHYSICAL action channel (e.g. per joint / gripper for a
+            pd_joint_delta_pos task), not per flat (replan_step, channel)
+            slot. Un-flattens to (batch, replan_steps, action_dim) -- same
+            ordering already relied on elsewhere (e.g. sample_batch_actions'
+            `r_modified = r_samples.reshape(n_edit_samples, replan_steps,
+            action_dim)`) -- then takes the L2 norm over the replan_steps
+            axis (collapsing "which of the replan_steps timesteps" the same
+            way the aggregate bc_*_gap metrics already collapse the full
+            flat vector), and finally averages over the batch. Same L2-norm
+            units as bc_demo_vs_base_action_gap/bc_residual_vs_demo_gap --
+            summing every per-dim value's square and sqrt-ing would roughly
+            recover those (not exact: mean-of-norms != norm-of-means).
+            Static/concrete self.action_dim, self.replan_steps -> plain
+            Python unpacking below, no jax control flow involved."""
+            per_dim = jnp.linalg.norm(
+                diff.reshape(diff.shape[0], self.replan_steps, self.action_dim), axis=1
+            ).mean(axis=0)
+            return per_dim
+
         def bc_loss_fn(actor_params):
             dist = self.residual_actor.apply_fn(
                 {"params": actor_params}, observations, actions=base_actions,
@@ -1092,6 +1113,22 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             predicted_action = residual_scaled + base_actions
 
             bc_loss = jnp.mean(jnp.sum((predicted_action - demo_actions) ** 2, axis=-1))
+
+            # Per-channel breakdown: is the demo/base gap (and how much of it
+            # survives after the residual correction) concentrated on a few
+            # action channels -- e.g. gripper -- rather than spread evenly
+            # across all self.action_dim channels? If so, a single scalar
+            # edit_scale calibrated from the AGGREGATE gap (see
+            # rl_edit_scale's derivation comment in the task YAML) can leave
+            # specific channels structurally unable to close their share of
+            # the gap even though the aggregate looks "covered with margin".
+            demo_vs_base_per_dim = _per_action_dim_gap(demo_actions - base_actions)
+            residual_vs_demo_per_dim = _per_action_dim_gap(predicted_action - demo_actions)
+            per_dim_info = {}
+            for d in range(self.action_dim):
+                per_dim_info[f"bc_demo_vs_base_action_gap_dim{d}"] = demo_vs_base_per_dim[d]
+                per_dim_info[f"bc_residual_vs_demo_gap_dim{d}"] = residual_vs_demo_per_dim[d]
+
             return bc_loss, {
                 "bc_loss": bc_loss,
                 "bc_residual_norm": jnp.linalg.norm(residual_scaled, axis=-1).mean(),
@@ -1103,6 +1140,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
                 # squared-scale loss.
                 "bc_residual_vs_demo_gap": jnp.linalg.norm(predicted_action - demo_actions, axis=-1).mean(),
                 "base_action_resample_noise": base_action_resample_noise,
+                **per_dim_info,
             }
 
         grads, bc_info = jax.grad(bc_loss_fn, has_aux=True)(self.residual_actor.params)
