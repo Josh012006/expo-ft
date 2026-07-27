@@ -413,7 +413,23 @@ class PPOLearner(AgentLearner, struct.PyTreeNode):
             observations = jax.lax.with_sharding_constraint(observations, self.data_sharding)
 
             dist = self.actor.apply_fn({"params": params["actor"]}, observations, p=batch["states"])
-            log_probs = dist.log_prob(batch["actions"])
+            # Same tanh-boundary safety clip as pretrain_actor_bc's own loss
+            # (a comment here previously claimed this already existed --
+            # it didn't; that gap is why every gradient step was ending up
+            # NaN). dist.log_prob internally computes arctanh(action) for a
+            # Tanh-transformed distribution -- if an action is EXACTLY +-1.0
+            # (not just close: float32 rounds tanh(x) to exactly 1.0 for
+            # |x| gtrsim 9-10, well within reach of this project's
+            # log_std_max=2 default, std up to ~7.39), arctanh(+-1) is
+            # literally +-inf, and that's enough to make gradients NaN for
+            # the WHOLE minibatch even if only one action, in one
+            # dimension, of one timestep, happens to land there. Since
+            # batch["actions"] here are genuine rollout actions actually
+            # sampled and executed, this isn't a rare edge case -- across a
+            # whole rollout it's likely to happen often enough to explain
+            # why every single update was being skipped.
+            safe_actions = jnp.clip(batch["actions"], -1.0 + 1e-6, 1.0 - 1e-6)
+            log_probs = dist.log_prob(safe_actions)
             # Clip the LOG-ratio before exponentiating, not just the ratio
             # itself. surr1 below uses this raw `ratio` (only surr2 uses the
             # clip_eps-clipped version) — if the policy has drifted enough
@@ -475,9 +491,31 @@ class PPOLearner(AgentLearner, struct.PyTreeNode):
         params = {"actor": self.actor.params, "value": self.value.params, "batch_encoder": self.batch_encoder.params}
         grads, info = jax.grad(loss_fn, has_aux=True)(params)
 
-        actor = self.actor.apply_gradients(grads=grads["actor"])
-        value = self.value.apply_gradients(grads=grads["value"])
-        batch_encoder = self.batch_encoder.apply_gradients(grads=grads["batch_encoder"])
+        # Same NaN-guard as pretrain_actor_bc's own gradient application --
+        # skip ALL THREE updates together (params AND optimizer state
+        # untouched) rather than let a non-finite gradient corrupt the
+        # actor permanently. This matters more here than in
+        # pretrain_actor_bc: update_actor runs num_epochs times per rollout
+        # batch via jax.lax.scan, carrying the agent forward each iteration,
+        # so a single NaN gradient applied here poisons every subsequent
+        # epoch/minibatch's actor weights too -- and once the actor's
+        # params are NaN, every dist.sample() call in sample_actions()
+        # returns NaN, which is what env.step() ultimately raises on. This
+        # guard was present in pretrain_actor_bc but missing here, which is
+        # the actual gap that let this happen.
+        grad_is_finite = jnp.isfinite(optax.global_norm(grads))
+
+        def _apply(_):
+            actor = self.actor.apply_gradients(grads=grads["actor"])
+            value = self.value.apply_gradients(grads=grads["value"])
+            batch_encoder = self.batch_encoder.apply_gradients(grads=grads["batch_encoder"])
+            return actor, value, batch_encoder
+
+        def _skip(_):
+            return self.actor, self.value, self.batch_encoder
+
+        actor, value, batch_encoder = jax.lax.cond(grad_is_finite, _apply, _skip, operand=None)
+        info["grad_skipped"] = jnp.logical_not(grad_is_finite).astype(jnp.float32)
         info["actor_param_norm"] = optax.global_norm(actor.params)
         info["value_param_norm"] = optax.global_norm(value.params)
 
@@ -504,7 +542,12 @@ class PPOLearner(AgentLearner, struct.PyTreeNode):
         # rollout collected under exactly these params.
         encoded_obs = batch_encode(self.batch_encoder.apply_fn, self.batch_encoder.params, batch["observations"], stop_gradient=True)
         dist = self.actor.apply_fn({"params": self.actor.params}, encoded_obs, p=batch["states"])
-        old_log_probs = dist.log_prob(batch["actions"])
+        # Same tanh-boundary clip as loss_fn's own log_probs above -- see
+        # that comment. batch["actions"] are the actual rollout actions
+        # this policy sampled and executed, so they're exactly as exposed
+        # to landing on +-1.0 here as they are inside update_actor.
+        safe_actions = jnp.clip(batch["actions"], -1.0 + 1e-6, 1.0 - 1e-6)
+        old_log_probs = dist.log_prob(safe_actions)
         old_values = self.value.apply_fn({"params": self.value.params}, encoded_obs, p=batch["states"])[0]
 
         next_encoded_obs = batch_encode(self.batch_encoder.apply_fn, self.batch_encoder.params, batch["next_observations"], stop_gradient=True)

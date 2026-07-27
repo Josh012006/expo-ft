@@ -364,7 +364,23 @@ class GRPOLearner(AgentLearner, struct.PyTreeNode):
             observations = jax.lax.with_sharding_constraint(observations, self.data_sharding)
 
             dist = self.actor.apply_fn({"params": params["actor"]}, observations, p=batch["states"])
-            log_probs = dist.log_prob(batch["actions"])
+            # Same tanh-boundary safety clip as pretrain_actor_bc's own loss
+            # (missing here before, same gap found and fixed in ppo.py).
+            # dist.log_prob internally computes arctanh(action) for a
+            # Tanh-transformed distribution -- if an action is EXACTLY
+            # +-1.0 (float32 rounds tanh(x) to exactly 1.0 for |x| gtrsim
+            # 9-10, well within reach of this project's log_std_max=2
+            # default, std up to ~7.39), arctanh(+-1) is literally +-inf,
+            # enough to make gradients NaN for the whole minibatch even if
+            # only one action, in one dimension, of one timestep, lands
+            # there. batch["actions"] here are genuine rollout actions
+            # actually sampled and executed, so across a whole rollout this
+            # is likely common enough to explain every update being
+            # skipped, not a rare edge case. Used for BOTH log_probs and
+            # ref_log_probs below, since they're evaluated on the same
+            # underlying actions.
+            safe_actions = jnp.clip(batch["actions"], -1.0 + 1e-6, 1.0 - 1e-6)
+            log_probs = dist.log_prob(safe_actions)
             # Clip the LOG-ratio before exponentiating — same overflow risk
             # as PPO's surr1 (see ppo.py's comment): if the policy drifts
             # enough over several GRPO epochs, exp(log_probs -
@@ -382,7 +398,7 @@ class GRPOLearner(AgentLearner, struct.PyTreeNode):
             # log-ratio estimator, the standard low-variance GRPO KL estimator:
             # KL(pi || pi_ref) ~= exp(log_pi_ref - log_pi) - (log_pi_ref - log_pi) - 1).
             ref_dist = self.actor.apply_fn({"params": self.ref_actor_params}, observations, p=batch["states"])
-            ref_log_probs = ref_dist.log_prob(batch["actions"])
+            ref_log_probs = ref_dist.log_prob(safe_actions)
             log_ratio_ref = ref_log_probs - log_probs
             kl_penalty = (jnp.exp(log_ratio_ref) - log_ratio_ref - 1.0).mean()
 
@@ -415,8 +431,30 @@ class GRPOLearner(AgentLearner, struct.PyTreeNode):
         params = {"actor": self.actor.params, "batch_encoder": self.batch_encoder.params}
         grads, info = jax.grad(loss_fn, has_aux=True)(params)
 
-        actor = self.actor.apply_gradients(grads=grads["actor"])
-        batch_encoder = self.batch_encoder.apply_gradients(grads=grads["batch_encoder"])
+        # Same NaN-guard as pretrain_actor_bc's own gradient application --
+        # skip both updates together (params AND optimizer state untouched)
+        # rather than let a non-finite gradient corrupt the actor
+        # permanently. This matters more here than in pretrain_actor_bc:
+        # update_actor runs num_epochs times per rollout batch via
+        # jax.lax.scan, carrying the agent forward each iteration, so a
+        # single NaN gradient applied here poisons every subsequent
+        # epoch/minibatch's actor weights too -- and once the actor's
+        # params are NaN, every dist.sample() call in sample_actions()
+        # returns NaN, which is what env.step() ultimately raises on. This
+        # guard was present in pretrain_actor_bc but missing here (same gap
+        # found and fixed in ppo.py's update_actor).
+        grad_is_finite = jnp.isfinite(optax.global_norm(grads))
+
+        def _apply(_):
+            actor = self.actor.apply_gradients(grads=grads["actor"])
+            batch_encoder = self.batch_encoder.apply_gradients(grads=grads["batch_encoder"])
+            return actor, batch_encoder
+
+        def _skip(_):
+            return self.actor, self.batch_encoder
+
+        actor, batch_encoder = jax.lax.cond(grad_is_finite, _apply, _skip, operand=None)
+        info["grad_skipped"] = jnp.logical_not(grad_is_finite).astype(jnp.float32)
         info["actor_param_norm"] = optax.global_norm(actor.params)
 
         return self.replace(actor=actor, batch_encoder=batch_encoder), info
@@ -441,7 +479,12 @@ class GRPOLearner(AgentLearner, struct.PyTreeNode):
 
         encoded_obs = batch_encode(self.batch_encoder.apply_fn, self.batch_encoder.params, batch["observations"], stop_gradient=True)
         dist = self.actor.apply_fn({"params": self.actor.params}, encoded_obs, p=batch["states"])
-        old_log_probs = dist.log_prob(batch["actions"])
+        # Same tanh-boundary clip as loss_fn's own log_probs/ref_log_probs
+        # above -- see that comment. batch["actions"] are the actual
+        # rollout actions this policy sampled and executed, exactly as
+        # exposed to landing on +-1.0 here as inside update_actor.
+        safe_actions = jnp.clip(batch["actions"], -1.0 + 1e-6, 1.0 - 1e-6)
+        old_log_probs = dist.log_prob(safe_actions)
 
         advantages = compute_group_relative_advantage(batch["episode_returns"], self.group_size)
 
