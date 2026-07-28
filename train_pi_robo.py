@@ -130,6 +130,7 @@ def main(_):
             FLAGS.config.hidden_dims = tuple(cfg.ppo_hidden_dims)
         FLAGS.config.actor_pretrain_steps = int(getattr(cfg, "ppo_actor_pretrain_steps", FLAGS.config.actor_pretrain_steps))
         FLAGS.config.rollout_length = int(getattr(cfg, "ppo_rollout_length", FLAGS.config.rollout_length))
+        FLAGS.config.actor_log_std_min = float(getattr(cfg, "ppo_actor_log_std_min", FLAGS.config.actor_log_std_min))
     elif model_cls == "GRPOLearner":
         FLAGS.config.actor_lr     = float(getattr(cfg, "grpo_lr", FLAGS.config.actor_lr))
         FLAGS.config.group_size   = int(getattr(cfg, "grpo_group_size", FLAGS.config.group_size))
@@ -143,6 +144,7 @@ def main(_):
             FLAGS.config.hidden_dims = tuple(cfg.grpo_hidden_dims)
         FLAGS.config.actor_pretrain_steps = int(getattr(cfg, "grpo_actor_pretrain_steps", FLAGS.config.actor_pretrain_steps))
         FLAGS.config.rollout_length = int(getattr(cfg, "grpo_rollout_length", FLAGS.config.rollout_length))
+        FLAGS.config.actor_log_std_min = float(getattr(cfg, "grpo_actor_log_std_min", FLAGS.config.actor_log_std_min))
     elif model_cls == "SACLearner":
         FLAGS.config.actor_lr  = float(getattr(cfg, "sac_lr", FLAGS.config.actor_lr))
         FLAGS.config.critic_lr = float(getattr(cfg, "sac_lr", FLAGS.config.critic_lr))

@@ -191,6 +191,7 @@ class PPOLearner(AgentLearner, struct.PyTreeNode):
         value_clip_eps: Optional[float] = 0.2,
         value_loss_coef: float = 0.5,
         entropy_coef: float = 0.01,
+        actor_log_std_min: float = -5.0,
         max_grad_norm: Optional[float] = 0.5,
         num_minibatches: int = 4,
         use_pnorm: bool = False,
@@ -240,7 +241,18 @@ class PPOLearner(AgentLearner, struct.PyTreeNode):
         critic_states = jnp.expand_dims(states, axis=0)
 
         actor_base_cls = partial(MLP, hidden_dims=hidden_dims, dropout_rate=actor_drop, activate_final=True, use_pnorm=use_pnorm)
-        actor_dist_cls = TanhNormal(actor_base_cls, full_action_dim)
+        # log_std_min=-20 (the shared TanhNormal default, kept as-is for
+        # EXPOLearner/SAC) allows std down to exp(-20)~2e-9 -- a degenerate
+        # near-delta policy. A pure-MLE BC warm-start actively drives std
+        # there (unbounded log-likelihood as std->0, which is what
+        # bc_log_prob_mean climbing past +200 means), and at that floor
+        # d(log_prob)/dmu reaches ~1.7e18 per dimension; chain-ruled through
+        # the network and summed over action dims and minibatch samples that
+        # overflows float32 (max 3.4e38) to inf, and inf-inf gives the NaN
+        # gradients that made every PPO update get skipped. -5 keeps std >=
+        # ~6.7e-3, which caps that term around 1.6e5 -- comfortably finite --
+        # while still being far tighter than any policy this task needs.
+        actor_dist_cls = TanhNormal(actor_base_cls, full_action_dim, log_std_min=actor_log_std_min)
         actor_def = PixelTanhNormalMultiplexer(
             network_cls=actor_dist_cls, latent_dim=latent_dim_image, include_state=include_state,
             state_latent_dim=latent_dim_state,
@@ -378,6 +390,12 @@ class PPOLearner(AgentLearner, struct.PyTreeNode):
             return bc_loss, {
                 "bc_loss": bc_loss,
                 "bc_log_prob_mean": log_probs.mean(),
+                # Watch these: plain-MLE BC has no floor on std, so without the
+                # log_std_min guard it collapses toward a near-delta policy and
+                # bc_log_prob_mean climbs without bound. actor_std_min hitting
+                # exp(actor_log_std_min) means the floor is doing real work.
+                "actor_std_mean": dist.distribution.stddev().mean(),
+                "actor_std_min": dist.distribution.stddev().min(),
             }
 
         params = {"actor": self.actor.params, "batch_encoder": self.batch_encoder.params}

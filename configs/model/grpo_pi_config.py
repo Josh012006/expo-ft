@@ -50,4 +50,12 @@ def get_config():
     # compilation) stays constant across updates.
     config.rollout_length = 512
 
+
+    # Floor on the actor's log-std. Deliberately much tighter than the shared
+    # TanhNormal default of -20 (kept for EXPOLearner/SAC): at -20 a pure-MLE
+    # BC warm-start collapses std to ~2e-9, making log-prob gradients overflow
+    # float32 and every PPO/GRPO update NaN out. See the comment at the
+    # TanhNormal construction in ppo.py.
+    config.actor_log_std_min = -5.0
+
     return config

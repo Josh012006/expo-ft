@@ -99,6 +99,7 @@ ppo_value_loss_coef: 0.5        # value loss weight
 ppo_entropy_coef: 0.01          # entropy bonus weight
 ppo_num_minibatches: 4          # number of PPO minibatches per update
 ppo_rollout_length: 512      # number of consecutive transitions per on-policy rollout; each update consumes one such rollout (collected under the current policy) then discards it. Must be divisible by ppo_num_minibatches.
+ppo_actor_log_std_min: -5.0   # floor on the actor's log-std. Much tighter than the shared TanhNormal default (-20), which allows std ~2e-9: a pure-MLE BC warm-start collapses to that floor and makes log-prob gradients overflow float32, NaN-ing every update. Only affects PPO/GRPO; EXPOLearner/SAC keep -20.
 ppo_hidden_dims: [256, 256, 256]  # actor/critic MLP widths
 ppo_value_clip_eps: null          # Optional[float] — null means "no value clipping"; set e.g. 0.2 to enable
 ppo_max_grad_norm: null           # Optional[float] — null means "no grad clipping"; set e.g. 0.5 to enable

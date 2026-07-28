@@ -97,6 +97,7 @@ grpo_kl_coef: 0.04              # KL penalty weight
 grpo_entropy_coef: 0.01         # entropy bonus weight
 grpo_num_minibatches: 4         # number of GRPO minibatches per update
 grpo_rollout_length: 512      # number of consecutive transitions per on-policy rollout; each update consumes one such rollout (collected under the current policy) then discards it. Must be divisible by grpo_num_minibatches.
+grpo_actor_log_std_min: -5.0   # floor on the actor's log-std. Much tighter than the shared TanhNormal default (-20), which allows std ~2e-9: a pure-MLE BC warm-start collapses to that floor and makes log-prob gradients overflow float32, NaN-ing every update. Only affects PPO/GRPO; EXPOLearner/SAC keep -20.
 grpo_hidden_dims: [256, 256, 256]  # actor MLP widths
 grpo_max_grad_norm: null          # Optional[float] — null means "no grad clipping"; set e.g. 0.5 to enable
 
