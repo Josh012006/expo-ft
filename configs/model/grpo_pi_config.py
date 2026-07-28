@@ -41,4 +41,13 @@ def get_config():
     # (default; matches the pre-existing from-scratch-random-init behavior).
     config.actor_pretrain_steps = 0
 
+
+    # Number of consecutive transitions per on-policy rollout. Each update
+    # consumes exactly one such rollout, collected under the policy in force
+    # since the previous update, then discards it — see BatchProcessor's
+    # on_policy mode. Must be divisible by num_minibatches. Fixed rather than
+    # episode-length-driven so the batch shape (and therefore the JIT
+    # compilation) stays constant across updates.
+    config.rollout_length = 512
+
     return config

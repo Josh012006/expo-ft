@@ -441,8 +441,8 @@ class GRPOLearner(AgentLearner, struct.PyTreeNode):
         # epoch/minibatch's actor weights too -- and once the actor's
         # params are NaN, every dist.sample() call in sample_actions()
         # returns NaN, which is what env.step() ultimately raises on. This
-        # guard was present in pretrain_actor_bc but missing here (same gap
-        # found and fixed in ppo.py's update_actor).
+        # Defensive only: with a correct on-policy rollout this should
+        # never fire (see ppo.py's matching comment).
         grad_is_finite = jnp.isfinite(optax.global_norm(grads))
 
         def _apply(_):

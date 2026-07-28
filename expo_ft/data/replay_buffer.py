@@ -337,13 +337,33 @@ class PiReplayBuffer(Dataset):
         return episode_starts, episode_ends
     
     def sample_jax(self, batch_size: int, keys=None, data_sharding=None,
-                       hil_only: bool = False, success_only: bool = False):
+                       hil_only: bool = False, success_only: bool = False,
+                       indices=None):
+        """`indices`: if given, use exactly these buffer positions instead of
+        drawing random ones. Everything downstream (n-step reward packing,
+        next_* lookup, format conversion) is unchanged — this only replaces
+        HOW the positions are chosen.
+
+        This exists for ON-POLICY algorithms (PPO/GRPO), which mathematically
+        require a time-ordered rollout collected under the current policy:
+        GAE's backward recursion assumes consecutive timesteps, and the
+        importance ratio exp(log_pi - log_pi_old) is only meaningful when
+        pi_old actually is the policy that collected the actions. The default
+        uniform-random draw below is correct for off-policy learners
+        (EXPOLearner/SAC) and silently invalid for on-policy ones.
+        """
         assert len(self) >= self._replan_steps, "Replay buffer size must be greater than replan steps"
         if not hasattr(self, "rng"):
             self.rng = jax.random.PRNGKey(self._seed or 42)
 
         if keys is None:
             keys = self.dataset_dict.keys()
+
+        if indices is not None:
+            indices = np.asarray(indices)
+            batch_size = int(indices.shape[0])
+            jax_dataset_dict = {k: self.dataset_dict[k][indices] for k in keys}
+            return self._finalize_sample(jax_dataset_dict, indices, batch_size, keys)
 
         key, rng = jax.random.split(self.rng)
         max_start = len(self) - self._replan_steps
@@ -373,7 +393,13 @@ class PiReplayBuffer(Dataset):
         self.rng = rng
 
         jax_dataset_dict = {k: self.dataset_dict[k][indices] for k in keys}
+        return self._finalize_sample(jax_dataset_dict, indices, batch_size, keys)
 
+    def _finalize_sample(self, jax_dataset_dict, indices, batch_size, keys):
+        """Shared tail of sample_jax: n-step reward packing, next_* lookup and
+        JAX conversion. Identical for random and explicit-index sampling —
+        factored out so the on-policy path can reuse it verbatim rather than
+        duplicating (and drifting from) this logic."""
         next_indices = (indices + self._replan_steps) % self._capacity
 
         jax_dataset_dict.update(

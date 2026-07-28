@@ -129,6 +129,7 @@ def main(_):
         if hasattr(cfg, "ppo_hidden_dims"):
             FLAGS.config.hidden_dims = tuple(cfg.ppo_hidden_dims)
         FLAGS.config.actor_pretrain_steps = int(getattr(cfg, "ppo_actor_pretrain_steps", FLAGS.config.actor_pretrain_steps))
+        FLAGS.config.rollout_length = int(getattr(cfg, "ppo_rollout_length", FLAGS.config.rollout_length))
     elif model_cls == "GRPOLearner":
         FLAGS.config.actor_lr     = float(getattr(cfg, "grpo_lr", FLAGS.config.actor_lr))
         FLAGS.config.group_size   = int(getattr(cfg, "grpo_group_size", FLAGS.config.group_size))
@@ -141,6 +142,7 @@ def main(_):
         if hasattr(cfg, "grpo_hidden_dims"):
             FLAGS.config.hidden_dims = tuple(cfg.grpo_hidden_dims)
         FLAGS.config.actor_pretrain_steps = int(getattr(cfg, "grpo_actor_pretrain_steps", FLAGS.config.actor_pretrain_steps))
+        FLAGS.config.rollout_length = int(getattr(cfg, "grpo_rollout_length", FLAGS.config.rollout_length))
     elif model_cls == "SACLearner":
         FLAGS.config.actor_lr  = float(getattr(cfg, "sac_lr", FLAGS.config.actor_lr))
         FLAGS.config.critic_lr = float(getattr(cfg, "sac_lr", FLAGS.config.critic_lr))
@@ -291,6 +293,27 @@ def main(_):
     # Force zero demo contamination for these two model classes, regardless of
     # whatever offline_ratio happens to be set to in the task YAML.
     is_on_policy_algo = model_cls in ("PPOLearner", "GRPOLearner")
+    # Number of consecutive transitions per on-policy rollout. Fixed (rather
+    # than "however many the last episode happened to last") so the batch
+    # shape stays constant across updates — a varying shape would force JAX to
+    # recompile _update_jit on every single update. Unused by off-policy
+    # learners.
+    rollout_length = int(getattr(FLAGS.config, "rollout_length", 0) or 0)
+    if is_on_policy_algo:
+        if rollout_length <= 0:
+            raise ValueError(
+                f"model_cls={model_cls} is on-policy and requires rollout_length > 0 "
+                f"(set ppo_rollout_length / grpo_rollout_length in the task YAML)"
+            )
+        _nmb = int(getattr(FLAGS.config, "num_minibatches", 1) or 1)
+        if rollout_length % _nmb != 0:
+            # _update_jit asserts this too, but only once inside the traced
+            # update — failing here instead surfaces it before a long rollout
+            # collection phase has already been spent.
+            raise ValueError(
+                f"rollout_length ({rollout_length}) must be divisible by "
+                f"num_minibatches ({_nmb})"
+            )
     if is_on_policy_algo and getattr(cfg, "offline_ratio", 0.0) != 0:
         logging.warning(
             "model_cls=%s is on-policy — ignoring offline_ratio=%s from the task "
@@ -327,6 +350,13 @@ def main(_):
         actor_success_only=actor_success_only,
         use_dagger_hil_sampling=use_dagger_hil_sampling,
         dataset=None if is_on_policy_algo else dataset,
+        # PPO/GRPO need a contiguous, time-ordered rollout collected under the
+        # current policy, not a uniform random draw over the whole buffer
+        # history — see BatchProcessor's docstring. Off-policy learners keep
+        # the previous behavior exactly (on_policy=False).
+        on_policy=is_on_policy_algo,
+        rollout_length=rollout_length if is_on_policy_algo else 0,
+        replan_steps=cfg.replan_steps,
     )
 
     if is_on_policy_algo:
@@ -674,14 +704,25 @@ def main(_):
             batch_processor.insert_transition(transition_dict)
         
         can_update = training_log.ep_count >= 10 and i >= cfg.batch_size
-        if cfg.update_type == "step" and can_update:
+        # On-policy (PPO/GRPO): update exactly when one full fresh rollout has
+        # been collected, then discard it — NOT on the step/episode/batch
+        # cadence below, which pairs with uniform random replay sampling and
+        # would here either update on stale data or on a variable-length
+        # (recompilation-triggering) batch. cfg.update_type/num_updates are
+        # deliberately ignored in this branch.
+        if is_on_policy_algo:
+            if can_update and batch_processor.rollout_ready():
+                run_agent_updates(1, step_metrics)
+        elif cfg.update_type == "step" and can_update:
             run_agent_updates(cfg.num_updates, step_metrics)
 
         if done:
             batch_processor.on_episode_done(success)
             env.reset()
 
-            if cfg.update_type == "episode" and can_update:
+            if is_on_policy_algo:
+                pass  # rollout-driven, handled above
+            elif cfg.update_type == "episode" and can_update:
                 for _ in tqdm.tqdm(range(cfg.num_updates)):
                     run_agent_updates(1, step_metrics)
             elif cfg.update_type == "batch" and can_update:

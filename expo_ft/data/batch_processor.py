@@ -1,5 +1,6 @@
 """BatchProcessor: fetches and mixes training batches from replay buffers."""
 import jax
+import numpy as np
 
 from expo_ft.agents import restore_replay_buffer
 from expo_ft.data.replay_buffer import PiReplayBuffer
@@ -13,6 +14,14 @@ class BatchProcessor:
     - online only (offline_ratio=0): all samples from the online replay buffer
     - mixed (0 < offline_ratio < 1): shuffled online + offline critic batches
     - BCLearner (use_dagger_hil_sampling): critic batch from replay; actor from HIL chunks
+    - ON-POLICY (on_policy=True, for PPO/GRPO): a contiguous, time-ordered
+      rollout of exactly `rollout_length` transitions collected under the
+      CURRENT policy, consumed once then discarded. The three modes above all
+      draw uniformly at random across the whole buffer history — correct for
+      off-policy learners, mathematically invalid for PPO/GRPO (GAE's backward
+      recursion needs consecutive timesteps, and the importance ratio
+      exp(log_pi - log_pi_old) is only meaningful when pi_old really is the
+      policy that collected the actions).
     """
     def __init__(
         self,
@@ -25,6 +34,9 @@ class BatchProcessor:
         actor_success_only: bool,
         use_dagger_hil_sampling: bool,  # True for BCLearner: actor batch from HIL chunks only
         dataset=None,
+        on_policy: bool = False,
+        rollout_length: int = 0,
+        replan_steps: int = 1,
     ):
         if dataset is not None:
             # offline_ratio=0: seed demos into the online replay buffer only.
@@ -40,6 +52,35 @@ class BatchProcessor:
         self.offline_ratio = offline_ratio
         self.actor_success_only = actor_success_only
         self.use_dagger_hil_sampling = use_dagger_hil_sampling
+        self.on_policy = on_policy
+        self.rollout_length = int(rollout_length)
+        self.replan_steps = int(replan_steps)
+        # Transitions collected since the last update. Reset to 0 on every
+        # next_batch() so each update consumes a rollout gathered entirely
+        # under the policy in force since the previous update.
+        self._rollout_count = 0
+
+        if on_policy:
+            if self.rollout_length <= 0:
+                raise ValueError("on_policy=True requires rollout_length > 0")
+            # Need rollout_length usable starts PLUS replan_steps of lookahead
+            # so every sampled index has a valid next_* target that is itself
+            # part of this same freshly-collected rollout (rather than stale
+            # data from a previous policy, or positions not yet written).
+            needed = self.rollout_length + self.replan_steps
+            if needed > replay_buffer._capacity:
+                raise ValueError(
+                    f"rollout_length ({self.rollout_length}) + replan_steps "
+                    f"({self.replan_steps}) exceeds replay buffer capacity "
+                    f"({replay_buffer._capacity})"
+                )
+            # Deliberately skip building the random-sampling iterators below:
+            # in on-policy mode they'd be both unused and misleading.
+            self.replay_iterator = None
+            self.offline_iterator = None
+            self.hil_iterator = None
+            self._ep_buffer_start = replay_buffer._insert_index
+            return
 
         replay_batch_multiplier = 1.0 if use_dagger_hil_sampling else (1 - offline_ratio)
         self.replay_iterator = replay_buffer.get_iterator(
@@ -73,6 +114,13 @@ class BatchProcessor:
 
     def insert_transition(self, transition_dict):
         self.replay_buffer.insert(transition_dict)
+        if self.on_policy:
+            self._rollout_count += 1
+
+    def rollout_ready(self):
+        """On-policy only: True once enough fresh transitions have been
+        collected under the current policy to form one complete rollout."""
+        return self.on_policy and self._rollout_count >= (self.rollout_length + self.replan_steps)
 
     def on_episode_start(self):
         self._ep_buffer_start = self.replay_buffer._insert_index
@@ -91,6 +139,28 @@ class BatchProcessor:
 
     def next_batch(self, combine_rng):
         """Return (critic_batch, actor_batch, new_rng) for one update step."""
+        if self.on_policy:
+            # Take the last (rollout_length + replan_steps) transitions and use
+            # the first rollout_length of them as batch positions, so every
+            # index's next_* lookup (indices + replan_steps) lands inside this
+            # same rollout. Indices are consecutive and in collection order —
+            # exactly what GAE's backward recursion assumes.
+            capacity = self.replay_buffer._capacity
+            end = self.replay_buffer._insert_index
+            start = (end - self.rollout_length - self.replan_steps) % capacity
+            indices = (start + np.arange(self.rollout_length)) % capacity
+
+            raw = self.replay_buffer.sample_jax(
+                batch_size=self.rollout_length, indices=indices
+            )
+            batch = self.replay_buffer._convert_to_openpi_format(raw)
+            batch = self.replay_buffer.apply_data_sharding(batch, self.data_sharding)
+            # Consumed: the next update must wait for a rollout gathered under
+            # the policy this update is about to produce. This is what makes
+            # the data genuinely on-policy rather than merely recent.
+            self._rollout_count = 0
+            return batch, None, combine_rng
+
         if self.use_dagger_hil_sampling or self.offline_ratio == 0:
             batch = next(self.replay_iterator)
             new_rng = combine_rng
