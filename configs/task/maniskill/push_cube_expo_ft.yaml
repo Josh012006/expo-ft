@@ -12,6 +12,7 @@ max_episode_steps: 120
 env_type: "sim"  # "sim" for simulation, "droid" for real robot
 env_wrapper: "maniskill"  # "maniskill" ou "droid" (real robot)
 sim_backend: "physx_cpu"
+reward_mode: "sparse"           # gym.make() never set this before -> ManiSkill defaulted to "normalized_dense" (dense, shaped, per-step reward, NOT sparse 0/1). Kept in sync across all Environment sections per this file's own note.
 
 # Control mode config
 control_mode: "pd_joint_delta_pos"
@@ -65,7 +66,7 @@ max_episodes: 1000
 max_steps_per_episode: 120
 batch_size: 24             # number of transitions sampled from replay buffer per gradient update
 utd_ratio: 2              # gradient updates performed per new transition collected
-offline_ratio: 0.7         # fraction of batch from offline demo buffer (0 = demos inserted into online buffer)
+offline_ratio: 0.5         # fraction of batch from offline demo buffer (0 = demos inserted into online buffer)
 update_type: "episode"     # when to trigger updates: "episode", "step", or "batch"
 num_updates: 1             # number of gradient updates per trigger
 num_batch: 1               # number of episodes to accumulate before updating (only used when update_type="batch")
@@ -127,6 +128,7 @@ rl_num_atoms: 101               # number of fixed support bins for the categoric
 rl_v_min: -10.0                 # lower bound of the critic's fixed support (normalized reward units)
 rl_v_max: 20.0                  # upper bound of the critic's fixed support (normalized reward units)
 rl_reward_scale_decay: 0.99     # EMA decay for the running reward-RMS estimate; higher = slower-adapting, more stable
+rl_use_reward_normalization: false  # with a low success rate, this rescaling can inflate the reward for rare successes rather than stabilize it -- testing with it off, paired with reward_mode=sparse above
 
 # ── KL regularization for the edit policy (XQCfD-style) ────────────────
 # Replaces the generic entropy bonus with a penalty for the edit

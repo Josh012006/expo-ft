@@ -29,6 +29,7 @@ def get_config():
     config.v_min = -10.0
     config.v_max = 20.0
     config.reward_scale_decay = 0.99  # EMA decay for the running reward-RMS estimate; higher = slower-adapting, more stable
+    config.use_reward_normalization = True  # set False to feed raw rewards straight into the Bellman projection, bypassing the RMS rescaling entirely
 
     # XQCfD-style KL regularization for the edit/residual policy (replaces
     # the generic entropy bonus with a penalty for deviating from a fixed

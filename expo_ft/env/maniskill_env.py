@@ -42,6 +42,7 @@ class ManiSkillEnvWrapper:
             cfg.env_id,
             obs_mode="rgb",
             control_mode=cfg.control_mode,
+            reward_mode=getattr(cfg, 'reward_mode', 'sparse'),
             num_envs=1,
             max_episode_steps=cfg.max_episode_steps,
             robot_uids=getattr(cfg, 'robot_uids', 'panda_wristcam'),

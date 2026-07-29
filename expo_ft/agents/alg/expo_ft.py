@@ -262,6 +262,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
     v_max: float = struct.field(pytree_node=False)
     atoms: jnp.ndarray  # fixed support values, e.g. linspace(v_min, v_max, num_atoms) — a pytree leaf (JAX arrays can't be static/hashable fields), but never trained, never changes after create()
     reward_scale_decay: float = struct.field(pytree_node=False)
+    use_reward_normalization: bool = struct.field(pytree_node=False)  # if False, skip the RMS rescaling entirely and feed raw batch["rewards"] straight into the Bellman projection -- see update_critic()
     kl_coef: float = struct.field(pytree_node=False)  # XQCfD-style KL-to-reference regularization for the edit policy; 0.0 = disabled (default), matches pre-existing entropy-only behavior
     kl_ref_std: float = struct.field(pytree_node=False)  # std of the fixed N(0, kl_ref_std) reference in pre-tanh space
     reward_ms: jnp.ndarray  # running mean-square of rewards (EMA), used to normalize rewards before the Bellman projection so the FIXED [v_min, v_max] support stays meaningful regardless of a task's absolute reward scale — see update_critic()
@@ -323,6 +324,12 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         v_min: float = -10.0,
         v_max: float = 20.0,
         reward_scale_decay: float = 0.99,
+        # Jesse's catch (July 2026): with a low success rate, reward_ms
+        # shrinks, which shrinks reward_scale, which INFLATES the normalized
+        # reward for the rare successes that remain -- a potential vicious
+        # cycle riding on top of whatever else is going on. Set False to
+        # bypass this rescaling entirely (raw batch["rewards"] used as-is).
+        use_reward_normalization: bool = True,
         # XQCfD-style KL regularization for the edit/residual policy,
         # replacing (when enabled) the generic entropy bonus with a penalty
         # for deviating from a fixed N(0, kl_ref_std) reference in pre-tanh
@@ -612,6 +619,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             v_max=v_max,
             atoms=atoms,
             reward_scale_decay=reward_scale_decay,
+            use_reward_normalization=use_reward_normalization,
             kl_coef=kl_coef,
             kl_ref_std=kl_ref_std,
             reward_ms=reward_ms,
@@ -1277,7 +1285,15 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         # regardless of this task's absolute reward scale — see create()'s
         # docstring for reward_scale_decay. Uses the scale from BEFORE this
         # batch updates it (below), so there's no within-batch leakage.
-        reward_scale = jnp.sqrt(self.reward_ms + 1e-6)
+        # If use_reward_normalization=False, skip this entirely (scale=1.0,
+        # raw rewards passed straight through) -- avoids the vicious-cycle
+        # risk Jesse flagged: reward_ms shrinking as success rate drops would
+        # otherwise INFLATE the normalized reward for the rare successes that
+        # remain, rather than keeping it stable.
+        if self.use_reward_normalization:
+            reward_scale = jnp.sqrt(self.reward_ms + 1e-6)
+        else:
+            reward_scale = jnp.array(1.0)
         normalized_rewards = batch["rewards"] / reward_scale
 
         discount_k = self.discount ** self.replan_steps

@@ -105,6 +105,7 @@ def main(_):
         FLAGS.config.v_min = float(getattr(cfg, "rl_v_min", FLAGS.config.v_min))
         FLAGS.config.v_max = float(getattr(cfg, "rl_v_max", FLAGS.config.v_max))
         FLAGS.config.reward_scale_decay = float(getattr(cfg, "rl_reward_scale_decay", FLAGS.config.reward_scale_decay))
+        FLAGS.config.use_reward_normalization = bool(getattr(cfg, "rl_use_reward_normalization", FLAGS.config.use_reward_normalization))
         FLAGS.config.kl_coef = float(getattr(cfg, "rl_kl_coef", FLAGS.config.kl_coef))
         FLAGS.config.entropy_scale = float(getattr(cfg, "rl_entropy_scale", FLAGS.config.entropy_scale))
         FLAGS.config.kl_ref_std = float(getattr(cfg, "rl_kl_ref_std", FLAGS.config.kl_ref_std))
