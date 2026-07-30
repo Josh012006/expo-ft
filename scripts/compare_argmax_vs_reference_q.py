@@ -258,16 +258,35 @@ def main():
         # hoisted out of the loop) since it depends on THIS checkpoint's own
         # batch_encoder params, same as sample_batch_actions above. No
         # next_-hack needed for states/critic_states -- those are already
-        # the genuine current-state fields. ──
+        # the genuine current-state fields.
+        #
+        # _compute_q_split's signature itself differs by architecture:
+        # EXPOLearner (categorical, BatchNorm) takes batch_stats as a
+        # required arg; EXPOLearnerOld (MSE/REDQ, no BatchNorm at all) has no
+        # batch_stats field on its target_critic TrainState and takes one
+        # fewer argument. Branch on hasattr() rather than trusting model_cls
+        # from the YAML, so this stays correct regardless of how the agent
+        # object was actually constructed. ──
         encoded_obs = agent._encode_observations(batch["observations"], stop_gradient=True)
-        q_agent_pick = agent._compute_q_split(
-            agent.target_critic.apply_fn, agent.target_critic.params, agent.target_critic.batch_stats,
-            encoded_obs, agent_actions, batch["critic_states"],
-        )
-        q_reference = agent._compute_q_split(
-            agent.target_critic.apply_fn, agent.target_critic.params, agent.target_critic.batch_stats,
-            encoded_obs, reference_actions, batch["critic_states"],
-        )
+        has_batch_stats = hasattr(agent.target_critic, "batch_stats")
+        if has_batch_stats:
+            q_agent_pick = agent._compute_q_split(
+                agent.target_critic.apply_fn, agent.target_critic.params, agent.target_critic.batch_stats,
+                encoded_obs, agent_actions, batch["critic_states"],
+            )
+            q_reference = agent._compute_q_split(
+                agent.target_critic.apply_fn, agent.target_critic.params, agent.target_critic.batch_stats,
+                encoded_obs, reference_actions, batch["critic_states"],
+            )
+        else:
+            q_agent_pick = agent._compute_q_split(
+                agent.target_critic.apply_fn, agent.target_critic.params,
+                encoded_obs, agent_actions, batch["critic_states"],
+            )
+            q_reference = agent._compute_q_split(
+                agent.target_critic.apply_fn, agent.target_critic.params,
+                encoded_obs, reference_actions, batch["critic_states"],
+            )
 
         q_agent_pick = np.asarray(q_agent_pick).reshape(-1)
         q_reference = np.asarray(q_reference).reshape(-1)
