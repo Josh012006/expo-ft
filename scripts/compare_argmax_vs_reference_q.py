@@ -66,6 +66,7 @@ def main():
     from expo_ft.data.replay_buffer import create_replay_buffer
     from expo_ft.env.droid_utils import process_droid_dataset
     from expo_ft.agents.alg.batch_utils import prepare_critic_batch, prepare_actor_sampling_batch_current
+    from expo_ft.networks.ensemble import subsample_image_ensemble
 
     cfg = load_task_config(args.config)
     cfg.normalize_action = True
@@ -279,12 +280,30 @@ def main():
                 encoded_obs, reference_actions, batch["critic_states"],
             )
         else:
+            # EXPOLearnerOld's _compute_q_split(..., num_min_qs=self.num_min_qs)
+            # expects critic_params to ALREADY be subsampled down to
+            # num_min_qs networks -- every internal caller in expo_ft_old.py
+            # (update_critic, sample_batch_actions) calls
+            # subsample_image_ensemble() first and only ever passes the
+            # subsampled result in. agent.target_critic.params holds the FULL
+            # num_qs=10 ensemble as restored from the checkpoint; passing it
+            # straight into _compute_q_split with num_min_qs=2 mismatches
+            # nn.vmap's axis_size (2) against the actual params' leading
+            # ensemble dim (10) -- "got (2,) and (10,)". Subsample ONCE and
+            # reuse for both calls below, so the agent's pick and the
+            # reference action are scored by the EXACT SAME 2-of-10 subset --
+            # scoring them under two independently-drawn subsets would mix
+            # real signal with pure ensemble-sampling noise.
+            subsample_key = jax.random.PRNGKey(args.seed + 2)
+            subsampled_params = subsample_image_ensemble(
+                subsample_key, agent.target_critic.params, agent.num_min_qs, agent.num_qs,
+            )
             q_agent_pick = agent._compute_q_split(
-                agent.target_critic.apply_fn, agent.target_critic.params,
+                agent.target_critic.apply_fn, subsampled_params,
                 encoded_obs, agent_actions, batch["critic_states"],
             )
             q_reference = agent._compute_q_split(
-                agent.target_critic.apply_fn, agent.target_critic.params,
+                agent.target_critic.apply_fn, subsampled_params,
                 encoded_obs, reference_actions, batch["critic_states"],
             )
 

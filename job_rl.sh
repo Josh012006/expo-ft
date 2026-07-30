@@ -31,3 +31,15 @@ python3 scripts/run_pipeline.py \
     --config "$CONFIG" \
     --stage rl \
     ${SFT_CHECKPOINT:+--sft-checkpoint "$SFT_CHECKPOINT"}
+
+# Chained AFTER the line above returns -- by then both run_pipeline.py and
+# its train_pi_robo.py child have fully exited, releasing the GPU memory
+# XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 held for their entire process lifetime.
+# Running eval_curve.py while training's own process was still alive (just
+# blocked waiting on it) starved every eval subprocess of GPU memory -- this
+# is why the sweep is chained here at the shell level instead of called
+# in-process from within train_pi_robo.py itself.
+HANDOFF="logs/eval_curve_handoff_${SLURM_JOB_ID}.json"
+if [ -f "$HANDOFF" ]; then
+    python3 scripts/run_eval_curve_from_handoff.py --handoff "$HANDOFF"
+fi

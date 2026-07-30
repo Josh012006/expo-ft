@@ -1,5 +1,6 @@
 #! /usr/bin/env python
 import os
+import json
 import logging
 import time
 from collections import deque
@@ -22,7 +23,6 @@ from expo_ft.env.droid_utils import process_droid_dataset
 from expo_ft.utils.log_utils import EpisodeState, TrainingStats
 from expo_ft.utils.train_utils import get_batch_info, init_logging, init_wandb
 from expo_ft.utils.config_loader import load_task_config, resolve_run_dir
-from expo_ft.utils.eval_curve_runner import run_eval_curve, log_eval_curve_to_wandb
 
 
 import openpi.training.sharding as openpi_sharding
@@ -801,19 +801,32 @@ def main(_):
         checkpoint_manager.wait_until_finished()
 
         if eval_curve_enabled:
-            # Training is fully done and its checkpoints are flushed to disk
-            # -- the GPU is free, so run the 200-fixed-seed sweep right here,
-            # synchronously, on every checkpoint keep_period left behind.
-            logging.info("[eval_curve] Training done -- running the rigorous 200-seed eval sweep "
-                         "before exiting (this adds real wall-clock time; see eval_curve_runner.py).")
-            ok = run_eval_curve(
-                config_path=FLAGS.task_config,
-                checkpoints_dir=checkpoint_dir,
-                n_episodes=getattr(cfg, "eval_curve_n_episodes", 200),
-                start_checkpoint=eval_curve_start_checkpoint,
+            # NOT run in-process here: XLA_PYTHON_CLIENT_MEM_FRACTION
+            # preallocation is held for THIS process's entire lifetime, not
+            # released just because the training loop itself is done --
+            # calling eval_curve.py via subprocess while this process is
+            # still alive (blocked waiting on it) starves every eval
+            # subprocess of GPU memory (observed: every one OOM'd trying to
+            # allocate ~1GB more, with this process still shown holding
+            # ~78GB). Instead, write a handoff file for job_rl.sh to pick up
+            # via scripts/run_eval_curve_from_handoff.py -- run as a
+            # genuinely separate process AFTER this one has fully exited.
+            handoff = {
+                "task_config": FLAGS.task_config,
+                "checkpoints_dir": checkpoint_dir,
+                "n_episodes": getattr(cfg, "eval_curve_n_episodes", 200),
+                "start_checkpoint": eval_curve_start_checkpoint,
+                "wandb_project": cfg.project_name,
+                "wandb_run_id": wandb.run.id,
+            }
+            handoff_path = os.path.join(
+                "logs", f"eval_curve_handoff_{os.environ.get('SLURM_JOB_ID', 'local')}.json"
             )
-            if ok:
-                log_eval_curve_to_wandb(checkpoint_dir)
+            os.makedirs("logs", exist_ok=True)
+            with open(handoff_path, "w") as f:
+                json.dump(handoff, f, indent=2)
+            logging.info(f"[eval_curve] Wrote handoff file: {handoff_path} "
+                         f"-- job_rl.sh runs the actual sweep after this process exits.")
 
 
 if __name__ == "__main__":
