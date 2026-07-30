@@ -22,6 +22,7 @@ from expo_ft.env.droid_utils import process_droid_dataset
 from expo_ft.utils.log_utils import EpisodeState, TrainingStats
 from expo_ft.utils.train_utils import get_batch_info, init_logging, init_wandb
 from expo_ft.utils.config_loader import load_task_config, resolve_run_dir
+from expo_ft.utils.eval_curve_runner import run_eval_curve, log_eval_curve_to_wandb
 
 
 import openpi.training.sharding as openpi_sharding
@@ -648,6 +649,18 @@ def main(_):
             for k, v in update_info.items():
                 metrics[f"training/{k}"] = v
 
+    # Rigorous 200-fixed-seed eval curve, run synchronously AFTER training
+    # finishes (see the note above run_eval_curve for why: same node/GPU,
+    # sequential not parallel, no separate job to track).
+    eval_curve_enabled = getattr(cfg, "eval_curve_enabled", False)
+    if eval_curve_enabled:
+        # pi05_weight_loader_path is the SFT checkpoint's "params" dir (what
+        # the weight LOADER needs); --start-checkpoint wants the STEP dir one
+        # level up (what eval_curve.py/eval_policy.py's --rl-checkpoint
+        # convention expects) -- strip a trailing "params" component.
+        _sft_ckpt = str(FLAGS.config.pi05_weight_loader_path or "")
+        eval_curve_start_checkpoint = _sft_ckpt[: -len("/params")] if _sft_ckpt.endswith("/params") else _sft_ckpt
+
     for i in tqdm.tqdm(
         range(start_step, cfg.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm
     ):
@@ -786,6 +799,21 @@ def main(_):
         logging.info("Waiting for checkpoint manager to finish")
         tb_writer.close()
         checkpoint_manager.wait_until_finished()
+
+        if eval_curve_enabled:
+            # Training is fully done and its checkpoints are flushed to disk
+            # -- the GPU is free, so run the 200-fixed-seed sweep right here,
+            # synchronously, on every checkpoint keep_period left behind.
+            logging.info("[eval_curve] Training done -- running the rigorous 200-seed eval sweep "
+                         "before exiting (this adds real wall-clock time; see eval_curve_runner.py).")
+            ok = run_eval_curve(
+                config_path=FLAGS.task_config,
+                checkpoints_dir=checkpoint_dir,
+                n_episodes=getattr(cfg, "eval_curve_n_episodes", 200),
+                start_checkpoint=eval_curve_start_checkpoint,
+            )
+            if ok:
+                log_eval_curve_to_wandb(checkpoint_dir)
 
 
 if __name__ == "__main__":

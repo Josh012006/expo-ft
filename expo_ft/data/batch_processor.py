@@ -82,10 +82,25 @@ class BatchProcessor:
             self._ep_buffer_start = replay_buffer._insert_index
             return
 
-        replay_batch_multiplier = 1.0 if use_dagger_hil_sampling else (1 - offline_ratio)
+        # total_bs MUST end up divisible by utd_ratio (== batch_size exactly,
+        # per-utd-step) -- computing online_bs/offline_bs independently via
+        # two separate int()/round() truncations does NOT guarantee their sum
+        # equals total_bs for an arbitrary offline_ratio (e.g. batch_size=24,
+        # utd_ratio=2, offline_ratio=0.7 -> int(48*0.3)=14, int(48*0.7)=33,
+        # sum=47 != 48). Only offline_ratio=0.5 happened to divide evenly by
+        # luck, which is why this went unnoticed until a different ratio was
+        # tried. Fix: round ONE side, derive the other as the complement of
+        # the fixed total -- guarantees exact sum regardless of offline_ratio.
+        total_bs = batch_size * utd_ratio
+        if use_dagger_hil_sampling or offline_ratio == 0:
+            online_bs, offline_bs = total_bs, 0
+        else:
+            offline_bs = round(total_bs * offline_ratio)
+            online_bs = total_bs - offline_bs
+
         self.replay_iterator = replay_buffer.get_iterator(
             sample_args={
-                "batch_size": int(batch_size * utd_ratio * replay_batch_multiplier),
+                "batch_size": online_bs,
             },
             data_sharding=data_sharding,
         )
@@ -94,7 +109,7 @@ class BatchProcessor:
         if offline_ratio > 0 and not use_dagger_hil_sampling:
             self.offline_iterator = offline_replay_buffer.get_iterator(
                 sample_args={
-                    "batch_size": int(batch_size * utd_ratio * offline_ratio),
+                    "batch_size": offline_bs,
                 },
                 data_sharding=data_sharding,
             )

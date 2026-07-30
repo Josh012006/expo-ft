@@ -50,8 +50,19 @@ def resolve_run_dir(cfg: SimpleNamespace, resume_dir: str | None = None, suffix:
         run_dir = resume_dir
         resuming = True
     else:
+        # Second-level timestamp alone isn't unique enough: two jobs launched
+        # in the same wall-clock second (e.g. submitting an old-critic run
+        # and a new-critic run back to back for comparison) get an IDENTICAL
+        # run_dir, and os.makedirs(..., exist_ok=True) silently lets both
+        # write into the same checkpoint folder -- causing concurrent-write
+        # races in orbax's OCDBT backend (manifest.ocdbt rename/ENOENT
+        # errors). Disambiguate with the SLURM job ID when present (no two
+        # jobs ever share one, and it's also the most useful thing to see in
+        # a directory listing); fall back to microsecond precision locally.
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        run_name = f"{cfg.run_name}_{timestamp}"
+        job_id = os.environ.get("SLURM_JOB_ID")
+        disambiguator = job_id if job_id else datetime.now().strftime("%f")
+        run_name = f"{cfg.run_name}_{timestamp}-{disambiguator}"
         if suffix:
             run_name = f"{run_name}_{suffix}"
         run_dir = os.path.join(cfg.output_dir, run_name)
