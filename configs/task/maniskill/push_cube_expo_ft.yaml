@@ -94,7 +94,7 @@ max_to_keep: 1
 eval_curve_enabled: true
 eval_curve_n_episodes: 200  # must match the SFT sweep's --n-episodes for the seeds to line up
 
-
+success_rate_window: 200        # eval/success_rate: episodes to average over; nothing is logged until this many have completed (see train_pi_robo.py)
 
 actor_success_only: true        # if true, actor batch is sampled only from successful transitions
 

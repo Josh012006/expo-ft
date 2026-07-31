@@ -750,13 +750,27 @@ def main(_):
 
             training_log.on_episode_done(episode_log, success, step_metrics)
             
-            # Rolling success rate over last 20 episodes
+            # Rolling success rate over the last success_rate_window episodes
+            # (YAML-driven, not hardcoded -- so a run's own config is the
+            # single source of truth, not a name typed in by hand). Nothing
+            # is logged under eval/success_rate at all until the window is
+            # genuinely full: a partial window (e.g. after 1 episode) can
+            # ONLY read exactly 0.0 or 1.0 regardless of the true underlying
+            # rate -- not a calculation bug, just what a 1-sample mean is
+            # mathematically forced to be -- and there's no principled prior
+            # to substitute in its place that wouldn't itself need
+            # justifying per task. Skipping those early points entirely
+            # keeps every logged value held to the exact same standard for
+            # the whole run, rather than looking better-calibrated later
+            # than it was at the start.
+            success_rate_window = getattr(cfg, "success_rate_window", 200)
             if not hasattr(training_log, '_success_window'):
                 training_log._success_window = []
             training_log._success_window.append(float(success))
-            if len(training_log._success_window) > 20:
+            if len(training_log._success_window) > success_rate_window:
                 training_log._success_window.pop(0)
-            step_metrics["eval/success_rate"] = np.mean(training_log._success_window)
+            if len(training_log._success_window) >= success_rate_window:
+                step_metrics["eval/success_rate"] = np.mean(training_log._success_window)
             
             episode_log.reset()
             batch_processor.on_episode_start()
