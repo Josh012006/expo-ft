@@ -1,6 +1,5 @@
 #! /usr/bin/env python
 import os
-import json
 import logging
 import time
 from collections import deque
@@ -649,17 +648,102 @@ def main(_):
             for k, v in update_info.items():
                 metrics[f"training/{k}"] = v
 
-    # Rigorous 200-fixed-seed eval curve, run synchronously AFTER training
-    # finishes (see the note above run_eval_curve for why: same node/GPU,
-    # sequential not parallel, no separate job to track).
-    eval_curve_enabled = getattr(cfg, "eval_curve_enabled", False)
-    if eval_curve_enabled:
-        # pi05_weight_loader_path is the SFT checkpoint's "params" dir (what
-        # the weight LOADER needs); --start-checkpoint wants the STEP dir one
-        # level up (what eval_curve.py/eval_policy.py's --rl-checkpoint
-        # convention expects) -- strip a trailing "params" component.
-        _sft_ckpt = str(FLAGS.config.pi05_weight_loader_path or "")
-        eval_curve_start_checkpoint = _sft_ckpt[: -len("/params")] if _sft_ckpt.endswith("/params") else _sft_ckpt
+    # =====================================================================
+    # Priming phase: evaluate the STARTING model on success_rate_window real
+    # episodes, BEFORE any weight updates. Deliberately kept OUTSIDE
+    # cfg.max_steps' budget -- its own step counter, never touches `i` or
+    # the training budget below.
+    #
+    # Logged at NEGATIVE wandb steps, counting UP toward (but never
+    # reaching) 0 -- confirmed necessary, not just cosmetic: tested directly
+    # (offline wandb run, raw datastore inspection) that logging at a step
+    # value at or below one wandb has already auto-incremented past causes
+    # that entire row to be SILENTLY DROPPED, for every key in it, custom
+    # step_metric or not. So priming's range and the main loop's range
+    # (starting at 0) must never overlap or touch.
+    #
+    # The starting value itself is meaningful, not arbitrary: -(success_rate
+    # _window * cfg.max_episode_steps) is the worst-case number of raw env
+    # steps priming could need (every episode timing out at the full
+    # horizon rather than ending early on success) -- e.g. -24000 for
+    # push_cube (window=200, max_episode_steps=120). Priming almost always
+    # finishes well before reaching 0, so reading e.g. -18000 at completion
+    # directly says "used 6000 of a 24000 worst-case budget."
+    #
+    # Skipped entirely when resuming: the model already has real training
+    # history; _success_window is a plain in-memory list (not part of the
+    # checkpoint) so it isn't "empty" in any meaningful sense on resume,
+    # there's just nothing to reconstruct it from -- re-priming would
+    # needlessly redo real training time.
+    success_rate_window = getattr(cfg, "success_rate_window", 200)
+    training_log._success_window = []
+
+    if not resuming and success_rate_window > 0:
+        logging.info(f"[priming] Evaluating the starting model on {success_rate_window} real "
+                     f"episodes before any weight updates (separate from cfg.max_steps budget)...")
+        priming_step = -(success_rate_window * cfg.max_episode_steps)
+        priming_pbar = tqdm.tqdm(total=success_rate_window, desc="priming", disable=not FLAGS.tqdm)
+
+        while len(training_log._success_window) < success_rate_window:
+            priming_step += 1
+            observation = env.get_observation()
+
+            if not action_plan and action_type != "human":
+                action_chunk, agent, new_si = agent.sample_actions(observation)
+                episode_log.sample_info_history.append(new_si)
+                action_plan.extend(action_chunk[:cfg.replan_steps])
+            else:
+                episode_log.sample_info_history.append(
+                    episode_log.sample_info_history[-1] if episode_log.sample_info_history else None
+                )
+
+            elapsed = time.time() - start_step_time
+            if elapsed < dt:
+                time.sleep(dt - elapsed)
+
+            has_action = bool(action_plan)
+            action = action_plan.popleft() if has_action else np.zeros_like(example_action.squeeze())
+            real_action, action_type = env.step(action.tolist())
+            start_step_time = time.time()
+            done, success, reward, mask = env.get_info_for_step()
+
+            episode_log.record_step(observation, len(action_plan), action_type, real_action, reward)
+
+            if action_type == "human":
+                action_plan.clear()
+
+            if has_action or action_type == "human":
+                transition_dict = dict(
+                    observations=observation, actions=real_action, rewards=reward,
+                    masks=mask, dones=done, is_hil=(action_type == "human"),
+                )
+                batch_processor.insert_transition(transition_dict)
+            # No agent.update(...) call anywhere in this phase, by design.
+
+            if done:
+                batch_processor.on_episode_done(success)
+                env.reset()
+                training_log.on_episode_done(episode_log, success, {})
+                training_log._success_window.append(float(success))
+                priming_pbar.update(1)
+                wandb.log(
+                    {"eval/init_progress": len(training_log._success_window) / success_rate_window},
+                    step=priming_step,
+                )
+
+                episode_log.reset()
+                batch_processor.on_episode_start()
+                observation = env.get_observation()
+                done = False
+                action_type = "policy"
+                action_plan.clear()
+
+        priming_pbar.close()
+        wandb.log({"eval/init_progress": 1.0}, step=priming_step)
+        logging.info(f"[priming] Done at step {priming_step} (of {-(success_rate_window * cfg.max_episode_steps)} "
+                     f"worst-case budget) -- {success_rate_window} episodes evaluated, starting "
+                     f"success_rate={np.mean(training_log._success_window):.3f}. Real training begins now, "
+                     f"budget (cfg.max_steps={cfg.max_steps}) untouched by this phase.")
 
     for i in tqdm.tqdm(
         range(start_step, cfg.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm
@@ -752,21 +836,16 @@ def main(_):
             step_metrics["training/episode_count"] = training_log.ep_count
             
             # Rolling success rate over the last success_rate_window episodes
-            # (YAML-driven, not hardcoded -- so a run's own config is the
-            # single source of truth, not a name typed in by hand). Nothing
-            # is logged under eval/success_rate at all until the window is
-            # genuinely full: a partial window (e.g. after 1 episode) can
-            # ONLY read exactly 0.0 or 1.0 regardless of the true underlying
-            # rate -- not a calculation bug, just what a 1-sample mean is
-            # mathematically forced to be -- and there's no principled prior
-            # to substitute in its place that wouldn't itself need
-            # justifying per task. Skipping those early points entirely
-            # keeps every logged value held to the exact same standard for
-            # the whole run, rather than looking better-calibrated later
-            # than it was at the start.
-            success_rate_window = getattr(cfg, "success_rate_window", 200)
-            if not hasattr(training_log, '_success_window'):
-                training_log._success_window = []
+            # (YAML-driven, computed once before the priming phase above --
+            # shared with it so both stay in sync). Nothing is logged under
+            # eval/success_rate at all until the window is genuinely full: a
+            # partial window (e.g. after 1 episode) can ONLY read exactly
+            # 0.0 or 1.0 regardless of the true underlying rate -- not a
+            # calculation bug, just what a 1-sample mean is mathematically
+            # forced to be. In practice the window is already full by the
+            # time this loop starts (see the priming phase above), except
+            # right when resuming a run whose in-memory window was never
+            # reconstructed -- this guard still protects that case too.
             training_log._success_window.append(float(success))
             if len(training_log._success_window) > success_rate_window:
                 training_log._success_window.pop(0)
@@ -814,34 +893,15 @@ def main(_):
         logging.info("Waiting for checkpoint manager to finish")
         tb_writer.close()
         checkpoint_manager.wait_until_finished()
-
-        if eval_curve_enabled:
-            # NOT run in-process here: XLA_PYTHON_CLIENT_MEM_FRACTION
-            # preallocation is held for THIS process's entire lifetime, not
-            # released just because the training loop itself is done --
-            # calling eval_curve.py via subprocess while this process is
-            # still alive (blocked waiting on it) starves every eval
-            # subprocess of GPU memory (observed: every one OOM'd trying to
-            # allocate ~1GB more, with this process still shown holding
-            # ~78GB). Instead, write a handoff file for job_rl.sh to pick up
-            # via scripts/run_eval_curve_from_handoff.py -- run as a
-            # genuinely separate process AFTER this one has fully exited.
-            handoff = {
-                "task_config": FLAGS.task_config,
-                "checkpoints_dir": checkpoint_dir,
-                "n_episodes": getattr(cfg, "eval_curve_n_episodes", 200),
-                "start_checkpoint": eval_curve_start_checkpoint,
-                "wandb_project": cfg.project_name,
-                "wandb_run_id": wandb.run.id,
-            }
-            handoff_path = os.path.join(
-                "logs", f"eval_curve_handoff_{os.environ.get('SLURM_JOB_ID', 'local')}.json"
-            )
-            os.makedirs("logs", exist_ok=True)
-            with open(handoff_path, "w") as f:
-                json.dump(handoff, f, indent=2)
-            logging.info(f"[eval_curve] Wrote handoff file: {handoff_path} "
-                         f"-- job_rl.sh runs the actual sweep after this process exits.")
+        # NOTE: the automatic end-of-training eval_curve.py sweep (writing a
+        # handoff file for job_rl.sh to pick up) has been removed here --
+        # eval/success_rate is now primed from step 1 (see the priming phase
+        # above) and trustworthy throughout, so an automatic full 200-seed
+        # sweep after every single run is no longer needed by default. The
+        # scripts themselves (expo_ft/utils/eval_curve_runner.py,
+        # scripts/run_eval_curve_from_handoff.py, scripts/eval_curve.py) are
+        # untouched -- run scripts/eval_curve.py directly (see job_eval_curve.sh)
+        # whenever a rigorous fixed-seed sweep is specifically wanted.
 
 
 if __name__ == "__main__":

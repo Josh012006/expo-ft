@@ -85,16 +85,22 @@ checkpoint_buffer: false   # save replay buffer transitions to disk at each step
 keep_period: 10000         # keep one checkpoint every N steps (older ones are deleted)
 max_to_keep: 1
 
-# ── Rigorous eval (200 fixed seeds, same as SFT) ───────────────────
-# Runs scripts/eval_curve.py synchronously, on the same node/GPU, right
-# after training finishes (see expo_ft/utils/eval_curve_runner.py) -- sweeps
-# every checkpoint keep_period left on disk, logs the resulting curve to
-# wandb. Adds real wall-clock time to the job (budget accordingly; see the
-# module docstring for the estimate).
-eval_curve_enabled: true
-eval_curve_n_episodes: 200  # must match the SFT sweep's --n-episodes for the seeds to line up
+# ── eval/success_rate ───────────────────────────────────────────────
+# In-training rolling success rate, primed on the STARTING model for
+# success_rate_window real episodes before any weight updates (separate
+# from cfg.max_steps' budget -- see train_pi_robo.py) so it's trustworthy
+# from step 1 onward, not just once it happens to fill up naturally.
+# eval/init_progress (0->1, logged at negative wandb steps) shows priming
+# progress without ever touching the real training step axis.
+success_rate_window: 200
 
-success_rate_window: 200        # eval/success_rate: episodes to average over; nothing is logged until this many have completed (see train_pi_robo.py)
+# A rigorous, held-out 200-fixed-seed sweep (scripts/eval_curve.py) is no
+# longer run automatically after training -- eval/success_rate above is
+# trustworthy enough on its own now. Still available to run manually
+# whenever wanted (see job_eval_curve.sh):
+#   python scripts/eval_curve.py --config <this file> \
+#       --checkpoints-dir <run>/checkpoints --n-episodes 200 --rl-curve \
+#       --start-checkpoint <sft checkpoint step dir>
 
 actor_success_only: true        # if true, actor batch is sampled only from successful transitions
 
