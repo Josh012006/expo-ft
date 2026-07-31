@@ -651,41 +651,38 @@ def main(_):
     # =====================================================================
     # Priming phase: evaluate the STARTING model on success_rate_window real
     # episodes, BEFORE any weight updates. Deliberately kept OUTSIDE
-    # cfg.max_steps' budget -- its own step counter, never touches `i` or
-    # the training budget below.
+    # cfg.max_steps' budget -- has its own step counter here, but `i` and
+    # everything keyed off it below (checkpoint naming, cfg.max_steps, the
+    # loop bound itself) are completely untouched by this phase.
     #
-    # Logged at NEGATIVE wandb steps, counting UP toward (but never
-    # reaching) 0 -- confirmed necessary, not just cosmetic: tested directly
-    # (offline wandb run, raw datastore inspection) that logging at a step
-    # value at or below one wandb has already auto-incremented past causes
-    # that entire row to be SILENTLY DROPPED, for every key in it, custom
-    # step_metric or not. So priming's range and the main loop's range
-    # (starting at 0) must never overlap or touch.
-    #
-    # The starting value itself is meaningful, not arbitrary: -(success_rate
-    # _window * cfg.max_episode_steps) is the worst-case number of raw env
-    # steps priming could need (every episode timing out at the full
-    # horizon rather than ending early on success) -- e.g. -24000 for
-    # push_cube (window=200, max_episode_steps=120). Priming almost always
-    # finishes well before reaching 0, so reading e.g. -18000 at completion
-    # directly says "used 6000 of a 24000 worst-case budget."
+    # wandb rejects negative step values outright, so priming logs at a
+    # normal POSITIVE, increasing counter (0, 1, 2, ...) -- real raw env
+    # steps, incremented once per priming iteration. Once priming ends,
+    # wandb_step_offset captures where it left off; the main loop's own
+    # wandb/TensorBoard logging calls add this offset on top of `i` so the
+    # combined step sequence stays monotonic across the whole run without
+    # ever going backward. Checkpoint saving/naming and cfg.max_steps below
+    # use `i` directly, unmodified -- e.g. "checkpoint 20000" always means
+    # exactly 20000 real training steps since training began, identically
+    # across every run regardless of how long its own priming phase took.
     #
     # Skipped entirely when resuming: the model already has real training
     # history; _success_window is a plain in-memory list (not part of the
     # checkpoint) so it isn't "empty" in any meaningful sense on resume,
     # there's just nothing to reconstruct it from -- re-priming would
-    # needlessly redo real training time.
+    # needlessly redo real training time. wandb_step_offset stays 0 in that
+    # case, matching the run's pre-existing step sequence exactly.
     success_rate_window = getattr(cfg, "success_rate_window", 200)
     training_log._success_window = []
+    wandb_step_offset = 0
 
     if not resuming and success_rate_window > 0:
         logging.info(f"[priming] Evaluating the starting model on {success_rate_window} real "
                      f"episodes before any weight updates (separate from cfg.max_steps budget)...")
-        priming_step = -(success_rate_window * cfg.max_episode_steps)
+        priming_step = 0
         priming_pbar = tqdm.tqdm(total=success_rate_window, desc="priming", disable=not FLAGS.tqdm)
 
         while len(training_log._success_window) < success_rate_window:
-            priming_step += 1
             observation = env.get_observation()
 
             if not action_plan and action_type != "human":
@@ -706,6 +703,7 @@ def main(_):
             real_action, action_type = env.step(action.tolist())
             start_step_time = time.time()
             done, success, reward, mask = env.get_info_for_step()
+            priming_step += 1
 
             episode_log.record_step(observation, len(action_plan), action_type, real_action, reward)
 
@@ -739,11 +737,13 @@ def main(_):
                 action_plan.clear()
 
         priming_pbar.close()
+        wandb_step_offset = priming_step + 1  # +1: next value logged must be strictly greater
         wandb.log({"eval/init_progress": 1.0}, step=priming_step)
-        logging.info(f"[priming] Done at step {priming_step} (of {-(success_rate_window * cfg.max_episode_steps)} "
-                     f"worst-case budget) -- {success_rate_window} episodes evaluated, starting "
-                     f"success_rate={np.mean(training_log._success_window):.3f}. Real training begins now, "
-                     f"budget (cfg.max_steps={cfg.max_steps}) untouched by this phase.")
+        logging.info(f"[priming] Done after {priming_step} raw steps -- {success_rate_window} episodes "
+                     f"evaluated, starting success_rate={np.mean(training_log._success_window):.3f}. Real "
+                     f"training begins now, budget (cfg.max_steps={cfg.max_steps}) untouched by this phase. "
+                     f"wandb/TensorBoard step axis continues at {wandb_step_offset} -- checkpoint step "
+                     f"numbers (i) are NOT offset and remain exactly comparable across runs.")
 
     for i in tqdm.tqdm(
         range(start_step, cfg.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm
@@ -879,10 +879,10 @@ def main(_):
         # (jnp.float32 etc.) which don't pass isinstance(v, (int, float))
         for k, v in step_metrics.items():
             try:
-                tb_writer.add_scalar(k, float(v), global_step=i)
+                tb_writer.add_scalar(k, float(v), global_step=wandb_step_offset + i)
             except (TypeError, ValueError):
                 pass  # skip non-scalar values (e.g. batch_info dicts)
-        wandb.log(step_metrics, step=i)
+        wandb.log(step_metrics, step=wandb_step_offset + i)
     
     if cfg.checkpoint_model:
         try:
