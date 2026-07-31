@@ -749,6 +749,7 @@ def main(_):
                     episodes_since_update = 0
 
             training_log.on_episode_done(episode_log, success, step_metrics)
+            step_metrics["training/episode_count"] = training_log.ep_count
             
             # Rolling success rate over the last success_rate_window episodes
             # (YAML-driven, not hardcoded -- so a run's own config is the

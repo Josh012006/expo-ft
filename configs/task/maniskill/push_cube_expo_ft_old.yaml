@@ -65,7 +65,7 @@ seed: 42
 max_episodes: 1000
 max_steps_per_episode: 120
 batch_size: 24             # number of transitions sampled from replay buffer per gradient update
-utd_ratio: 20              # gradient updates performed per new transition collected
+utd_ratio: 1              # gradient updates performed per new transition collected
 offline_ratio: 0.5         # fraction of batch from offline demo buffer (0 = demos inserted into online buffer)
 update_type: "episode"     # when to trigger updates: "episode", "step", or "batch"
 num_updates: 1             # number of gradient updates per trigger
