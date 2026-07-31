@@ -11,14 +11,15 @@ beat the SFT baseline (see Current status).
 > ManiSkill simulation instead — no real robot, NUC, or spacemouse involved.
 > `run_pipeline.py` and `expo_ft/env/maniskill_env.py` are new, replacing the
 > original client-server DROID environment with a local ManiSkill one.
-> `expo_ft/agents/alg/expo_ft_old.py` preserves the original, reference-faithful
-> ExpoLearner (MSE scalar critic, REDQ-style ensemble) unmodified, for
-> comparison/rollback — `expo_ft/agents/alg/expo_ft.py` (the one actually used)
-> has since diverged from it: a categorical/distributional critic architecture
-> (XQC/XQCfD-style, see Current status) replaces the original's scalar
-> regression critic. Both are directly runnable and A/B-comparable via
-> `model_cls: "EXPOLearner"` (new) vs. `"EXPOLearnerOld"` (original) in the
-> task YAML — see Pipeline.
+> `expo_ft/agents/alg/expo_ft_categorical.py` preserves the categorical/
+> distributional critic rewrite (XQC/XQCfD-style, C51-bounded support) that
+> was briefly the default — `expo_ft/agents/alg/expo_ft.py` (the one actually
+> used) is the original, reference-faithful ExpoLearner (MSE scalar critic,
+> REDQ-style ensemble), which moved back to being the default once it proved
+> more stable under the corrected sparse-reward setup (see Current status).
+> Both are directly runnable and A/B-comparable via
+> `model_cls: "EXPOLearner"` (MSE, default) vs. `"EXPOLearnerCategorical"`
+> (categorical rewrite) in the task YAML — see Pipeline.
 
 ## Setup
 
@@ -75,11 +76,11 @@ Everything runs through `scripts/run_pipeline.py --config <task.yaml> --stage <s
 | `all` | All of the above in sequence | — |
 
 **Architecture toggle**: `model_cls` in the task YAML picks which critic
-architecture `train_pi_robo.py` dispatches to — `EXPOLearner` (categorical
-critic, current default) or `EXPOLearnerOld` (original scalar-critic
-architecture, for direct A/B comparison — see Current status). Each has its
-own model config (`configs/model/{expo_ft,expo_ft_old}_pi_config.py`) and its
-own task YAML per task (`configs/task/maniskill/<task>_{sft,expo_ft,expo_ft_old}.yaml`)
+architecture `train_pi_robo.py` dispatches to — `EXPOLearner` (MSE scalar
+critic, current default — see Current status) or `EXPOLearnerCategorical`
+(categorical/distributional critic architecture, for direct A/B comparison).
+Each has its own model config (`configs/model/{expo_ft,expo_ft_categorical}_pi_config.py`)
+and its own task YAML per task (`configs/task/maniskill/<task>_{sft,expo_ft,expo_ft_categorical}.yaml`)
 — the `_sft.yaml` variant is shared for the `demos`/`sft` stages; the
 architecture-specific variants are used for `--stage rl`.
 `run_pipeline.py::stage_rl` reads `model_cls` from whichever task YAML is
@@ -118,8 +119,9 @@ fixed along the way without resolving the core symptom.
 categorical/distributional one (XQC, arXiv 2509.25174 / XQCfD, arXiv
 2605.10734 — fixed bounded support instead of a scalar, batch norm + weight
 norm on the critic MLP, no ensemble). See
-`expo_ft/networks/categorical_value.py` and `expo_ft/agents/alg/expo_ft.py`;
-the original architecture is preserved unmodified in `expo_ft_old.py`. Result:
+`expo_ft/networks/categorical_value.py` and `expo_ft/agents/alg/expo_ft_categorical.py`;
+the original architecture is preserved in `expo_ft.py` (moved back to being
+the default since — see below). Result:
 `target_q_max`/`target_q_min` now genuinely converge and stay bounded instead
 of climbing indefinitely (the original architecture's `critic_loss` also grew
 increasingly spiky over training; the new one stays smooth) — but
@@ -243,7 +245,7 @@ Demo generation applies the same overrides via `scripts/replay_trajectory_patche
 ## RL hyperparameters (YAML fields)
 
 These apply to the ExpoFT task YAMLs (`<task>_expo_ft.yaml` /
-`<task>_expo_ft_old.yaml`).
+`<task>_expo_ft_categorical.yaml`).
 
 ```yaml
 rl_lr: 3.0e-4                    # learning rate for critic and actor (NOTE: write scientific
@@ -317,10 +319,11 @@ a different phase of work (debugging *why* RL doesn't beat SFT, rather than
 getting the ManiSkill port running at all).
 
 **Categorical critic architecture** (`expo_ft/networks/categorical_value.py`,
-`expo_ft/agents/alg/expo_ft.py`): replaced the scalar MSE-regression critic
+`expo_ft/agents/alg/expo_ft_categorical.py`): replaced the scalar MSE-regression critic
 with a C51-style categorical one (fixed bounded support, batch norm + weight
-norm, no ensemble) per XQC/XQCfD. `expo_ft_old.py` preserves the original
-architecture unmodified for comparison/rollback — a thin passthrough at
+norm, no ensemble) per XQC/XQCfD. `expo_ft.py` preserves the original
+architecture for comparison/rollback (and is the current default again — see
+Current status) — a thin passthrough at
 `expo_ft.py`'s old location was used during the transition so the rest of the
 package (`__init__.py`, which every other learner's import chain went
 through) didn't hard-depend on whichever architecture was mid-rewrite.
@@ -371,13 +374,13 @@ rejected ("steps must be monotonically increasing"). Fixed by giving
 via `wandb.define_metric(..., step_metric=...)`, decoupled from the main
 loop's default counter entirely.
 
-**`EXPOLearnerOld` toggle**: `expo_ft_old.py` was previously just a passive
+**`EXPOLearnerCategorical` toggle**: `expo_ft_categorical.py` was previously just a passive
 fallback file, not actually runnable. Wired it into `train_pi_robo.py`'s
 dispatch and `run_pipeline.py`'s model-config lookup as `model_cls:
-"EXPOLearnerOld"`, plus a thin `expo_ft_old_pi_config.py` (reuses
-`expo_ft_pi_config.py` as-is — `expo_ft_old.create()`'s `**kwargs` silently
-absorbs the categorical-critic-specific fields it doesn't need) and
-per-task YAMLs, so the original architecture is directly A/B-testable against
+"EXPOLearnerCategorical"`, plus a thin `expo_ft_categorical_pi_config.py` (reuses
+`expo_ft_pi_config.py` as-is — `expo_ft_categorical.create()`'s `**kwargs` silently
+absorbs the MSE/REDQ-specific fields it doesn't need) and
+per-task YAMLs, so the categorical architecture is directly A/B-testable against
 the categorical rewrite rather than just preserved as a rollback reference.
 
 ## Changelog — key fixes made while adapting to ManiSkill (July 2026)

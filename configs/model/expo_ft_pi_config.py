@@ -7,20 +7,21 @@ def get_config():
 
     config.model_cls = "EXPOLearner"
 
-    # NOTE: num_qs/num_min_qs/critic_layer_norm below are dead for EXPOLearner
-    # as of the categorical-critic rewrite (expo_ft.py) — kept here only
-    # because SACLearner (sac.py, which also extends this same base config)
-    # still uses the old ensemble-of-scalars critic architecture and reads
-    # these fields directly. Do not remove.
+    # num_qs/num_min_qs/critic_layer_norm: the REDQ-style ensemble
+    # hyperparameters actually used by EXPOLearner (MSE scalar critic,
+    # expo_ft.py) and by SACLearner (sac.py, which also extends this same
+    # base config). Dead for EXPOLearnerCategorical (expo_ft_categorical.py,
+    # categorical/C51-style critic below) -- kept here regardless since this
+    # file is the shared base every model_cls variant extends.
     config.num_qs = 10
     config.num_min_qs = 2
     config.critic_layer_norm = True
 
-    # Categorical (C51-style, bounded support) critic — EXPOLearner only, per
-    # XQC (arXiv 2509.25174) / XQCfD (arXiv 2605.10734). v_min/v_max apply to
+    # Categorical (C51-style, bounded support) critic — EXPOLearnerCategorical
+    # only, per XQC (arXiv 2509.25174) / XQCfD (arXiv 2605.10734). v_min/v_max apply to
     # NORMALIZED reward units (rewards are divided by a running RMS estimate
     # before the Bellman projection — see reward_scale_decay and
-    # expo_ft.py's update_critic()), so they should be domain-agnostic and
+    # expo_ft_categorical.py's update_critic()), so they should be domain-agnostic and
     # NOT need per-task hand-tuning. Still watch target_q_max/min (the
     # normalized ones, not the _denorm logging variants): if Q is pinned at
     # exactly v_min or v_max for a meaningful fraction of training even in

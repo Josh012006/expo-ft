@@ -76,7 +76,7 @@ def main(_):
     # float(x) is a no-op if x is already a float, and fixes it if x is a
     # not-quite-valid-YAML-float string — belt and suspenders alongside fixing
     # the YAML values themselves.
-    if model_cls in ("EXPOLearner", "EXPOLearnerOld"):
+    if model_cls in ("EXPOLearner", "EXPOLearnerCategorical"):
         # --- unchanged from before this refactor: byte-for-byte identical ---
         FLAGS.config.actor_lr         = float(getattr(cfg, "rl_lr", FLAGS.config.actor_lr))
         FLAGS.config.critic_lr        = float(getattr(cfg, "rl_lr", FLAGS.config.critic_lr))
@@ -265,15 +265,16 @@ def main(_):
         from expo_ft.agents.alg.bc import load_agent, restore_checkpoint, save_checkpoint
     elif model_cls == "EXPOLearner":
         from expo_ft.agents.alg.expo_ft import load_agent, restore_checkpoint, save_checkpoint
-    elif model_cls == "EXPOLearnerOld":
-        # The original, reference-faithful architecture (MSE scalar critic,
-        # REDQ-style ensemble) preserved unmodified in expo_ft_old.py — for
-        # direct A/B comparison against the categorical (XQC/XQCfD-style)
-        # rewrite now used by "EXPOLearner". Shares the exact same config
-        # overrides above (expo_ft_old.create()'s signature ends in **kwargs,
-        # so the categorical-specific fields set there — num_atoms, v_min,
-        # kl_coef, etc. — are silently absorbed and ignored, not an error).
-        from expo_ft.agents.alg.expo_ft_old import load_agent, restore_checkpoint, save_checkpoint
+    elif model_cls == "EXPOLearnerCategorical":
+        # The categorical/distributional (XQC/XQCfD-style, C51-bounded
+        # support) critic rewrite, kept in expo_ft_categorical.py — for
+        # direct A/B comparison against the MSE scalar critic/REDQ-ensemble
+        # architecture now used by the default "EXPOLearner". Shares the
+        # exact same config overrides above (expo_ft_categorical.create()'s
+        # signature ends in **kwargs, so the MSE/REDQ-specific fields set
+        # there — num_qs, num_min_qs, critic_layer_norm, etc. — are silently
+        # absorbed and ignored, not an error).
+        from expo_ft.agents.alg.expo_ft_categorical import load_agent, restore_checkpoint, save_checkpoint
     elif model_cls == "PPOLearner":
         from expo_ft.agents.alg.ppo import load_agent, restore_checkpoint, save_checkpoint
     elif model_cls == "GRPOLearner":
@@ -417,11 +418,11 @@ def main(_):
     # online replay_buffer when offline_ratio == 0 — follow whichever buffer
     # actually received the dataset. Shared by both pretraining stages below.
     # Guarded by model_cls: offline_ratio/this whole pretraining mechanism is
-    # ExpoFT-specific (EXPOLearner/EXPOLearnerOld) -- PPO/GRPO/SAC task YAMLs
+    # ExpoFT-specific (EXPOLearner/EXPOLearnerCategorical) -- PPO/GRPO/SAC task YAMLs
     # don't define offline_ratio at all, so this must not run unconditionally.
     critic_pretrain_steps = int(getattr(FLAGS.config, "critic_pretrain_steps", 0) or 0)
     actor_bc_pretrain_steps = int(getattr(FLAGS.config, "actor_bc_pretrain_steps", 0) or 0)
-    if model_cls in ("EXPOLearner", "EXPOLearnerOld"):
+    if model_cls in ("EXPOLearner", "EXPOLearnerCategorical"):
         pretrain_buffer = offline_replay_buffer if cfg.offline_ratio > 0 else replay_buffer
     else:
         pretrain_buffer = None
@@ -429,10 +430,10 @@ def main(_):
     # ── Actor BC warm-start (XQCfD-style "policy pretraining") ──────────────
     # Only on a fresh run, same rationale as critic pretraining below. Runs
     # BEFORE critic pretraining — see pretrain_actor_bc()'s docstring for why
-    # the ordering matters. EXPOLearnerOld doesn't have pretrain_actor_bc
-    # (legacy baseline, frozen on purpose) — only the current
-    # categorical-critic EXPOLearner does.
-    if not resuming and model_cls == "EXPOLearner" and actor_bc_pretrain_steps > 0:
+    # the ordering matters. EXPOLearner (MSE) doesn't have pretrain_actor_bc
+    # (legacy baseline, frozen on purpose) — only EXPOLearnerCategorical
+    # (the categorical-critic architecture) does.
+    if not resuming and model_cls == "EXPOLearnerCategorical" and actor_bc_pretrain_steps > 0:
         logging.info(
             "BC warm-start: pretraining residual actor for %d steps on demo data (%s buffer)...",
             actor_bc_pretrain_steps,
@@ -489,7 +490,7 @@ def main(_):
     # The point is purely to get the critic roughly "coherent" with the SFT
     # policy's own actions before the online loop starts pulling the residual
     # policy toward whatever a still-randomly-initialized critic prefers.
-    if not resuming and model_cls in ("EXPOLearner", "EXPOLearnerOld") and critic_pretrain_steps > 0:
+    if not resuming and model_cls in ("EXPOLearner", "EXPOLearnerCategorical") and critic_pretrain_steps > 0:
         logging.info(
             "Pretraining critic for %d steps on demo data (%s buffer)...",
             critic_pretrain_steps,

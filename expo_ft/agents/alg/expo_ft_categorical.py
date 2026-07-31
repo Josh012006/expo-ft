@@ -1,4 +1,17 @@
-"""EXPO-FT learner: Pi0.5 base policy + residual actor + critic (EXPOLearner)."""
+"""EXPO-FT learner: Pi0.5 base policy + residual actor + critic (EXPOLearnerCategorical).
+
+Critic architecture: categorical/distributional (C51-style, bounded support)
+per XQC (arXiv 2509.25174) / XQCfD (arXiv 2605.10734), as an alternative to
+the MSE scalar-regression critic (the default, in expo_ft.py, for
+comparison/rollback). See expo_ft/networks/categorical_value.py for the
+network, Bellman projection, and weight-normalization implementation. No
+critic ensemble (XQCfD's own reported setup uses none) — a single critic and
+single target critic.
+
+Everything ELSE (the residual/edit policy, the argmax-over-candidates
+action-selection mechanism itself, the base VLA fine-tuning, checkpointing,
+replay/data plumbing) is unchanged from expo_ft.py.
+"""
 
 from functools import partial
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
@@ -18,21 +31,26 @@ import numpy as np
 
 from expo_ft.agents.alg.agent import AgentLearner, initialize_checkpoint_dir
 from expo_ft.agents.alg.checkpoint_utils import make_checkpoint_fns
-from expo_ft.agents.alg.batch_utils import prepare_critic_batch, prepare_actor_sampling_batch, extract_critic_fields
+from expo_ft.agents.alg.batch_utils import prepare_critic_batch, prepare_actor_sampling_batch, prepare_actor_sampling_batch_current, extract_critic_fields
 from expo_ft.networks.temperature import Temperature
 from expo_ft.data.dataset import DatasetDict
-from expo_ft.distributions import TanhNormal
+from expo_ft.distributions import TanhNormal, HetStatTanhNormal
 from expo_ft.networks import (
     MLP,
-    Ensemble,
-    MLPResNetV2,
-    StateActionValue,
-    subsample_image_ensemble,
     PixelMultiplexer,
     PixelEditMultiplexer,
     BatchEncoder,
 )
 from expo_ft.networks.encoders import ResNetV2Encoder
+from expo_ft.networks.categorical_value import (
+    XQCCriticBase,
+    CategoricalStateActionValue,
+    make_atoms,
+    q_from_logits,
+    categorical_bellman_projection,
+    categorical_cross_entropy_loss,
+    project_weights_to_unit_norm,
+)
 
 from expo_ft.utils.augmentation import make_data_augmentation_fn
 
@@ -41,12 +59,24 @@ import openpi.training.sharding as _sharding
 import openpi.training.utils as training_utils
 
 
+class BNTrainState(TrainState):
+    """TrainState extended with a batch_stats field, for the critic's
+    BatchNorm running mean/var — a separate mutable collection from `params`
+    that flax's plain TrainState doesn't track. Updated via
+    .replace(batch_stats=...) after each apply() call with mutable=
+    ['batch_stats'], NOT via apply_gradients (batch_stats isn't
+    gradient-updated, it's a running average maintained by BatchNorm itself
+    during the forward pass)."""
+    batch_stats: Any = None
+
+
 def _split_params(agent: Any) -> tuple[Any, dict[str, at.Params]]:
     batch_encoder_params = agent.batch_encoder.params
     residual_actor_params = agent.residual_actor.params
     temp_params = agent.temp.params
     critic_params = agent.critic.params
-    
+    critic_batch_stats = agent.critic.batch_stats
+
     with at.disable_typechecking():
         if agent.actor_train_state.ema_params is not None:
             actor_params = agent.actor_train_state.ema_params
@@ -60,7 +90,7 @@ def _split_params(agent: Any) -> tuple[Any, dict[str, at.Params]]:
         batch_encoder=dataclasses.replace(agent.batch_encoder, params={}),
         residual_actor=dataclasses.replace(agent.residual_actor, params={}), 
         temp=dataclasses.replace(agent.temp, params={}), 
-        critic=dataclasses.replace(agent.critic, params={}),
+        critic=dataclasses.replace(agent.critic, params={}, batch_stats={}),
         actor_train_state=actor_train_state
     )
 
@@ -69,6 +99,7 @@ def _split_params(agent: Any) -> tuple[Any, dict[str, at.Params]]:
         "residual_actor_params": residual_actor_params, 
         "temp_params": temp_params, 
         "critic_params": critic_params,
+        "critic_batch_stats": critic_batch_stats,
         "actor_params": actor_params
     }
     return agent, params
@@ -78,7 +109,7 @@ def _merge_params(agent: Any, params: dict[str, at.Params]) -> Any:
     batch_encoder = dataclasses.replace(agent.batch_encoder, params=params["batch_encoder_params"])
     residual_actor = dataclasses.replace(agent.residual_actor, params=params["residual_actor_params"])
     temp = dataclasses.replace(agent.temp, params=params["temp_params"])
-    critic = dataclasses.replace(agent.critic, params=params["critic_params"])
+    critic = dataclasses.replace(agent.critic, params=params["critic_params"], batch_stats=params["critic_batch_stats"])
 
     with at.disable_typechecking():
         if agent.actor_train_state.params:
@@ -142,11 +173,27 @@ def decay_mask_fn(params):
     # value in any prior run.
     return flax.traverse_util.unflatten_dict(flat_mask)
 
-@partial(jax.jit, static_argnames=('critic_fn', 'num_min_qs'))
-def compute_q(critic_fn, critic_params, observations, actions, states, num_min_qs=None):
-    q_values = critic_fn({'params': critic_params}, observations, actions, p=states, sample_num=num_min_qs)
-    q_values = q_values.min(axis=0)
-    return q_values
+@partial(jax.jit, static_argnames=('critic_fn',))
+def compute_q(critic_fn, critic_params, critic_batch_stats, atoms, observations, actions, states):
+    """Q = E[atoms] under the critic's predicted categorical distribution —
+    see expo_ft/networks/categorical_value.py. Structurally bounded to
+    [atoms.min(), atoms.max()] no matter what the network outputs.
+
+    Always evaluated in inference mode (training=False, i.e. BatchNorm uses
+    its running mean/var rather than this batch's) — this function is used
+    for action SELECTION (scoring the target critic's candidates), never for
+    the critic's own training step (see update_critic's own logits/loss
+    computation for that, which correctly uses training=True instead).
+
+    No ensemble reduction anymore (no more `.min(axis=0)` over a REDQ-style
+    ensemble) — single critic, single target critic, per XQCfD's own
+    reported setup ("no Q-function ensembles").
+    """
+    logits = critic_fn(
+        {"params": critic_params, "batch_stats": critic_batch_stats},
+        observations, actions, False, p=states,
+    )
+    return q_from_logits(logits, atoms)
 
 
 @partial(jax.jit, static_argnames=('encoder_fn', 'stop_gradient'))
@@ -160,6 +207,29 @@ def _sample_actions(rng, apply_fn, params, observations: jnp.ndarray, states, ac
     key, rng = jax.random.split(rng)
     dist = apply_fn({"params": params}, observations, actions=actions, p=states)
     return dist.sample(seed=key), rng
+
+
+def _find_param_by_name(params_tree, name):
+    """Recursively search a (possibly nested) Flax params dict for a leaf
+    keyed by `name` and return it, or None if not found.
+
+    Used to pull out HetStat's raw "HetStatLogVarScale" parameter directly
+    from the params pytree for diagnostics, without needing to know or
+    hardcode exactly how many modules deep PixelEditMultiplexer/HetStatNormal
+    happen to nest it (and without changing HetStatNormal's __call__ return
+    signature via sow/mutable=['intermediates'], which would ripple into
+    every call site of the residual actor). Returns None (rather than
+    raising) for architectures that don't have this param at all (plain
+    TanhNormal, EXPOLearner) so callers can log the metric conditionally.
+    """
+    if isinstance(params_tree, dict):
+        if name in params_tree:
+            return params_tree[name]
+        for v in params_tree.values():
+            found = _find_param_by_name(v, name)
+            if found is not None:
+                return found
+    return None
 
 
 class EXPOLearner(AgentLearner, struct.PyTreeNode):
@@ -176,7 +246,9 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
     N: int = struct.field(pytree_node=False)
     n_edit_samples: int = struct.field(pytree_node=False)
     edit_scale: float = struct.field(pytree_node=False)
+    hetstat_var_lr_multiplier: float = struct.field(pytree_node=False)
     use_double_q_selection: bool = struct.field(pytree_node=False)
+    use_clipped_double_q: bool = struct.field(pytree_node=False)
     residual_action_xyzg: bool = struct.field(pytree_node=False)
     batch_split: int = struct.field(pytree_node=False)
     encode_batch_split: int = struct.field(pytree_node=False)
@@ -185,10 +257,15 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
     discount: float
     target_entropy: float
     entropy_scale: float
-    num_qs: int = struct.field(pytree_node=False)
-    num_min_qs: Optional[int] = struct.field(
-        pytree_node=False
-    )  # See M in RedQ https://arxiv.org/abs/2101.05982
+    num_atoms: int = struct.field(pytree_node=False)
+    v_min: float = struct.field(pytree_node=False)
+    v_max: float = struct.field(pytree_node=False)
+    atoms: jnp.ndarray  # fixed support values, e.g. linspace(v_min, v_max, num_atoms) — a pytree leaf (JAX arrays can't be static/hashable fields), but never trained, never changes after create()
+    reward_scale_decay: float = struct.field(pytree_node=False)
+    use_reward_normalization: bool = struct.field(pytree_node=False)  # if False, skip the RMS rescaling entirely and feed raw batch["rewards"] straight into the Bellman projection -- see update_critic()
+    kl_coef: float = struct.field(pytree_node=False)  # XQCfD-style KL-to-reference regularization for the edit policy; 0.0 = disabled (default), matches pre-existing entropy-only behavior
+    kl_ref_std: float = struct.field(pytree_node=False)  # std of the fixed N(0, kl_ref_std) reference in pre-tanh space
+    reward_ms: jnp.ndarray  # running mean-square of rewards (EMA), used to normalize rewards before the Bellman projection so the FIXED [v_min, v_max] support stays meaningful regardless of a task's absolute reward scale — see update_critic()
     action_dim: int = struct.field(pytree_node=False)
     state_dim: int = struct.field(pytree_node=False)
     full_action_dim: int = struct.field(pytree_node=False)
@@ -227,11 +304,76 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         hidden_dims: Sequence[int] = (256, 256),
         discount: float = 0.99,
         tau: float = 0.005,
-        num_qs: int = 2,
-        num_min_qs: Optional[int] = None,
-        critic_dropout_rate: Optional[float] = None,
+        # Categorical (C51-style, bounded support) critic — replaces the old
+        # ensemble-of-scalars critic (num_qs/num_min_qs/critic_layer_norm/
+        # critic_dropout_rate/use_critic_resnet are gone; see
+        # expo_ft/networks/categorical_value.py).
+        #
+        # v_min/v_max apply to NORMALIZED reward units, not raw task reward
+        # scale — rewards are divided by a running RMS estimate
+        # (reward_scale_decay controls the EMA) before the Bellman
+        # projection, so this fixed support stays meaningful across any
+        # task's absolute reward scale without per-task hand-tuning (the
+        # atoms themselves never move/reproject — only the reward's
+        # normalization does, avoiding any instability from redefining a
+        # trained distributional head's support mid-training). Still watch
+        # target_q_max/min: if Q sits pinned at exactly v_min or v_max for a
+        # meaningful fraction of training even in normalized units, the
+        # support itself (not just the normalization) is too narrow.
+        num_atoms: int = 101,
+        v_min: float = -10.0,
+        v_max: float = 20.0,
+        reward_scale_decay: float = 0.99,
+        # Jesse's catch (July 2026): with a low success rate, reward_ms
+        # shrinks, which shrinks reward_scale, which INFLATES the normalized
+        # reward for the rare successes that remain -- a potential vicious
+        # cycle riding on top of whatever else is going on. Set False to
+        # bypass this rescaling entirely (raw batch["rewards"] used as-is).
+        use_reward_normalization: bool = True,
+        # XQCfD-style KL regularization for the edit/residual policy,
+        # replacing (when enabled) the generic entropy bonus with a penalty
+        # for deviating from a fixed N(0, kl_ref_std) reference in pre-tanh
+        # space — "prefer staying close to zero residual unless Q strongly
+        # justifies deviating". 0.0 = disabled (exact no-op), matching
+        # pre-existing behavior.
+        kl_coef: float = 0.0,
+        kl_ref_std: float = 1.0,
+        # HetStat (heteroscedastic + stationary) residual-policy architecture,
+        # per XQCfD Section 3.1 -- see expo_ft/distributions/hetstat.py for
+        # the full mechanism. Replaces TanhNormal's usual MLP-head-directly
+        # architecture with one that reverts to a wide, near-uniform
+        # distribution when out of the demos' distribution, so kl_coef's
+        # regularization doesn't fight the network's own OOD behavior.
+        # False = disabled (default; matches pre-existing TanhNormal
+        # behavior exactly, no change unless explicitly turned on).
+        use_hetstat_policy: bool = False,
+        hetstat_num_rff_features: int = 256,
+        hetstat_var_lr_multiplier: float = 40.0,
+        # False = disabled (default; matches pre-existing behavior exactly:
+        # sample_batch_actions' argmax-candidate-selection uses
+        # target_critic, the SAME network update_critic then bootstraps
+        # from downstream -- a single estimator both picking its own
+        # favorite candidate and having that pick trusted as the Bellman
+        # target, the classic maximization-bias setup Double Q-learning
+        # exists to fix). True = decouple: selection uses self.critic
+        # (online), evaluation still uses self.target_critic downstream in
+        # update_critic (unchanged either way). No new network needed --
+        # reuses the existing online/target pair. Unrelated to HetStat;
+        # independently togglable.
+        use_double_q_selection: bool = False,
+        # False = disabled (default; matches pre-existing behavior exactly:
+        # the Bellman target's next-state evaluation uses target_critic
+        # alone). True = at every update_critic step, use whichever of
+        # target_critic/critic (online) predicts the LOWER expected value
+        # for next_actions -- TD3-style "clipped double-Q", applied
+        # continuously rather than only correcting after the two drift far
+        # apart (which is what use_double_q_selection above does instead).
+        # Orthogonal to and stackable with use_double_q_selection -- that
+        # flag picks who SELECTS next_actions; this one picks how that pick
+        # gets EVALUATED for the target.
+        use_clipped_double_q: bool = False,
+        critic_hidden_dims: Sequence[int] = (512, 512, 512, 512),
         critic_weight_decay: Optional[float] = None,
-        critic_layer_norm: bool = False,
         critic_grad_clip_norm: Optional[float] = None,
         target_entropy: Optional[float] = None,
         adjust_target_entropy: Optional[bool] = False,
@@ -239,29 +381,12 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         init_temperature: float = 1.0,
         fixed_temperature: Optional[float] = None,
         use_pnorm: bool = False,
-        use_critic_resnet: bool = False,
         actor_drop: Optional[float] = None,
         N: int = 32,
         batch_split: int = 1,
         encode_batch_split: int = 1,
         n_edit_samples: int = 0,
         edit_scale: float = 1.0,
-        # False = disabled (default; matches pre-existing behavior exactly:
-        # sample_batch_actions' argmax-candidate-selection draws its
-        # subsample from target_critic's ensemble, the SAME ensemble
-        # update_critic then bootstraps from downstream -- a single
-        # estimator both picking its own favorite candidate and having
-        # that pick trusted as the Bellman target, the classic
-        # maximization-bias setup Double Q-learning exists to fix). True =
-        # decouple: selection draws its subsample from self.critic's
-        # ensemble (online), evaluation still draws its own fresh subsample
-        # from self.target_critic downstream in update_critic (unchanged
-        # either way). No new network needed -- reuses the existing
-        # online/target ensembles. Mirrors the same mechanism added to the
-        # categorical-critic EXPOLearner in expo_ft.py, adapted here for
-        # REDQ's ensemble-subsampling (subsample_image_ensemble) instead of
-        # a single critic head.
-        use_double_q_selection: bool = False,
         residual_action_xyzg: bool = False,
         actor_tau: float = 0.001,
         include_state: bool = True,
@@ -357,7 +482,11 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         residual_actor_base_cls = partial(
             MLP, hidden_dims=hidden_dims, dropout_rate=actor_drop, activate_final=True, use_pnorm=use_pnorm
         )
-        residual_actor_cls= TanhNormal(residual_actor_base_cls, full_action_dim)
+        residual_actor_cls = (
+            HetStatTanhNormal(residual_actor_base_cls, full_action_dim, num_rff_features=hetstat_num_rff_features, var_lr_multiplier=hetstat_var_lr_multiplier)
+            if use_hetstat_policy
+            else TanhNormal(residual_actor_base_cls, full_action_dim)
+        )
         residual_actor_def = PixelEditMultiplexer(
             network_cls=residual_actor_cls,
             latent_dim=latent_dim_state,
@@ -379,29 +508,29 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             out_shardings=residual_actor_sharding,
         )(residual_actor)
 
-        if use_critic_resnet:
-            critic_base_cls = partial(
-                MLPResNetV2,
-                num_blocks=1,
-            )
-        else:
-            critic_base_cls = partial(
-                MLP,
-                hidden_dims=hidden_dims,
-                activate_final=True,
-                dropout_rate=critic_dropout_rate, 
-                use_layer_norm=critic_layer_norm,
-                use_pnorm=use_pnorm,
-            )
+        critic_base_cls = partial(
+            XQCCriticBase,
+            hidden_dims=critic_hidden_dims,
+        )
 
-        critic_cls = partial(StateActionValue, base_cls=critic_base_cls)
-        critic_cls = partial(Ensemble, net_cls=critic_cls, num=num_qs)
+        critic_cls = partial(CategoricalStateActionValue, base_cls=critic_base_cls, num_atoms=num_atoms)
         critic_def = PixelMultiplexer(
             network_cls=critic_cls,
             latent_dim=latent_dim_state,
             include_state=include_state,
         )
-        critic_params = critic_def.init(critic_key, critic_observations, critic_actions, p=critic_states_ext)["params"]
+        # `True` for `training` here (not the old code's implicit default
+        # False) so BatchNorm's `batch_stats` collection is actually created
+        # at init time — .init() would still create it either way (flax
+        # walks every declared variable collection during init regardless of
+        # the train/eval flag value), but passing True is the more correct,
+        # unambiguous signal of intent given this is about to be trained.
+        critic_variables = critic_def.init(critic_key, critic_observations, critic_actions, True, p=critic_states_ext)
+        critic_params = critic_variables["params"]
+        critic_batch_stats = critic_variables["batch_stats"]
+        atoms = make_atoms(num_atoms, v_min, v_max)
+        reward_ms = jnp.array(1.0)  # start at scale=1.0 (no normalization effect) until enough real data accumulates
+
         if critic_weight_decay is not None:
             tx = optax.adamw(
                 learning_rate=critic_lr,
@@ -422,9 +551,10 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
                 tx,
             )
 
-        critic = TrainState.create(
+        critic = BNTrainState.create(
             apply_fn=critic_def.apply,
             params=critic_params,
+            batch_stats=critic_batch_stats,
             tx=tx,
         )
 
@@ -436,9 +566,10 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             out_shardings=critic_sharding,
         )(critic)
 
-        target_critic = TrainState.create(
+        target_critic = BNTrainState.create(
             apply_fn=critic_def.apply,
             params=critic_params,
+            batch_stats=critic_batch_stats,
             tx=optax.GradientTransformation(lambda _: None, lambda _: None),
         )
 
@@ -469,7 +600,9 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             n_edit_samples=n_edit_samples,
             encode_batch_split=encode_batch_split,
             edit_scale=edit_scale,
+            hetstat_var_lr_multiplier=hetstat_var_lr_multiplier,
             use_double_q_selection=use_double_q_selection,
+            use_clipped_double_q=use_clipped_double_q,
             residual_action_xyzg=residual_action_xyzg,
             batch_split=batch_split,
             actor_tau=actor_tau,
@@ -481,8 +614,15 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             entropy_scale=entropy_scale,
             tau=tau,
             discount=discount,
-            num_qs=num_qs,
-            num_min_qs=num_min_qs,
+            num_atoms=num_atoms,
+            v_min=v_min,
+            v_max=v_max,
+            atoms=atoms,
+            reward_scale_decay=reward_scale_decay,
+            use_reward_normalization=use_reward_normalization,
+            kl_coef=kl_coef,
+            kl_ref_std=kl_ref_std,
+            reward_ms=reward_ms,
             fixed_temperature=fixed_temperature,
             critic_grad_clip_norm=critic_grad_clip_norm,
             data_augmentation_fn=make_data_augmentation_fn(use_full_augmentation),
@@ -525,6 +665,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             "batch_encoder_params": jax.device_put(self.batch_encoder.params, s),
             "residual_actor_params": jax.device_put(self.residual_actor.params, s),
             "target_critic_params": jax.device_put(self.target_critic.params, s),
+            "target_critic_batch_stats": jax.device_put(self.target_critic.batch_stats, s),
         })
 
     def _sample_residual(self, key, residual_params, encoded_obs, states, base_actions):
@@ -546,16 +687,16 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             return jnp.concatenate(chunks)
         return batch_encode(self.batch_encoder.apply_fn, params, observations, stop_gradient=stop_gradient)
 
-    def _compute_q_split(self, critic_fn, critic_params, obs, actions, states):
+    def _compute_q_split(self, critic_fn, critic_params, critic_batch_stats, obs, actions, states):
         if self.batch_split > 1:
             total = obs.shape[0]
             one_call = total // self.batch_split
             q_list = [
-                compute_q(critic_fn, critic_params, obs[i * one_call:(i + 1) * one_call], actions[i * one_call:(i + 1) * one_call], states[i * one_call:(i + 1) * one_call], self.num_min_qs)
+                compute_q(critic_fn, critic_params, critic_batch_stats, self.atoms, obs[i * one_call:(i + 1) * one_call], actions[i * one_call:(i + 1) * one_call], states[i * one_call:(i + 1) * one_call])
                 for i in range(self.batch_split)
             ]
             return jnp.concatenate(q_list)
-        return compute_q(critic_fn, critic_params, obs, actions, states, self.num_min_qs)
+        return compute_q(critic_fn, critic_params, critic_batch_stats, self.atoms, obs, actions, states)
 
     def sample_actions(self, observations, only_base_actions=False):
         # Keep inference-time randomness on the same single device as inference params
@@ -567,6 +708,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         _batch_encoder_params = c.get("batch_encoder_params") or jax.device_put(self.batch_encoder.params, infer_sharding)
         _residual_actor_params = c.get("residual_actor_params") or jax.device_put(self.residual_actor.params, infer_sharding)
         _target_critic_params = c.get("target_critic_params") or jax.device_put(self.target_critic.params, infer_sharding)
+        _target_critic_batch_stats = c.get("target_critic_batch_stats") or jax.device_put(self.target_critic.batch_stats, infer_sharding)
 
         transformed_inputs = self.actor.process_raw_inputs(observations, self.action_dim, self.resize_size)
         transformed_inputs = extract_critic_fields(transformed_inputs, self.actor.model_config.action_dim, self.state_dim)
@@ -600,11 +742,6 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         critic_encoded_obs = critic_encoded_obs.repeat(self.N, axis=0)
 
         if self.N > 1:
-            key, rng = jax.random.split(rng)
-            target_params = subsample_image_ensemble(
-                key, _target_critic_params, self.num_min_qs, self.num_qs
-            )
-
             if self.n_edit_samples > 0:
                 key, rng = jax.random.split(rng, 2)
 
@@ -623,7 +760,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
                 raw_r_samples = self.actor.process_transformed_outputs(full_r_modified)
                 raw_actions = jnp.concatenate([raw_actions, raw_r_samples], axis=0)
 
-            qs = compute_q(self.target_critic.apply_fn, target_params, critic_encoded_obs, transformed_actions, transformed_states, self.num_min_qs)
+            qs = compute_q(self.target_critic.apply_fn, _target_critic_params, _target_critic_batch_stats, self.atoms, critic_encoded_obs, transformed_actions, transformed_states)
 
             idx = jnp.argmax(qs)
 
@@ -694,35 +831,26 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
 
         # Select best actions via Q-values
         if self.N > 1:
-            key, rng = jax.random.split(rng)
-
-            # Double-Q-style decoupled selection/evaluation, togglable via
-            # use_double_q_selection. Legacy behavior (False, default): this
-            # argmax draws its subsample from self.target_critic's ensemble
-            # -- the SAME ensemble update_critic then bootstraps from
-            # downstream (next_qs = self.target_critic.apply_fn(...) on
-            # this exact next_actions, itself another fresh subsample) -- a
-            # single estimator both picking its own favorite candidate and
-            # having that pick trusted as the Bellman target is exactly the
-            # classic maximization-bias setup Double Q-learning exists to
-            # fix. When True: selecting here from a subsample of
-            # self.critic's ensemble (online) while update_critic's
-            # evaluation still draws its own fresh subsample from
-            # self.target_critic (unchanged, downstream) decorrelates the
-            # two steps between two independently-varying estimators. No
-            # new network needed either way -- reuses the existing
-            # online/target ensembles, matching subsample size (num_min_qs
-            # out of num_qs) for direct comparability.
-            selection_critic = self.critic if self.use_double_q_selection else self.target_critic
-            selection_params = subsample_image_ensemble(
-                key, selection_critic.params, self.num_min_qs, self.num_qs
-            )
-
             obs_flat = jax.device_put(jnp.repeat(encoded_obs, total_candidates, axis=0), self.data_sharding)
             states_flat = jax.device_put(jnp.repeat(states, total_candidates, axis=0), self.data_sharding)
             actions_flat = jax.device_put(actions.reshape(-1, actions.shape[-1]), self.data_sharding)
 
-            qs = self._compute_q_split(selection_critic.apply_fn, selection_params, obs_flat, actions_flat, states_flat)
+            # Double-Q-style decoupled selection/evaluation, togglable via
+            # use_double_q_selection. Legacy behavior (False, default): this
+            # argmax uses self.target_critic -- the SAME network whose
+            # Q-estimate update_critic then bootstraps from downstream
+            # (next_logits = self.target_critic.apply_fn(...) on this exact
+            # next_actions) -- a single estimator both picking its own
+            # favorite candidate AND having that pick trusted as the
+            # Bellman target is exactly the classic maximization-bias setup
+            # Double Q-learning exists to fix. When True: selecting here
+            # with self.critic (online) while update_critic's evaluation
+            # still uses self.target_critic (unchanged, downstream)
+            # decorrelates the two steps between two independently-varying
+            # estimators. No new network needed either way -- reuses the
+            # existing online/target pair.
+            selection_critic = self.critic if self.use_double_q_selection else self.target_critic
+            qs = self._compute_q_split(selection_critic.apply_fn, selection_critic.params, selection_critic.batch_stats, obs_flat, actions_flat, states_flat)
             qs = qs.reshape(batch_size, total_candidates)
 
             best_indices = jnp.argmax(qs, axis=1)
@@ -738,22 +866,18 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             # Diagnostic: quantify the online/target disagreement on
             # whichever action actually got selected -- meaningful and
             # logged the same way regardless of the toggle above. qs
-            # already holds the SELECTING ensemble's opinion; we only need
-            # one more (freshly subsampled) Q pass, from the OTHER
-            # ensemble, on the same picks. A consistently positive
-            # (online - target) gap is direct evidence of the
-            # overestimation bias use_double_q_selection is meant to
-            # address.
-            key, rng = jax.random.split(rng)
+            # already holds the SELECTING network's opinion; we only need
+            # one more Q pass, from the OTHER network, on the same picks.
+            # A consistently positive (online - target) gap is direct
+            # evidence of the overestimation bias use_double_q_selection is
+            # meant to address.
             if self.use_double_q_selection:
                 online_q_at_argmax = qs[batch_indices, best_indices]
-                other_params = subsample_image_ensemble(key, self.target_critic.params, self.num_min_qs, self.num_qs)
-                other_qs_flat = self._compute_q_split(self.target_critic.apply_fn, other_params, obs_flat, actions_flat, states_flat)
+                other_qs_flat = self._compute_q_split(self.target_critic.apply_fn, self.target_critic.params, self.target_critic.batch_stats, obs_flat, actions_flat, states_flat)
                 target_q_at_argmax = other_qs_flat.reshape(batch_size, total_candidates)[batch_indices, best_indices]
             else:
                 target_q_at_argmax = qs[batch_indices, best_indices]
-                other_params = subsample_image_ensemble(key, self.critic.params, self.num_min_qs, self.num_qs)
-                other_qs_flat = self._compute_q_split(self.critic.apply_fn, other_params, obs_flat, actions_flat, states_flat)
+                other_qs_flat = self._compute_q_split(self.critic.apply_fn, self.critic.params, self.critic.batch_stats, obs_flat, actions_flat, states_flat)
                 online_q_at_argmax = other_qs_flat.reshape(batch_size, total_candidates)[batch_indices, best_indices]
             overestimation_gap = jnp.mean(online_q_at_argmax - target_q_at_argmax)
         else:
@@ -794,15 +918,46 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
 
             actions = residual_scaled + batch["actions"]
 
-            qs = self.critic.apply_fn(
-                {"params": self.critic.params},
+            logits = self.critic.apply_fn(
+                {"params": self.critic.params, "batch_stats": self.critic.batch_stats},
                 observations,
                 actions,
-                True,
-                p=batch['critic_states'], 
-                rngs={"dropout": key2},
-            )  # training=True
-            q = qs.mean(axis=0)
+                False,
+                p=batch['critic_states'],
+            )
+            # train=False here: this call SCORES the residual actor's
+            # proposed action (its output feeds the actor's own gradient) —
+            # it doesn't train the critic itself, so it should use the
+            # critic's stable running BatchNorm statistics, exactly like
+            # every other place the critic is queried (rather than trained)
+            # elsewhere in this file (compute_q, sample_actions,
+            # sample_batch_actions). No more dropout rng either — the new
+            # categorical critic architecture has no dropout layer (XQC's
+            # own recipe doesn't include one).
+            q = q_from_logits(logits, self.atoms)
+            # KL regularization (XQCfD-style: replaces/augments the generic
+            # entropy bonus with a penalty for the edit distribution
+            # deviating from a fixed reference — "prefer staying close to
+            # zero residual unless Q strongly justifies deviating", a
+            # learned/adaptive analogue of the hard edit_scale cap).
+            # Computed in the PRE-TANH (Gaussian) space, not the squashed
+            # action space — KL between two tanh-squashed distributions has
+            # no clean closed form (the same reason TFP can't compute
+            # entropy() for a TanhTransformedDistribution either, which is
+            # what forced the try/except fallback in ppo.py/grpo.py). Two
+            # Gaussians DO have a closed-form KL, so we use dist.distribution
+            # (the underlying pre-squash MultivariateNormalDiag) directly.
+            # kl_coef=0.0 (the default) makes this an exact no-op — same
+            # behavior as before this was added.
+            base_dist = dist.distribution
+            residual_mean = base_dist.mean()
+            residual_std = base_dist.stddev()
+            kl_per_dim = (
+                jnp.log(self.kl_ref_std / residual_std)
+                + (residual_std ** 2 + residual_mean ** 2) / (2 * self.kl_ref_std ** 2)
+                - 0.5
+            )
+            kl_penalty = kl_per_dim.sum(axis=-1)
             # Use a manually fixed temperature when configured (bypasses the learned
             # temperature entirely) — a quick diagnostic Jesse suggested to see if the
             # runaway/unconverged alpha behavior is itself contributing to instability,
@@ -812,20 +967,215 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
                 else self.temp.apply_fn({"params": self.temp.params})
             )
             residual_actor_loss = (
-                self.entropy_scale * log_probs * temperature - q
+                self.entropy_scale * log_probs * temperature - q + self.kl_coef * kl_penalty
             ).mean()
             return residual_actor_loss, {
                 "residual_q": q.mean(),
                 "residual_actor_loss": residual_actor_loss,
                 "entropy": -log_probs.mean(),
                 "temperature": jnp.asarray(temperature),
+                "kl_penalty": kl_penalty.mean(),
+                # Pre-tanh Gaussian stats (already computed above for the KL
+                # formula itself) — logged so kl_ref_std can be calibrated
+                # against the actual equilibrium std under entropy alone,
+                # rather than guessed. mean_residual_scaled_norm (elsewhere)
+                # is POST-tanh and POST-edit_scale, so it saturates and
+                # doesn't directly show this.
+                "residual_mean_norm": jnp.linalg.norm(residual_mean, axis=-1).mean(),
+                "residual_std_mean": residual_std.mean(),
             }
 
         grads, actor_info = jax.grad(residual_actor_loss_fn, has_aux=True)(self.residual_actor.params)
         residual_actor = self.residual_actor.apply_gradients(grads=grads)
 
+        # Diagnostic: HetStat's raw, PRE-bound variance-scale parameter,
+        # read directly from the params tree (not derived from the already
+        # tanh/smooth-bound-transformed residual_std_mean above). Lets us
+        # tell directly whether this parameter is actually moving under
+        # gradient pressure (e.g. from kl_coef pulling std toward
+        # kl_ref_std) or effectively stuck near its init value, instead of
+        # inferring it indirectly through the heavily compressed
+        # log -> smooth-bound -> exp chain that residual_std_mean goes
+        # through. None (and simply omitted) for architectures without this
+        # param (plain TanhNormal, EXPOLearner).
+        # Diagnostic: HetStat's raw variance-scale parameter, read directly
+        # from the params tree (not derived from the already
+        # tanh/smooth-bound-transformed residual_std_mean above). Lets us
+        # tell directly whether this parameter is actually moving under
+        # gradient pressure (e.g. from kl_coef pulling std toward
+        # kl_ref_std) or effectively stuck near its init value, instead of
+        # inferring it indirectly through the heavily compressed
+        # log -> smooth-bound -> exp chain that residual_std_mean goes
+        # through. Post-reparameterization (see hetstat.py's
+        # HetStatLogVarScaleRaw), this is logged as the EFFECTIVE shift in
+        # log_sigma_sq units (raw * var_lr_multiplier) -- 0 = exactly at
+        # init, negative = moving the direction kl_coef pulls toward --
+        # directly comparable to the pre-reparameterization absolute-value
+        # tracking, just relative to init instead of absolute. None (and
+        # simply omitted) for architectures without this param (plain
+        # TanhNormal, EXPOLearner).
+        hetstat_raw_var = _find_param_by_name(self.residual_actor.params, "HetStatLogVarScaleRaw")
+        if hetstat_raw_var is not None:
+            actor_info = dict(actor_info)
+            actor_info["hetstat_log_sigma_sq_shift_mean"] = hetstat_raw_var.mean() * self.hetstat_var_lr_multiplier
+
         return self.replace(residual_actor=residual_actor, rng=rng), actor_info
-    
+
+    def pretrain_actor_bc(self, batch: DatasetDict) -> Tuple["EXPOLearner", Dict[str, float]]:
+        """
+        BC warm-start for the residual actor (XQCfD-style "policy pretraining"),
+        run BEFORE critic pretraining so that the argmax-over-candidates
+        mechanism used by critic pretraining sees sensible "edited" candidates
+        instead of the residual actor's fresh (random / HetStat-max-entropy)
+        initialization. Mirrors the paper's own ordering: policy pretraining
+        to BC-level first, THEN critic pretraining for actor/critic coherence.
+
+        Target: base_VLA(s) + residual_actor(s) ~= demo_action. base_VLA is
+        frozen, so this only trains the residual actor. Uses the
+        deterministic dist.mode() (= tanh(dist.distribution.mode()), same
+        approximation SAC-style implementations use for a greedy action)
+        rather than the reparameterized sample used by the Q-maximizing actor
+        loss elsewhere -- standard for BC pretraining, and it sidesteps
+        needing to invert the tanh squashing (numerically unstable near
+        saturation when the required correction exceeds edit_scale).
+        """
+        key, rng = jax.random.split(self.rng)
+        noise_key, rng = jax.random.split(rng)
+        dropout_key, rng = jax.random.split(rng)
+
+        observations = batch_encode(
+            self.batch_encoder.apply_fn, self.batch_encoder.params,
+            batch["observations"], stop_gradient=True,
+        )
+        observations = jax.device_put(observations, self.data_sharding)
+        states = jax.device_put(batch["states"], self.data_sharding)
+        batch_size = batch["states"].shape[0]
+
+        # Base VLA action for the CURRENT state -- one deterministic candidate
+        # per row (num_samples=1), not the N-candidate set used for argmax
+        # elsewhere.
+        transformed_inputs = prepare_actor_sampling_batch_current(batch)
+        base_actions, _ = self.actor.sample_training_actions(
+            transformed_inputs=transformed_inputs,
+            train_state=self.actor_train_state,
+            rng=key,
+            train=False,
+            num_samples=1,
+        )
+        base_actions = base_actions[:, :self.replan_steps, :]
+        base_actions = base_actions.reshape(batch_size, self.full_action_dim)
+        base_actions = jax.lax.stop_gradient(base_actions)
+
+        # Diagnostic: resample the base VLA action a SECOND time, same
+        # states, independent rng key. pi_0.5 is a flow-matching model --
+        # sample_training_actions runs a stochastic integration, not a
+        # deterministic function of the state -- so two calls for the same
+        # state won't generally agree. This measures that intrinsic
+        # resampling noise directly, in the same L2-norm units as
+        # bc_demo_vs_base_action_gap, so it's directly comparable: it's a
+        # floor under bc_residual_vs_demo_gap that no amount of edit_scale,
+        # learning rate, or BC steps can push below, since the residual
+        # actor is implicitly chasing a target (demo - base) that jitters
+        # from one base_action draw to the next by roughly this much.
+        base_actions_2, _ = self.actor.sample_training_actions(
+            transformed_inputs=transformed_inputs,
+            train_state=self.actor_train_state,
+            rng=noise_key,
+            train=False,
+            num_samples=1,
+        )
+        base_actions_2 = base_actions_2[:, :self.replan_steps, :]
+        base_actions_2 = base_actions_2.reshape(batch_size, self.full_action_dim)
+        base_action_resample_noise = jnp.linalg.norm(base_actions - base_actions_2, axis=-1).mean()
+
+        demo_actions = batch["actions"]
+
+        def _per_action_dim_gap(diff: jnp.ndarray) -> jnp.ndarray:
+            """diff: (batch, full_action_dim) -> (action_dim,), one scalar per
+            PHYSICAL action channel (e.g. per joint / gripper for a
+            pd_joint_delta_pos task), not per flat (replan_step, channel)
+            slot. Un-flattens to (batch, replan_steps, action_dim) -- same
+            ordering already relied on elsewhere (e.g. sample_batch_actions'
+            `r_modified = r_samples.reshape(n_edit_samples, replan_steps,
+            action_dim)`) -- then takes the L2 norm over the replan_steps
+            axis (collapsing "which of the replan_steps timesteps" the same
+            way the aggregate bc_*_gap metrics already collapse the full
+            flat vector), and finally averages over the batch. Same L2-norm
+            units as bc_demo_vs_base_action_gap/bc_residual_vs_demo_gap --
+            summing every per-dim value's square and sqrt-ing would roughly
+            recover those (not exact: mean-of-norms != norm-of-means).
+            Static/concrete self.action_dim, self.replan_steps -> plain
+            Python unpacking below, no jax control flow involved."""
+            per_dim = jnp.linalg.norm(
+                diff.reshape(diff.shape[0], self.replan_steps, self.action_dim), axis=1
+            ).mean(axis=0)
+            return per_dim
+
+        def bc_loss_fn(actor_params):
+            dist = self.residual_actor.apply_fn(
+                {"params": actor_params}, observations, actions=base_actions,
+                training=True, p=states, rngs={"dropout": dropout_key},
+            )
+            residual_squashed = dist.mode()
+            residual_scaled = self._apply_residual_xyzg_mask(residual_squashed * self.edit_scale)
+            predicted_action = residual_scaled + base_actions
+
+            bc_loss = jnp.mean(jnp.sum((predicted_action - demo_actions) ** 2, axis=-1))
+
+            # Per-channel breakdown: is the demo/base gap (and how much of it
+            # survives after the residual correction) concentrated on a few
+            # action channels -- e.g. gripper -- rather than spread evenly
+            # across all self.action_dim channels? If so, a single scalar
+            # edit_scale calibrated from the AGGREGATE gap (see
+            # rl_edit_scale's derivation comment in the task YAML) can leave
+            # specific channels structurally unable to close their share of
+            # the gap even though the aggregate looks "covered with margin".
+            demo_vs_base_per_dim = _per_action_dim_gap(demo_actions - base_actions)
+            residual_vs_demo_per_dim = _per_action_dim_gap(predicted_action - demo_actions)
+            per_dim_info = {}
+            for d in range(self.action_dim):
+                per_dim_info[f"bc_demo_vs_base_action_gap_dim{d}"] = demo_vs_base_per_dim[d]
+                per_dim_info[f"bc_residual_vs_demo_gap_dim{d}"] = residual_vs_demo_per_dim[d]
+
+            return bc_loss, {
+                "bc_loss": bc_loss,
+                "bc_residual_norm": jnp.linalg.norm(residual_scaled, axis=-1).mean(),
+                "bc_demo_vs_base_action_gap": jnp.linalg.norm(demo_actions - base_actions, axis=-1).mean(),
+                # Same L2-norm scale as bc_demo_vs_base_action_gap (unlike
+                # bc_loss, which is a sum-of-squares) -- lets you directly
+                # compare "gap before correction" vs "gap after correction"
+                # in the same units, rather than inferring it from a
+                # squared-scale loss.
+                "bc_residual_vs_demo_gap": jnp.linalg.norm(predicted_action - demo_actions, axis=-1).mean(),
+                "base_action_resample_noise": base_action_resample_noise,
+                **per_dim_info,
+            }
+
+        grads, bc_info = jax.grad(bc_loss_fn, has_aux=True)(self.residual_actor.params)
+        residual_actor = self.residual_actor.apply_gradients(grads=grads)
+
+        # Same diagnostic as update_residual_actor -- see that docstring.
+        # Expected to stay essentially unchanged here specifically, since
+        # dist.mode() = tanh(dist.distribution.mode()) doesn't depend on
+        # std at all, so bc_loss's gradient shouldn't touch this parameter.
+        # Logged anyway as a clean baseline: confirms what value online RL
+        # actually starts from, and rules out BC warm-start itself as an
+        # explanation if it turns out NOT to have moved during BC either.
+        # Same diagnostic as update_residual_actor -- see that docstring.
+        # Expected to stay essentially unchanged (shift ~0) here
+        # specifically, since dist.mode() = tanh(dist.distribution.mode())
+        # doesn't depend on std at all, so bc_loss's gradient shouldn't
+        # touch this parameter. Logged anyway as a clean baseline: confirms
+        # what value online RL actually starts from, and rules out BC
+        # warm-start itself as an explanation if it turns out NOT to have
+        # moved during BC either.
+        hetstat_raw_var = _find_param_by_name(self.residual_actor.params, "HetStatLogVarScaleRaw")
+        if hetstat_raw_var is not None:
+            bc_info = dict(bc_info)
+            bc_info["hetstat_log_sigma_sq_shift_mean"] = hetstat_raw_var.mean() * self.hetstat_var_lr_multiplier
+
+        return self.replace(residual_actor=residual_actor, rng=rng), bc_info
+
     def update_actor(self, batch: DatasetDict) -> Tuple[AgentLearner, Dict[str, float]]:
         actor_batch = self.actor.prepare_batch_for_actor(batch)
         
@@ -871,32 +1221,90 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         next_actions, sample_info, rng = self.sample_batch_actions(batch)
         next_actions = jax.device_put(next_actions, self.data_sharding)
 
-        # Used only for REDQ.
-        key, rng = jax.random.split(rng)
-        target_params = subsample_image_ensemble(
-            key, self.target_critic.params, self.num_min_qs, self.num_qs
-        )
-
         key, rng = jax.random.split(rng)
 
         next_observations = batch_encode(self.batch_encoder.apply_fn, self.batch_encoder.params, 
                                         batch["next_observations"], stop_gradient=True)
         next_observations = jax.device_put(next_observations, self.data_sharding)  
 
-        next_qs = self.target_critic.apply_fn(
-            {"params": target_params},
+        # No ensemble subsampling anymore (single critic + single target
+        # critic — XQCfD's own reported setup uses none). training=False:
+        # BatchNorm uses its running mean/var here, not this batch's.
+        next_logits = self.target_critic.apply_fn(
+            {"params": self.target_critic.params, "batch_stats": self.target_critic.batch_stats},
             next_observations,
             next_actions,
-            False,  # training=False: target must be deterministic (no dropout)
+            False,
             p=batch['next_critic_states'],
-            sample_num=self.num_min_qs,
         )
+        next_probs = jax.nn.softmax(next_logits, axis=-1)
 
-        next_q_nan_mask = jnp.isnan(next_qs)
-        next_q_nan_ratio = jnp.mean(next_q_nan_mask)
-        next_qs = jnp.where(next_q_nan_mask, 0.0, next_qs)
-        next_q = next_qs.min(axis=0)
-        target_q = batch["rewards"] + (self.discount ** self.replan_steps) * batch["masks"] * next_q
+        # Clipped Double-Q (TD3-style), togglable via use_clipped_double_q,
+        # independent of (and stackable with) use_double_q_selection above.
+        # That flag decides WHO SELECTS next_actions (target vs online
+        # critic's argmax); this one decides how next_actions gets
+        # EVALUATED for the Bellman target -- unconditionally on
+        # target_critic alone (legacy, False) vs the more conservative of
+        # target_critic AND critic (online), every single step, rather than
+        # only correcting after the two have already drifted far apart.
+        # Since this is a distributional (categorical) critic rather than a
+        # scalar one, "minimum" means picking whichever NETWORK's full
+        # predicted distribution has the lower expectation for this
+        # (next_state, next_action) -- the projection needs an entire
+        # distribution to project, not just a scalar -- so the "losing"
+        # network's distribution is discarded whole, not blended in.
+        if self.use_clipped_double_q:
+            next_logits_online = self.critic.apply_fn(
+                {"params": self.critic.params, "batch_stats": self.critic.batch_stats},
+                next_observations,
+                next_actions,
+                False,
+                p=batch['next_critic_states'],
+            )
+            next_probs_online = jax.nn.softmax(next_logits_online, axis=-1)
+
+            next_q_target_raw = jnp.sum(next_probs * self.atoms, axis=-1)
+            next_q_online_raw = jnp.sum(next_probs_online * self.atoms, axis=-1)
+            use_target_dist = next_q_target_raw <= next_q_online_raw
+            clipped_double_q_gap = jnp.mean(next_q_online_raw - next_q_target_raw)
+            next_probs = jnp.where(use_target_dist[:, None], next_probs, next_probs_online)
+        else:
+            clipped_double_q_gap = jnp.array(0.0, dtype=jnp.float32)
+
+        # Same defensive NaN handling as the old scalar critic (there
+        # replacing a NaN Q with 0.0) — replace a NaN row's distribution with
+        # a uniform one (maximum entropy, Q = midpoint of the support) rather
+        # than letting a single bad row poison the whole batch's loss.
+        next_probs_nan_mask = jnp.isnan(next_probs).any(axis=-1)
+        next_q_nan_ratio = jnp.mean(next_probs_nan_mask)
+        uniform_probs = jnp.ones_like(next_probs) / self.num_atoms
+        next_probs = jnp.where(next_probs_nan_mask[:, None], uniform_probs, next_probs)
+
+        # Normalize rewards by a running RMS estimate BEFORE the Bellman
+        # projection, keeping the fixed [v_min, v_max] support meaningful
+        # regardless of this task's absolute reward scale — see create()'s
+        # docstring for reward_scale_decay. Uses the scale from BEFORE this
+        # batch updates it (below), so there's no within-batch leakage.
+        # If use_reward_normalization=False, skip this entirely (scale=1.0,
+        # raw rewards passed straight through) -- avoids the vicious-cycle
+        # risk Jesse flagged: reward_ms shrinking as success rate drops would
+        # otherwise INFLATE the normalized reward for the rare successes that
+        # remain, rather than keeping it stable.
+        if self.use_reward_normalization:
+            reward_scale = jnp.sqrt(self.reward_ms + 1e-6)
+        else:
+            reward_scale = jnp.array(1.0)
+        normalized_rewards = batch["rewards"] / reward_scale
+
+        discount_k = self.discount ** self.replan_steps
+        target_probs = categorical_bellman_projection(
+            next_probs, normalized_rewards, batch["masks"], discount_k,
+            self.atoms, self.v_min, self.v_max,
+        )
+        target_q = jnp.sum(target_probs * self.atoms, axis=-1)  # E[atoms] in NORMALIZED units, for logging — not part of the loss (the loss uses the full distribution, not this scalar summary)
+        target_q_denorm = target_q * reward_scale  # same quantity, rescaled back to this task's raw reward units, purely for human-readable logging
+
+        new_reward_ms = self.reward_scale_decay * self.reward_ms + (1 - self.reward_scale_decay) * jnp.mean(batch["rewards"] ** 2)
 
         key, rng = jax.random.split(rng)
 
@@ -920,35 +1328,60 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             observations = jax.lax.with_sharding_constraint(observations, self.data_sharding)
             # Per-sample L2 norm of the encoder's output feature vector — the
             # thing that feeds directly into the critic's Q computation.
-            # Diagnostic for Albert's hypothesis: an unfrozen, unclipped ResNet-34
-            # inflating its own feature magnitudes to chase a rising Q target.
-            # Compare this against target_q_max/critic_loss over training —
-            # if all three climb together, that's direct evidence for it.
             encoder_feature_norms = jnp.linalg.norm(observations, axis=-1)
-            qs = self.critic.apply_fn(
-                {"params": params_dict['critic']},
+            # training=True: BatchNorm uses (and updates) this batch's own
+            # statistics. mutable=['batch_stats'] returns the updated running
+            # mean/var alongside the logits — captured here as `model_state`
+            # and threaded back onto the critic TrainState AFTER
+            # jax.grad returns (batch_stats are a forward-pass running
+            # average, not something to differentiate w.r.t. params).
+            logits, model_state = self.critic.apply_fn(
+                {"params": params_dict['critic'], "batch_stats": self.critic.batch_stats},
                 observations,
                 batch["actions"],
                 True,
-                p=batch['critic_states'], 
-                rngs={"dropout": key},
+                p=batch['critic_states'],
+                mutable=['batch_stats'],
             )
-            critic_loss = (((qs - target_q) ** 2) * batch["valids"]).mean()
+            per_sample_loss = categorical_cross_entropy_loss(logits, target_probs)
+            critic_loss = (per_sample_loss * batch["valids"]).mean()
+            q = q_from_logits(logits, self.atoms)
+            q_denorm = q * reward_scale  # rescaled back to raw reward units, for human-readable logging only
             return critic_loss, {
                 "critic_loss": critic_loss,
-                "q": qs.mean(),
-                "q_min": qs.min(),
-                "q_max": qs.max(),
+                "q": q.mean(),
+                "q_min": q.min(),
+                "q_max": q.max(),
                 "target_q_min": target_q.min(),
                 "target_q_max": target_q.max(),
                 "target_q_mean": target_q.mean(),
+                # Same quantities rescaled back to this task's raw reward
+                # units — NOT bounded (reward_scale itself changes over
+                # training), purely for human interpretability. The
+                # normalized q/target_q above are the ones that are
+                # structurally guaranteed to stay within [v_min, v_max].
+                "q_denorm": q_denorm.mean(),
+                "q_min_denorm": q_denorm.min(),
+                "q_max_denorm": q_denorm.max(),
+                "target_q_max_denorm": target_q_denorm.max(),
+                "target_q_min_denorm": target_q_denorm.min(),
+                "reward_scale": reward_scale,
                 "encoder_feature_norm_mean": encoder_feature_norms.mean(),
                 "encoder_feature_norm_max": encoder_feature_norms.max(),
+                "_new_critic_batch_stats": model_state["batch_stats"],
             }
 
         grads, info = jax.grad(critic_loss_fn, has_aux=True)(params_dict)
+        new_critic_batch_stats = info.pop("_new_critic_batch_stats")
 
         critic = self.critic.apply_gradients(grads=grads["critic"])
+        # XQC's post-optimizer-step weight normalization: project every
+        # Dense kernel's columns back to unit L2 norm, AFTER the gradient
+        # step (not part of the gradient computation itself).
+        critic = critic.replace(
+            params=project_weights_to_unit_norm(critic.params),
+            batch_stats=new_critic_batch_stats,
+        )
 
         if self.freeze_critic_encoder:
             batch_encoder = self.batch_encoder
@@ -974,16 +1407,22 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             info["critic_grad_norm_post_clip"] = critic_grad_norm
         info["critic_param_norm"] = optax.global_norm(critic.params)
         info["next_q_nan_ratio"] = next_q_nan_ratio
+        info["clipped_double_q_gap"] = clipped_double_q_gap
         
         target_critic_params = optax.incremental_update(
             critic.params, self.target_critic.params, self.tau
         )
-        target_critic = self.target_critic.replace(params=target_critic_params)
+        target_critic_batch_stats = optax.incremental_update(
+            critic.batch_stats, self.target_critic.batch_stats, self.tau
+        )
+        target_critic = self.target_critic.replace(params=target_critic_params, batch_stats=target_critic_batch_stats)
         info["target_critic_param_norm"] = optax.global_norm(target_critic_params)
 
         info.update(sample_info)
 
-        return self.replace(critic=critic, target_critic=target_critic, batch_encoder=batch_encoder, rng=rng), info
+        info["reward_ms"] = new_reward_ms
+
+        return self.replace(critic=critic, target_critic=target_critic, batch_encoder=batch_encoder, reward_ms=new_reward_ms, rng=rng), info
 
 
     def update(self, agent, batch: DatasetDict, utd_ratio: int, actor_batch: DatasetDict = None):

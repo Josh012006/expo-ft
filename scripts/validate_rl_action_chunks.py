@@ -56,7 +56,7 @@ def build_model_config(cfg):
     import importlib.util
     model_cls_name = getattr(cfg, "model_cls", "EXPOLearner")
     model_config_path = REPO_ROOT / (
-        "configs/model/expo_ft_old_pi_config.py" if model_cls_name == "EXPOLearnerOld" else "configs/model/expo_ft_pi_config.py"
+        "configs/model/expo_ft_categorical_pi_config.py" if model_cls_name == "EXPOLearnerCategorical" else "configs/model/expo_ft_pi_config.py"
     )
     spec = importlib.util.spec_from_file_location("model_config", str(model_config_path))
     mod = importlib.util.module_from_spec(spec)

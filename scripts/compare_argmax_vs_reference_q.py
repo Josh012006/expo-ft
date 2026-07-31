@@ -71,8 +71,8 @@ def main():
     cfg = load_task_config(args.config)
     cfg.normalize_action = True
 
-    if getattr(cfg, "model_cls", "EXPOLearner") == "EXPOLearnerOld":
-        from expo_ft.agents.alg.expo_ft_old import load_agent, restore_checkpoint
+    if getattr(cfg, "model_cls", "EXPOLearner") == "EXPOLearnerCategorical":
+        from expo_ft.agents.alg.expo_ft_categorical import load_agent, restore_checkpoint
     else:
         from expo_ft.agents.alg.expo_ft import load_agent, restore_checkpoint
 
@@ -91,7 +91,7 @@ def main():
     import importlib.util
     model_cls_name = getattr(cfg, "model_cls", "EXPOLearner")
     model_config_path = REPO_ROOT / (
-        "configs/model/expo_ft_old_pi_config.py" if model_cls_name == "EXPOLearnerOld" else "configs/model/expo_ft_pi_config.py"
+        "configs/model/expo_ft_categorical_pi_config.py" if model_cls_name == "EXPOLearnerCategorical" else "configs/model/expo_ft_pi_config.py"
     )
     spec = importlib.util.spec_from_file_location("model_config", str(model_config_path))
     mod = importlib.util.module_from_spec(spec)
@@ -263,7 +263,7 @@ def main():
         #
         # _compute_q_split's signature itself differs by architecture:
         # EXPOLearner (categorical, BatchNorm) takes batch_stats as a
-        # required arg; EXPOLearnerOld (MSE/REDQ, no BatchNorm at all) has no
+        # required arg; EXPOLearner (MSE/REDQ, no BatchNorm at all) has no
         # batch_stats field on its target_critic TrainState and takes one
         # fewer argument. Branch on hasattr() rather than trusting model_cls
         # from the YAML, so this stays correct regardless of how the agent
@@ -280,9 +280,9 @@ def main():
                 encoded_obs, reference_actions, batch["critic_states"],
             )
         else:
-            # EXPOLearnerOld's _compute_q_split(..., num_min_qs=self.num_min_qs)
+            # EXPOLearner's _compute_q_split(..., num_min_qs=self.num_min_qs)
             # expects critic_params to ALREADY be subsampled down to
-            # num_min_qs networks -- every internal caller in expo_ft_old.py
+            # num_min_qs networks -- every internal caller in expo_ft.py
             # (update_critic, sample_batch_actions) calls
             # subsample_image_ensemble() first and only ever passes the
             # subsampled result in. agent.target_critic.params holds the FULL
