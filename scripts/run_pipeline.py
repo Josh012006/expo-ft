@@ -152,6 +152,8 @@ _MODEL_CONFIG_BY_CLS = {
     "EXPOLearnerCategorical": "configs/model/expo_ft_categorical_pi_config.py",
     "PPOLearner": "configs/model/ppo_pi_config.py",
     "GRPOLearner": "configs/model/grpo_pi_config.py",
+    "PPOResidualLearner": "configs/model/ppo_residual_pi_config.py",
+    "GRPOResidualLearner": "configs/model/grpo_residual_pi_config.py",
     "SACLearner": "configs/model/sac_pi_config.py",
     "BCLearner": "configs/model/dagger_pi_config.py",
 }

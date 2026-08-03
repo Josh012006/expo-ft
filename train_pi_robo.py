@@ -146,6 +146,47 @@ def main(_):
         FLAGS.config.actor_pretrain_steps = int(getattr(cfg, "grpo_actor_pretrain_steps", FLAGS.config.actor_pretrain_steps))
         FLAGS.config.rollout_length = int(getattr(cfg, "grpo_rollout_length", FLAGS.config.rollout_length))
         FLAGS.config.actor_log_std_min = float(getattr(cfg, "grpo_actor_log_std_min", FLAGS.config.actor_log_std_min))
+    elif model_cls == "PPOResidualLearner":
+        # Same fields as PPOLearner's own override block above, EXCEPT
+        # actor_pretrain_steps -- there is no pretrain_actor_bc on this
+        # class (no random-init-actor problem to warm-start away, see
+        # ppo_residual_pi_config.py's docstring), so that field does not
+        # exist on this config at all; setting it would error. edit_scale
+        # is new here (unused by plain PPOLearner).
+        FLAGS.config.actor_lr  = float(getattr(cfg, "ppo_lr", FLAGS.config.actor_lr))
+        FLAGS.config.critic_lr = float(getattr(cfg, "ppo_lr", FLAGS.config.critic_lr))
+        FLAGS.config.discount  = float(getattr(cfg, "ppo_discount", FLAGS.config.discount))
+        FLAGS.config.gae_lambda        = float(getattr(cfg, "ppo_gae_lambda", FLAGS.config.gae_lambda))
+        FLAGS.config.clip_eps          = float(getattr(cfg, "ppo_clip_eps", FLAGS.config.clip_eps))
+        FLAGS.config.value_loss_coef   = float(getattr(cfg, "ppo_value_loss_coef", FLAGS.config.value_loss_coef))
+        FLAGS.config.entropy_coef      = float(getattr(cfg, "ppo_entropy_coef", FLAGS.config.entropy_coef))
+        _ppo_value_clip_eps = getattr(cfg, "ppo_value_clip_eps", FLAGS.config.value_clip_eps)
+        FLAGS.config.value_clip_eps = float(_ppo_value_clip_eps) if _ppo_value_clip_eps is not None else None
+        _ppo_max_grad_norm = getattr(cfg, "ppo_max_grad_norm", FLAGS.config.max_grad_norm)
+        FLAGS.config.max_grad_norm = float(_ppo_max_grad_norm) if _ppo_max_grad_norm is not None else None
+        FLAGS.config.num_minibatches = int(getattr(cfg, "ppo_num_minibatches", FLAGS.config.num_minibatches))
+        if hasattr(cfg, "ppo_hidden_dims"):
+            FLAGS.config.hidden_dims = tuple(cfg.ppo_hidden_dims)
+        FLAGS.config.rollout_length = int(getattr(cfg, "ppo_rollout_length", FLAGS.config.rollout_length))
+        FLAGS.config.actor_log_std_min = float(getattr(cfg, "ppo_actor_log_std_min", FLAGS.config.actor_log_std_min))
+        FLAGS.config.edit_scale = float(getattr(cfg, "ppo_edit_scale", FLAGS.config.edit_scale))
+    elif model_cls == "GRPOResidualLearner":
+        # Same fields as GRPOLearner's own override block above, EXCEPT
+        # actor_pretrain_steps (same rationale as PPOResidualLearner's
+        # branch just above), plus edit_scale.
+        FLAGS.config.actor_lr     = float(getattr(cfg, "grpo_lr", FLAGS.config.actor_lr))
+        FLAGS.config.group_size   = int(getattr(cfg, "grpo_group_size", FLAGS.config.group_size))
+        FLAGS.config.clip_eps     = float(getattr(cfg, "grpo_clip_eps", FLAGS.config.clip_eps))
+        FLAGS.config.kl_coef      = float(getattr(cfg, "grpo_kl_coef", FLAGS.config.kl_coef))
+        FLAGS.config.entropy_coef = float(getattr(cfg, "grpo_entropy_coef", FLAGS.config.entropy_coef))
+        _grpo_max_grad_norm = getattr(cfg, "grpo_max_grad_norm", FLAGS.config.max_grad_norm)
+        FLAGS.config.max_grad_norm = float(_grpo_max_grad_norm) if _grpo_max_grad_norm is not None else None
+        FLAGS.config.num_minibatches = int(getattr(cfg, "grpo_num_minibatches", FLAGS.config.num_minibatches))
+        if hasattr(cfg, "grpo_hidden_dims"):
+            FLAGS.config.hidden_dims = tuple(cfg.grpo_hidden_dims)
+        FLAGS.config.rollout_length = int(getattr(cfg, "grpo_rollout_length", FLAGS.config.rollout_length))
+        FLAGS.config.actor_log_std_min = float(getattr(cfg, "grpo_actor_log_std_min", FLAGS.config.actor_log_std_min))
+        FLAGS.config.edit_scale = float(getattr(cfg, "grpo_edit_scale", FLAGS.config.edit_scale))
     elif model_cls == "SACLearner":
         FLAGS.config.actor_lr  = float(getattr(cfg, "sac_lr", FLAGS.config.actor_lr))
         FLAGS.config.critic_lr = float(getattr(cfg, "sac_lr", FLAGS.config.critic_lr))
@@ -279,6 +320,17 @@ def main(_):
         from expo_ft.agents.alg.ppo import load_agent, restore_checkpoint, save_checkpoint
     elif model_cls == "GRPOLearner":
         from expo_ft.agents.alg.grpo import load_agent, restore_checkpoint, save_checkpoint
+    elif model_cls == "PPOResidualLearner":
+        # Same on-policy PPO machinery as PPOLearner, but trained on a
+        # residual policy conditioned on the frozen VLA's own sampled base
+        # action (via ExpoFT's own residual actor construction), instead of
+        # a standalone actor with zero connection to it — see
+        # ppo_residual.py's module docstring for the full rationale.
+        from expo_ft.agents.alg.ppo_residual import load_agent, restore_checkpoint, save_checkpoint
+    elif model_cls == "GRPOResidualLearner":
+        # GRPO counterpart of PPOResidualLearner — same residual mechanism,
+        # group-relative advantage instead of GAE. See grpo_residual.py.
+        from expo_ft.agents.alg.grpo_residual import load_agent, restore_checkpoint, save_checkpoint
     elif model_cls == "SACLearner":
         from expo_ft.agents.alg.sac import load_agent, restore_checkpoint, save_checkpoint
     else:
@@ -294,9 +346,17 @@ def main(_):
     # via offline_ratio==0 (which instead seeds them permanently into the
     # ONLINE replay buffer, where uniform sampling would keep resurfacing them
     # indefinitely) — silently breaks that assumption and any group structure.
-    # Force zero demo contamination for these two model classes, regardless of
-    # whatever offline_ratio happens to be set to in the task YAML.
-    is_on_policy_algo = model_cls in ("PPOLearner", "GRPOLearner")
+    # Force zero demo contamination for these four model classes (the plain
+    # and residual variants alike), regardless of whatever offline_ratio
+    # happens to be set to in the task YAML.
+    is_on_policy_algo = model_cls in ("PPOLearner", "GRPOLearner", "PPOResidualLearner", "GRPOResidualLearner")
+    # Residual variants additionally need the frozen VLA's own sampled base
+    # action recorded per-transition (see ppo_residual.py/grpo_residual.py's
+    # module docstrings): update() must recompute the residual's log_prob
+    # against the EXACT base action used at rollout time, not a fresh
+    # resample (pi0.5 is a stochastic flow-matching model, so a fresh sample
+    # would generally differ from the one actually executed).
+    is_residual_on_policy_algo = model_cls in ("PPOResidualLearner", "GRPOResidualLearner")
     # Number of consecutive transitions per on-policy rollout. Fixed (rather
     # than "however many the last episode happened to last") so the batch
     # shape stays constant across updates — a varying shape would force JAX to
@@ -339,6 +399,7 @@ def main(_):
         task_description=env.task_description,
         replan_steps=cfg.replan_steps,
         seed=cfg.seed,
+        store_base_actions=is_residual_on_policy_algo,
     )
     replay_buffer = create_replay_buffer(**rb_args)
     offline_replay_buffer = create_replay_buffer(**rb_args)
@@ -712,10 +773,13 @@ def main(_):
                 action_plan.clear()
 
             if has_action or action_type == "human":
+                _last_si = episode_log.sample_info_history[-1] if episode_log.sample_info_history else None
                 transition_dict = dict(
                     observations=observation, actions=real_action, rewards=reward,
                     masks=mask, dones=done, is_hil=(action_type == "human"),
                 )
+                if _last_si and "base_action" in _last_si:
+                    transition_dict["base_actions"] = _last_si["base_action"]
                 batch_processor.insert_transition(transition_dict)
             # No agent.update(...) call anywhere in this phase, by design.
 
@@ -794,6 +858,7 @@ def main(_):
             action_plan.clear()
 
         if has_action or action_type == "human":
+            _last_si = episode_log.sample_info_history[-1] if episode_log.sample_info_history else None
             transition_dict = dict(
                 observations=observation,
                 actions=real_action,
@@ -802,6 +867,8 @@ def main(_):
                 dones=done,
                 is_hil=(action_type == "human"),
             )
+            if _last_si and "base_action" in _last_si:
+                transition_dict["base_actions"] = _last_si["base_action"]
             batch_processor.insert_transition(transition_dict)
         
         can_update = training_log.ep_count >= 10 and i >= cfg.batch_size
