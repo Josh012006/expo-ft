@@ -29,7 +29,7 @@ def _insert_recursively(
         raise TypeError()
 
 
-def create_replay_buffer(config, example_action, capacity, task_description, replan_steps, seed):
+def create_replay_buffer(config, example_action, capacity, task_description, replan_steps, seed, store_base_actions=False):
     """Build pi05 config and create a seeded PiReplayBuffer."""
     from expo_ft.utils.train_utils import build_pi05_config
     _, pi05_train_config, pi05_resize_size, _ = build_pi05_config(config)
@@ -43,6 +43,7 @@ def create_replay_buffer(config, example_action, capacity, task_description, rep
         replan_steps=replan_steps,
         discount=config.discount,
         skip_repack_transforms=getattr(config, 'skip_repack_transforms', False),
+        store_base_actions=store_base_actions,
     )
     buf.seed(seed)
     return buf
@@ -91,6 +92,7 @@ class PiReplayBuffer(Dataset):
         replan_steps: int = None,
         discount: float = 0.99,
         skip_repack_transforms: bool = False,
+        store_base_actions: bool = False,
     ):
         data_config = pi_train_config.data.create(pi_train_config.assets_dirs, pi_train_config.model)
         model_config = pi_train_config.model
@@ -120,6 +122,19 @@ class PiReplayBuffer(Dataset):
             hil_chunk=np.empty((capacity,), dtype=bool),
             is_success=np.zeros((capacity,), dtype=bool),
         )
+        # PPOResidualLearner/GRPOResidualLearner only: the frozen base VLA's
+        # own sampled action (in the SAME normalized space TanhNormal/the
+        # residual actor operate in -- sample_training_actions()'s output is
+        # already there, no extra normalization needed, see pi05.py). Needed
+        # because _update_jit must recompute the residual's log_prob against
+        # the EXACT base action used at rollout time -- re-sampling a fresh
+        # one from the (stochastic) flow-matching model would not match what
+        # was actually executed. Off by default: every other learner
+        # (EXPOLearner/EXPOLearnerCategorical/SACLearner/BCLearner/plain
+        # PPOLearner/GRPOLearner) neither reads nor writes this field.
+        self._store_base_actions = store_base_actions
+        if store_base_actions:
+            dataset_dict["base_actions"] = np.empty((capacity, *action_chunk_shape), dtype=np.float32)
         super().__init__(dataset_dict)
 
         self._size = 0
@@ -219,6 +234,13 @@ class PiReplayBuffer(Dataset):
             data_dict.get("hil_chunk", result["is_hil"]), dtype=bool
         )
         result["is_success"] = np.asarray(data_dict.get("is_success", False), dtype=bool)
+        # Passed through AS-IS, deliberately not run through self._transform:
+        # it's already in the normalized space the residual actor and its
+        # TanhNormal distribution operate in (see sample_training_actions()
+        # in pi05.py), unlike "actions" above which starts in raw/physical
+        # units and needs self._transform's normalization step.
+        if self._store_base_actions:
+            result["base_actions"] = data_dict["base_actions"]
 
         return result
 
@@ -236,6 +258,8 @@ class PiReplayBuffer(Dataset):
         obs_data_dict["is_hil"] = np.asarray(is_hil, dtype=bool)
         obs_data_dict["hil_chunk"] = np.asarray(is_hil, dtype=bool)
         obs_data_dict["is_success"] = np.asarray(data_dict.get("is_success", False), dtype=bool)
+        if self._store_base_actions:
+            obs_data_dict["base_actions"] = np.tile(data_dict["base_actions"][None, :], (self._action_horizon, 1))
         preprocessed_dict = self._preprocess_single_transition(obs_data_dict)
 
         # Drop any keys not in buffer storage (e.g. stray fields) so _insert_recursively matches.
@@ -243,6 +267,7 @@ class PiReplayBuffer(Dataset):
         _insert_recursively(self.dataset_dict, row, self._insert_index)
         
         preprocessed_action = row["actions"][0]
+        preprocessed_base_action = row["base_actions"][0] if self._store_base_actions else None
         for action_idx in range(1, self._action_horizon):
             if self._insert_index < action_idx and self._size < self._capacity:
                 # Buffer hasn't wrapped yet and we don't have enough history
@@ -251,6 +276,8 @@ class PiReplayBuffer(Dataset):
             if self.dataset_dict["dones"][prev_idx]:
                 break
             self.dataset_dict["actions"][prev_idx, action_idx:] = np.tile(preprocessed_action[None, :], (self._action_horizon - action_idx, 1))
+            if self._store_base_actions:
+                self.dataset_dict["base_actions"][prev_idx, action_idx:] = np.tile(preprocessed_base_action[None, :], (self._action_horizon - action_idx, 1))
             if is_hil:
                 self.dataset_dict["hil_chunk"][prev_idx] = True
         
