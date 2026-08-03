@@ -37,12 +37,22 @@ class BatchProcessor:
         on_policy: bool = False,
         rollout_length: int = 0,
         replan_steps: int = 1,
+        seed_demos_online: bool = False,
     ):
+        # Demo placement is deliberately independent of offline_ratio's
+        # VALUE -- offline_ratio means exactly what it says (fraction of
+        # each training batch drawn from the offline buffer during
+        # sampling), nothing more, at every value including 0.0. Previously
+        # offline_ratio==0 silently meant "seed demos into the online buffer
+        # instead" (matching the EXPO paper's own single-buffer convention,
+        # inherited unmodified from the original reference implementation --
+        # see git history), which is exactly the kind of behavior a reader
+        # of the task YAML would never guess from the field's name alone.
+        # seed_demos_online now makes that choice its own explicit setting.
         if dataset is not None:
-            # offline_ratio=0: seed demos into the online replay buffer only.
-            if offline_ratio == 0 or use_dagger_hil_sampling:
+            if seed_demos_online or use_dagger_hil_sampling:
                 replay_buffer.insert_dataset(dataset)
-            if offline_ratio != 0:
+            if offline_ratio > 0:
                 offline_replay_buffer.insert_dataset(dataset)
 
         self.replay_buffer = replay_buffer

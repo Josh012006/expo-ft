@@ -415,6 +415,12 @@ def main(_):
         actor_success_only=actor_success_only,
         use_dagger_hil_sampling=use_dagger_hil_sampling,
         dataset=None if is_on_policy_algo else dataset,
+        # Independent of offline_ratio's value -- see BatchProcessor's own
+        # docstring/comment. Off (default) means genuinely no demos anywhere
+        # unless offline_ratio > 0 also puts them in the offline buffer;
+        # explicitly opt in via rl_seed_demos_online in the task YAML to
+        # match the EXPO paper's own single-buffer convention instead.
+        seed_demos_online=False if is_on_policy_algo else bool(getattr(cfg, "rl_seed_demos_online", False)),
         # PPO/GRPO need a contiguous, time-ordered rollout collected under the
         # current policy, not a uniform random draw over the whole buffer
         # history — see BatchProcessor's docstring. Off-policy learners keep
