@@ -723,26 +723,32 @@ def main(_):
     # everything keyed off it below (checkpoint naming, cfg.max_steps, the
     # loop bound itself) are completely untouched by this phase.
     #
-    # wandb rejects negative step values outright, so priming logs at a
-    # normal POSITIVE, increasing counter (0, 1, 2, ...) -- real raw env
-    # steps, incremented once per priming iteration. Once priming ends,
-    # wandb_step_offset captures where it left off; the main loop's own
-    # wandb/TensorBoard logging calls add this offset on top of `i` so the
-    # combined step sequence stays monotonic across the whole run without
-    # ever going backward. Checkpoint saving/naming and cfg.max_steps below
-    # use `i` directly, unmodified -- e.g. "checkpoint 20000" always means
-    # exactly 20000 real training steps since training began, identically
-    # across every run regardless of how long its own priming phase took.
+    # wandb rejects going backward on its own internal step counter -- but
+    # ALSO, tested directly (offline run, raw datastore inspection), NEVER
+    # passing an explicit step= at all and instead using per-metric custom
+    # step metrics (wandb.define_metric(..., step_metric=...)) sidesteps
+    # that entirely: the internal counter still auto-increments harmlessly
+    # in the background (nothing reads it), while each metric's own chart
+    # x-axis uses whatever value we log alongside it under its custom step
+    # key. This means training/eval metrics can genuinely start at 0 for
+    # every run/task -- clean, directly comparable curves, no offset
+    # arithmetic needed -- while eval/init_progress (priming) keeps its own
+    # separate, real-step-based x-axis. Checkpoint saving/naming and
+    # cfg.max_steps below use `i` directly, unaffected either way.
     #
     # Skipped entirely when resuming: the model already has real training
     # history; _success_window is a plain in-memory list (not part of the
     # checkpoint) so it isn't "empty" in any meaningful sense on resume,
     # there's just nothing to reconstruct it from -- re-priming would
-    # needlessly redo real training time. wandb_step_offset stays 0 in that
-    # case, matching the run's pre-existing step sequence exactly.
+    # needlessly redo real training time.
+    wandb.define_metric("eval/init_step")
+    wandb.define_metric("eval/init_progress", step_metric="eval/init_step")
+    wandb.define_metric("training/global_step")
+    wandb.define_metric("training/*", step_metric="training/global_step")
+    wandb.define_metric("eval/success_rate", step_metric="training/global_step")
+
     success_rate_window = getattr(cfg, "success_rate_window", 200)
     training_log._success_window = []
-    wandb_step_offset = 0
 
     if not resuming and success_rate_window > 0:
         logging.info(f"[priming] Evaluating the starting model on {success_rate_window} real "
@@ -795,10 +801,10 @@ def main(_):
                 training_log.on_episode_done(episode_log, success, {})
                 training_log._success_window.append(float(success))
                 priming_pbar.update(1)
-                wandb.log(
-                    {"eval/init_progress": len(training_log._success_window) / success_rate_window},
-                    step=priming_step,
-                )
+                wandb.log({
+                    "eval/init_progress": len(training_log._success_window) / success_rate_window,
+                    "eval/init_step": priming_step,
+                })
 
                 episode_log.reset()
                 batch_processor.on_episode_start()
@@ -808,12 +814,12 @@ def main(_):
                 action_plan.clear()
 
         priming_pbar.close()
-        wandb_step_offset = priming_step + 1  # +1: next value logged must be strictly greater
-        wandb.log({"eval/init_progress": 1.0}, step=priming_step)
+        wandb.log({"eval/init_progress": 1.0, "eval/init_step": priming_step})
         logging.info(f"[priming] Done after {priming_step} raw steps -- {success_rate_window} episodes "
                      f"evaluated, starting success_rate={np.mean(training_log._success_window):.3f}. Real "
                      f"training begins now, budget (cfg.max_steps={cfg.max_steps}) untouched by this phase. "
-                     f"wandb/TensorBoard step axis continues at {wandb_step_offset} -- checkpoint step "
+                     f"eval/success_rate and training/* now use training/global_step as their own x-axis, "
+                     f"starting fresh at 0 -- checkpoint step "
                      f"numbers (i) are NOT offset and remain exactly comparable across runs.")
 
     for i in tqdm.tqdm(
@@ -948,15 +954,21 @@ def main(_):
                 logging.exception("Could not save agent buffer.")
 
         step_metrics["training/loop_time_ms"] = (time.time() - loop_start) * 1000.0
-        
+        step_metrics["training/global_step"] = i
+
         # TensorBoard logging — convert to float() to handle JAX scalars
         # (jnp.float32 etc.) which don't pass isinstance(v, (int, float))
         for k, v in step_metrics.items():
             try:
-                tb_writer.add_scalar(k, float(v), global_step=wandb_step_offset + i)
+                tb_writer.add_scalar(k, float(v), global_step=i)
             except (TypeError, ValueError):
                 pass  # skip non-scalar values (e.g. batch_info dicts)
-        wandb.log(step_metrics, step=wandb_step_offset + i)
+        # No explicit step= here -- training/global_step (defined above via
+        # wandb.define_metric) is what every training/eval chart actually
+        # uses for its x-axis, starting fresh at 0 regardless of how long
+        # priming took. See this file's priming-phase comment for why this
+        # avoids the step-monotonicity data-loss issue entirely.
+        wandb.log(step_metrics)
     
     if cfg.checkpoint_model:
         try:
