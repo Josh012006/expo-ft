@@ -1,0 +1,114 @@
+# configs/task/maniskill/stack_cube_ppo_residual.yaml
+
+# NOTE: the Environment/Data/Run-Logging sections below are shared
+# (kept identical) across all *_sft.yaml / *_expo_ft.yaml / *_ppo.yaml /
+# *_grpo.yaml / *_sac.yaml files for this task. If you change an env or
+# data setting, update it in all five files to keep them in sync.
+# ── Environment ────────────────────────────────────────────────
+env_id: "StackCube-v1"
+language_instruction: "stack the red cube on top of the green cube"
+control_hz: 10
+max_episode_steps: 120
+env_type: "sim"  # "sim" for simulation, "droid" for real robot
+env_wrapper: "maniskill"  # "maniskill" ou "droid" (real robot)
+sim_backend: "physx_cpu"
+
+# Control mode config
+control_mode: "pd_joint_delta_pos"
+normalize_action: true
+use_cartesian_state: false
+output_action_dim: 8
+action_space: "joint_position" # Action space keys for DROID format reader
+gripper_action_space: "position"
+
+# Observation config
+state_obs_key: "observation/joint_position"
+state_obs_dim: 7
+
+# Camera config
+camera_width: 224
+camera_height: 224
+camera_eye_pos: [0.6, 0.7, 0.6]      # default is [0.3, 0, 0.6]
+camera_target_pos: [0.0, 0.0, 0.35]  # default is [-0.1, 0, 0.1]
+camera_fov: 1.0
+robot_uids: "panda_wristcam"
+
+
+# ── Data ───────────────────────────────────────────────────────
+# How many successful demo episodes to GENERATE via motion planning
+# (--stage demos, a one-time upfront step). Different from num_data_sft/
+# num_data_rl below, which control how many of these to LOAD for SFT/RL.
+num_demos_generate: 550
+lerobot_repo_id: "expo_ft/stack_cube"
+droid_format_dir: "demos/StackCube-v1/droid_format"
+# Skip RepackTransform in replay buffer — our observations already have the
+# correct keys for DroidInputs (observation/cartesian_position, etc.)
+skip_repack_transforms: true
+
+
+# ── Run / Logging ──────────────────────────────────────────────
+project_name: "expo-ft"
+run_name: "stack_cube_ppo_residual"
+output_dir: "logs/stack_cube"  # a timestamped subdir is created automatically per run
+
+
+
+# sft_use_lora is needed here (not the rest of SFT warmup config) purely to
+# resolve which openpi SFT TrainConfig matches the checkpoint being loaded —
+# see get_sft_config_name(). Full SFT training hyperparameters live in
+# stack_cube_sft.yaml instead.
+sft_use_lora: true         # use LoRA fine-tuning (faster, less memory than full fine-tune)
+
+# ── RL Algorithm ──────────────────────────────────────────────────
+seed: 42
+max_episodes: 1000
+max_steps_per_episode: 120
+batch_size: 128             # number of transitions sampled from replay buffer per gradient update
+utd_ratio: 10              # gradient updates performed per new transition collected
+update_type: "episode"     # when to trigger updates: "episode", "step", or "batch"
+num_updates: 1             # number of gradient updates per trigger
+num_batch: 1               # number of episodes to accumulate before updating (only used when update_type="batch")
+replan_steps: 8            # number of actions to execute from each action chunk before replanning (action_horizon=16)
+fsdp_devices: 1            # number of GPUs for FSDP sharding (1 = single GPU, no sharding)
+
+num_data_rl: 50
+rl_resume_dir: null
+
+model_cls: "PPOResidualLearner"  # selects both configs/model/*.py (via run_pipeline.py) and the FLAGS.config path used by train_pi_robo.py
+
+# ── RL Checkpointing ──────────────────────────────────────────────
+checkpoint_model: true
+checkpoint_interval: 1000  # save checkpoint every N steps (0 = only save at end)
+checkpoint_buffer: false   # save replay buffer transitions to disk at each step
+keep_period: 20000         # keep one checkpoint every N steps (older ones are deleted)
+max_to_keep: 1
+
+
+
+actor_success_only: true        # if true, actor batch is sampled only from successful transitions
+
+# ── PPO hyperparameters ─────────────────────────────────────────
+# Uncomment a line and give it a real value to override that default
+# from ppo_pi_config.py. Do NOT set the commented fields to `null` —
+# they are plain floats/ints, not Optional.
+ppo_lr: 3.0e-4                  # overrides both actor_lr and critic_lr
+ppo_discount: 0.99              # GAE discount factor
+ppo_gae_lambda: 0.95            # GAE lambda
+ppo_clip_eps: 0.2               # PPO clip ratio
+ppo_value_loss_coef: 0.5        # value loss weight
+ppo_entropy_coef: 0.01          # entropy bonus weight
+ppo_num_minibatches: 4          # number of PPO minibatches per update
+ppo_rollout_length: 512      # number of consecutive transitions per on-policy rollout; each update consumes one such rollout (collected under the current policy) then discards it. Must be divisible by ppo_num_minibatches.
+ppo_actor_log_std_min: -5.0   # floor on the actor's log-std. Much tighter than the shared TanhNormal default (-20), which allows std ~2e-9: a pure-MLE BC warm-start collapses to that floor and makes log-prob gradients overflow float32, NaN-ing every update. Only affects PPO/GRPO; EXPOLearner/SAC keep -20.
+ppo_hidden_dims: [256, 256, 256]  # actor/critic MLP widths
+ppo_edit_scale: 0.2                # residual scale: executed action = base_action + ppo_edit_scale * residual
+ppo_value_clip_eps: null          # Optional[float] — null means "no value clipping"; set e.g. 0.2 to enable
+ppo_max_grad_norm: null           # Optional[float] — null means "no grad clipping"; set e.g. 0.5 to enable
+
+
+# No BC pretraining section here: unlike plain PPOLearner, this actor
+# IS connected to the SFT-competent frozen VLA (it supplies the base action
+# directly; PPO only trains the small residual correction on top of
+# it), so there is no random-init-actor problem to warm-start away in the
+# first place. There is no ppo_actor_pretrain_steps field on this config
+# at all -- see ppo_residual_pi_config.py's docstring.
