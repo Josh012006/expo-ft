@@ -1087,24 +1087,77 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         loop — replaces one step of the former jax.lax.scan."""
         return agent.update_critic(mb)
 
-    @partial(jax.jit, static_argnames=("use_success_batch",))
+    @jax.jit
     def _update_finalize_jit(self, agent, last_minibatch, actor_batch: DatasetDict = None, use_success_batch: bool = False):
         """Everything _update_jit did AFTER the critic-update loop: actor,
         residual actor, and temperature updates using the last minibatch.
-        Unchanged from before — just extracted into its own function."""
+
+        use_success_batch is deliberately NOT a static arg (see the
+        @jax.jit above -- no static_argnames at all now). It used to be
+        static, which meant every time it flipped True for the first time
+        (the first successful episode landing in the replay buffer, often
+        well into a resumed run) JAX traced and kept resident a SECOND,
+        entirely separate compiled program for this function -- doubling
+        its memory footprint at an unpredictable point in training, on top
+        of whatever the checkpoint restore had already used. That's a
+        second, independent cause from the lax.scan bug this file's other
+        functions were restructured to avoid (see update()'s own comment) --
+        this one predates that work entirely (see the original comment
+        this replaces, already present before this fix: "the OOM we hit
+        around step 2473 on a run that started with 0% base success").
+
+        jax.lax.cond compiles both branches together as ONE program instead
+        (confirmed via JAX's own docs: "With lax.cond, only one compilation
+        occurs, handling both branches within the XLA graph") -- so there is
+        only ever one resident program for this function, regardless of how
+        many times use_success_batch flips between True and False over the
+        course of training.
+
+        actor_batch and last_minibatch have DIFFERENT batch sizes
+        (actor_batch is sampled at the full cfg.batch_size;
+        last_minibatch is cfg.batch_size // utd_ratio, see
+        _prepare_minibatches_jit) -- this is fine for lax.cond specifically
+        because its two branches are independent computation subgraphs
+        compiled together in one trace, each free to operate on
+        differently-shaped intermediates internally. What lax.cond actually
+        requires is that the two branches' OUTPUTS match in pytree
+        structure/shape/dtype -- verified here: both branches' final step is
+        the same self.update_actor(...) call, whose output shape (agent
+        params structure + a dict of batch-reduced scalar losses) does not
+        depend on the input batch's size, only on the network's own fixed
+        architecture. Both batches are threaded through the shared operand
+        tuple regardless of which branch will actually use which one --
+        lax.cond does not require every branch to consume every operand
+        field, only that the operand structure itself is fixed."""
         new_agent = agent
 
-        # When actor_success_only, use the dedicated success-episode batch for
-        # the Pi05 actor update; otherwise (or if no successful episode exists
-        # yet in the buffer, e.g. early in training / near-0% base success)
-        # fall back to the last critic minibatch.
-        if self.actor_success_only and use_success_batch:
-            actor_batch = actor_batch.copy()
-            rng, key = jax.random.split(new_agent.rng)
-            actor_batch["image"] = self.data_augmentation_fn(key, actor_batch["image"])
-            new_agent = new_agent.replace(rng=rng)
-            actor_batch = prepare_critic_batch(actor_batch, self.actor.model_config.action_dim, self.action_dim, self.state_dim, self.action_horizon, self.replan_steps)
-            new_agent, actor_info = new_agent.update_actor(actor_batch)
+        # actor_success_only is a genuinely static, compile-time-fixed
+        # property of THIS agent (struct.field(pytree_node=False), set once
+        # at construction, never changes during a run) -- resolving it with
+        # a plain Python `if` here is safe and does not reintroduce the
+        # multiple-compiled-programs problem the way the old
+        # use_success_batch static arg did, since there is only ever one
+        # value of it for the whole lifetime of a given agent/run.
+        if self.actor_success_only:
+            def _use_success_branch(operand):
+                new_agent, actor_batch, _last_minibatch_unused = operand
+                actor_batch = actor_batch.copy()
+                rng, key = jax.random.split(new_agent.rng)
+                actor_batch["image"] = self.data_augmentation_fn(key, actor_batch["image"])
+                new_agent = new_agent.replace(rng=rng)
+                actor_batch = prepare_critic_batch(actor_batch, self.actor.model_config.action_dim, self.action_dim, self.state_dim, self.action_horizon, self.replan_steps)
+                return new_agent.update_actor(actor_batch)
+
+            def _fallback_branch(operand):
+                new_agent, _actor_batch_unused, last_minibatch = operand
+                return new_agent.update_actor(last_minibatch)
+
+            new_agent, actor_info = jax.lax.cond(
+                use_success_batch,
+                _use_success_branch,
+                _fallback_branch,
+                (new_agent, actor_batch, last_minibatch),
+            )
         else:
             new_agent, actor_info = new_agent.update_actor(last_minibatch)
 
