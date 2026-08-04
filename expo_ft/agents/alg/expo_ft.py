@@ -993,7 +993,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         # XLA program the first time a successful episode appears in the
         # buffer, potentially well into training (e.g. the OOM we hit around
         # step 2473 on a run that started with 0% base success). Pass a
-        # static bool instead, and always give _update_jit a
+        # static bool instead, and always give the prepare step a
         # consistently-shaped placeholder (reusing `batch`'s own structure,
         # which goes through the same prepare_critic_batch() call) when no
         # real success-only actor_batch is available yet.
@@ -1001,14 +1001,50 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         if actor_batch is None:
             actor_batch = batch
         # Drop stale inference copies before JIT; rebuild after so rollouts use new weights.
-        new_agent, info = self.replace(_infer_cache=None)._update_jit(
-            agent.replace(_infer_cache=None), batch, utd_ratio, actor_batch, use_success_batch
-        )
+        self_clean = self.replace(_infer_cache=None)
+        agent = agent.replace(_infer_cache=None)
+
+        agent, minibatches = self_clean._prepare_minibatches_jit(agent, batch, utd_ratio)
+
+        # utd_ratio critic updates, dispatched one at a time from Python
+        # instead of via jax.lax.scan over all utd_ratio minibatches inside
+        # one compiled program. Deliberately NOT jax.lax.scan: JAX 0.5.3
+        # (pinned by openpi's own pyproject.toml, not something this project
+        # can freely change) has a confirmed upstream bug where XLA's
+        # rematerialization pass becomes ineffective specifically on
+        # remat-wrapped lax.scan (jax-ml/jax#27748), producing exactly the
+        # buffer-assignment crash (shape_util.cc:1128) hit here once
+        # utd_ratio grew large enough (utd_ratio=20) to push the compiled
+        # program's memory footprint past what a resumed run's extra
+        # checkpoint-restore memory left available. _critic_update_step_jit
+        # is its own small, separately-compiled (and JIT-cached — compiled
+        # once, reused for every call) program; no scan, no large remat
+        # region for that bug to trigger on. Behaviorally identical to the
+        # scan version: `agent` threads through sequentially exactly as the
+        # scan's own carry did, over the same minibatches in the same order,
+        # so RNG consumption and every computed value match exactly — only
+        # the mechanism XLA uses to compile/dispatch this changed, not what
+        # gets computed.
+        critic_info = None
+        for step in range(utd_ratio):
+            mb = jax.tree_util.tree_map(lambda x: x[step], minibatches)
+            agent, critic_info = self_clean._critic_update_step_jit(agent, mb)
+
+        # Use last minibatch for actor updates — same selection as before.
+        last_minibatch = jax.tree_util.tree_map(lambda x: x[-1] if x is not None and hasattr(x, "shape") else x, minibatches)
+
+        new_agent, actor_info = self_clean._update_finalize_jit(agent, last_minibatch, actor_batch, use_success_batch)
+
+        info = {**actor_info, **critic_info}
         return new_agent.cache_infer_params(), info
 
-
-    @partial(jax.jit, static_argnames=("utd_ratio", "use_success_batch"))
-    def _update_jit(self, agent, batch: DatasetDict, utd_ratio: int, actor_batch: DatasetDict = None, use_success_batch: bool = False):
+    @partial(jax.jit, static_argnames=("utd_ratio",))
+    def _prepare_minibatches_jit(self, agent, batch: DatasetDict, utd_ratio: int):
+        """Everything _update_jit did BEFORE the critic-update loop:
+        augmentation, prepare_critic_batch, reshape into utd_ratio
+        minibatches, sharding. Unchanged from before — this part never
+        involved lax.scan or remat, so it isn't implicated in the bug this
+        split works around; it's just been extracted into its own function."""
         batch = batch.copy()
         rng, key1 = jax.random.split(agent.rng)
         rng, key2 = jax.random.split(rng)
@@ -1041,15 +1077,22 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
 
         minibatches = jax.tree_util.tree_map(create_minibatch_sharding, minibatches)
 
-        def critic_update_step(carry, mb):
-            (agent,) = carry
-            agent, info = agent.update_critic(mb)
-            return (agent,), info
+        return new_agent, minibatches
 
-        (new_agent,), critic_infos = jax.lax.scan(critic_update_step, (new_agent,), minibatches)
+    @jax.jit
+    def _critic_update_step_jit(self, agent, mb):
+        """One critic update on one minibatch. Compiled once (JIT caches on
+        first call, since its input shapes never change across the
+        utd_ratio calls) and reused for every call in update()'s Python
+        loop — replaces one step of the former jax.lax.scan."""
+        return agent.update_critic(mb)
 
-        # Use last minibatch for actor updates
-        last_minibatch = jax.tree_util.tree_map(lambda x: x[-1] if x is not None and hasattr(x, "shape") else x, minibatches)
+    @partial(jax.jit, static_argnames=("use_success_batch",))
+    def _update_finalize_jit(self, agent, last_minibatch, actor_batch: DatasetDict = None, use_success_batch: bool = False):
+        """Everything _update_jit did AFTER the critic-update loop: actor,
+        residual actor, and temperature updates using the last minibatch.
+        Unchanged from before — just extracted into its own function."""
+        new_agent = agent
 
         # When actor_success_only, use the dedicated success-episode batch for
         # the Pi05 actor update; otherwise (or if no successful episode exists
@@ -1078,5 +1121,4 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
                 # learned-temperature runs in wandb/TensorBoard for comparison.
                 actor_info["temperature"] = jnp.asarray(self.fixed_temperature)
 
-        critic_info = jax.tree_util.tree_map(lambda x: x[-1], critic_infos)
-        return new_agent, {**actor_info, **critic_info}
+        return new_agent, actor_info
