@@ -555,8 +555,21 @@ def main(_):
             for _field in ("dones", "masks", "is_hil", "hil_chunk", "rewards"):
                 if _field in replay_buffer.dataset_dict:
                     replay_buffer.dataset_dict[_field][:_warmup_n] = 0
-            _warmup_indices = np.arange(cfg.batch_size)
-            _warmup_batch = replay_buffer.sample_jax(cfg.batch_size, data_sharding=data_sharding, indices=_warmup_indices)
+            # sample_jax() asserts len(self) >= self._replan_steps UNCONDITIONALLY,
+            # before it even looks at `indices` -- with _size genuinely 0 (nothing
+            # inserted yet on a resumed run), that assertion fails regardless of
+            # indices being explicitly given. Temporarily report a large-enough
+            # size just for this call, then restore the true value immediately
+            # after -- consistent with directly poking dataset_dict above; _size
+            # is what real training's own insert()/sample_jax() calls rely on
+            # being accurate, so it must not be left altered.
+            _true_size = replay_buffer._size
+            replay_buffer._size = max(_true_size, _warmup_n)
+            try:
+                _warmup_indices = np.arange(cfg.batch_size)
+                _warmup_batch = replay_buffer.sample_jax(cfg.batch_size, data_sharding=data_sharding, indices=_warmup_indices)
+            finally:
+                replay_buffer._size = _true_size
 
             _discard_agent, _discard_info = agent.update(agent, _warmup_batch, cfg.utd_ratio, None)
             jax.block_until_ready(_discard_agent)
