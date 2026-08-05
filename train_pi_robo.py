@@ -528,6 +528,16 @@ def main(_):
     # behavior (compilation deferred to the ep_count gate as before) rather
     # than failing a run that might not even have hit the crash this exists
     # for.
+    # Diagnostic logging -- unconditional, always prints, so the next run's
+    # .out file gives a definitive answer for why the warm-up below did or
+    # did not trigger, instead of guessing again from an absence of output.
+    logging.info(
+        "[warmup-diag] resuming=%s model_cls=%s pretrain_buffer_is_none=%s "
+        "pretrain_buffer_len=%s cfg.batch_size=%s",
+        resuming, model_cls, pretrain_buffer is None,
+        (len(pretrain_buffer) if pretrain_buffer is not None else "N/A"),
+        getattr(cfg, "batch_size", "MISSING"),
+    )
     if resuming and pretrain_buffer is not None and len(pretrain_buffer) >= cfg.batch_size:
         try:
             logging.info("[warmup] Triggering discarded warm-up compilation of agent.update() "
