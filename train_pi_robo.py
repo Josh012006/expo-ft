@@ -515,52 +515,61 @@ def main(_):
     # (use_success_batch True and False) are warmed deliberately, so neither
     # is deferred to whenever a real success episode first appears online.
     #
-    # Result is fully discarded (never assigned back to `agent`) -- this
-    # changes WHEN compilation happens, nothing about what gets computed or
-    # trained on. jax.block_until_ready() forces the compile+execute to
-    # genuinely finish now rather than lazily deferring; gc.collect()
-    # releases the discarded arrays' Python-side references afterward so
-    # JAX's allocator can reclaim whatever was compile-time-only.
+    # Deliberately does NOT depend on pretrain_buffer/demo data being
+    # available anywhere -- robust to offline_ratio=0.0 + rl_seed_demos_online
+    # =false (the genuinely-no-demos-anywhere config), where pretrain_buffer
+    # is correctly empty by design, not by bug. Instead this samples directly
+    # from `replay_buffer` (the online buffer, which always exists, is always
+    # pre-allocated to capacity=cfg.max_steps >> cfg.batch_size, and is safe
+    # to read at literal indices [0, batch_size) via sample_jax(indices=...),
+    # which bypasses the usual "only sample within _size" restriction).
+    #
+    # Those specific indices are explicitly zeroed first for the CONTROL
+    # fields (dones/masks/is_hil/hil_chunk/rewards) before sampling --
+    # PiReplayBuffer.__init__ allocates these via np.empty, not np.zeros
+    # (only is_success is zero-initialized), so reading them unwritten would
+    # be uninitialized garbage, which risks corrupting _finalize_sample's
+    # "next" index bookkeeping (n-step reward packing) rather than just
+    # producing meaningless-but-safe numbers the way garbage image/state/
+    # action data would. Image/state/action fields are left as whatever
+    # np.empty gave them -- irrelevant here since the result is discarded
+    # and no control-flow logic depends on their values.
+    #
+    # This never touches _size/_insert_index, so it can never be sampled by
+    # real training later (normal sampling only draws from [0, _size), which
+    # stays 0 here) and real inserts will naturally overwrite these same
+    # slots first anyway (_insert_index starts at 0) -- zero contamination
+    # risk to the real training trajectory.
     #
     # Wrapped in try/except: this is a best-effort optimization, not a
-    # required step. If it fails for any reason (e.g. too little demo data
-    # to sample success_only=True from), the run falls back to the original
-    # behavior (compilation deferred to the ep_count gate as before) rather
-    # than failing a run that might not even have hit the crash this exists
-    # for.
-    # Diagnostic logging -- unconditional, always prints, so the next run's
-    # .out file gives a definitive answer for why the warm-up below did or
-    # did not trigger, instead of guessing again from an absence of output.
-    logging.info(
-        "[warmup-diag] resuming=%s model_cls=%s pretrain_buffer_is_none=%s "
-        "pretrain_buffer_len=%s cfg.batch_size=%s",
-        resuming, model_cls, pretrain_buffer is None,
-        (len(pretrain_buffer) if pretrain_buffer is not None else "N/A"),
-        getattr(cfg, "batch_size", "MISSING"),
-    )
-    if resuming and pretrain_buffer is not None and len(pretrain_buffer) >= cfg.batch_size:
+    # required step. If it fails for any reason, the run falls back to the
+    # original behavior (compilation deferred to the ep_count gate as
+    # before) rather than failing a run that might not even have hit the
+    # crash this exists for.
+    if resuming:
         try:
             logging.info("[warmup] Triggering discarded warm-up compilation of agent.update() "
                          "right after restore (both use_success_batch branches), before rollout "
                          "collection accumulates further memory pressure...")
-            _warmup_batch = pretrain_buffer.sample_jax(cfg.batch_size, data_sharding=data_sharding)
-            try:
-                _warmup_actor_batch = pretrain_buffer.sample_jax(
-                    cfg.batch_size, data_sharding=data_sharding, success_only=True
-                )
-            except Exception:
-                logging.warning("[warmup] No success_only demo data available for the "
-                               "use_success_batch=True branch -- warming the False branch only.")
-                _warmup_actor_batch = None
+            _warmup_n = cfg.batch_size + cfg.replan_steps + 1  # safety margin for "next" index lookups
+            for _field in ("dones", "masks", "is_hil", "hil_chunk", "rewards"):
+                if _field in replay_buffer.dataset_dict:
+                    replay_buffer.dataset_dict[_field][:_warmup_n] = 0
+            _warmup_indices = np.arange(cfg.batch_size)
+            _warmup_batch = replay_buffer.sample_jax(cfg.batch_size, data_sharding=data_sharding, indices=_warmup_indices)
 
-            _discard_agent, _discard_info = agent.update(agent, _warmup_batch, cfg.utd_ratio, _warmup_actor_batch)
+            _discard_agent, _discard_info = agent.update(agent, _warmup_batch, cfg.utd_ratio, None)
             jax.block_until_ready(_discard_agent)
-            if _warmup_actor_batch is not None:
-                _discard_agent2, _discard_info2 = agent.update(agent, _warmup_batch, cfg.utd_ratio, None)
-                jax.block_until_ready(_discard_agent2)
-                del _discard_agent2, _discard_info2
+            del _discard_agent, _discard_info
 
-            del _discard_agent, _discard_info, _warmup_batch, _warmup_actor_batch
+            # Second pass warms the use_success_batch=True branch too (see
+            # comment block above) -- same synthetic batch reused as the
+            # placeholder actor_batch, since only its SHAPE matters here.
+            _discard_agent2, _discard_info2 = agent.update(agent, _warmup_batch, cfg.utd_ratio, _warmup_batch)
+            jax.block_until_ready(_discard_agent2)
+            del _discard_agent2, _discard_info2
+
+            del _warmup_batch
             gc.collect()
             logging.info("[warmup] Compile-only warm-up complete; agent unchanged "
                          "(warm-up result discarded, never assigned).")
