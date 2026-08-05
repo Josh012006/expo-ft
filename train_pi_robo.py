@@ -1071,6 +1071,25 @@ def main(_):
         if cfg.checkpoint_model and cfg.checkpoint_interval > 0 and i > 0 and i % cfg.checkpoint_interval == 0:
             try:
                 save_checkpoint(checkpoint_manager, agent, i)
+                # save_checkpoint() only blocks for the synchronous portion
+                # of the save (per Orbax's own docs: "Finished blocking save
+                # in N seconds. Continuing to save asynchronously...") --
+                # the background thread doing the actual host transfer can
+                # still be running, and still using GPU memory for that
+                # transfer, well after this call returns and this log line
+                # prints. That transfer memory being unexpectedly still
+                # resident is a plausible explanation for the OOM crashes
+                # observed shortly after a checkpoint save reports complete.
+                # wait_until_finished() is Orbax's own documented API for
+                # genuinely blocking until that background thread is done
+                # ("Blocks until any incomplete save operations are
+                # completed... will wait until each of these checkpointers
+                # is finished") -- calling it here, then gc.collect()
+                # immediately after, gives that transfer memory a real
+                # chance to be released before the next training step needs
+                # its own peak memory.
+                checkpoint_manager.wait_until_finished()
+                gc.collect()
                 logging.info(f"Saved agent checkpoint at step {i} (interval={cfg.checkpoint_interval})")
             except Exception as e:
                 logging.error(f"Could not save model checkpoint: {e}")
