@@ -567,7 +567,17 @@ def main(_):
             replay_buffer._size = max(_true_size, _warmup_n)
             try:
                 _warmup_indices = np.arange(cfg.batch_size)
-                _warmup_batch = replay_buffer.sample_jax(cfg.batch_size, data_sharding=data_sharding, indices=_warmup_indices)
+                # sample_jax's raw output still uses the buffer's own field
+                # names (base_image, left_wrist_image, ...) -- agent.update()
+                # expects the assembled "image"/"next_image" dict structure
+                # instead. _convert_to_openpi_format does exactly this
+                # conversion; apply_data_sharding is applied AFTER it (not
+                # via sample_jax's own data_sharding= param), matching
+                # next_batch()'s own proven on-policy-branch ordering exactly
+                # rather than inventing a different one here.
+                _warmup_raw = replay_buffer.sample_jax(cfg.batch_size, indices=_warmup_indices)
+                _warmup_batch = replay_buffer._convert_to_openpi_format(_warmup_raw)
+                _warmup_batch = replay_buffer.apply_data_sharding(_warmup_batch, data_sharding)
             finally:
                 replay_buffer._size = _true_size
 
