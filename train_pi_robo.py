@@ -551,7 +551,16 @@ def main(_):
             logging.info("[warmup] Triggering discarded warm-up compilation of agent.update() "
                          "right after restore (both use_success_batch branches), before rollout "
                          "collection accumulates further memory pressure...")
-            _warmup_n = cfg.batch_size + cfg.replan_steps + 1  # safety margin for "next" index lookups
+            # agent.update() internally splits its input batch into utd_ratio
+            # minibatches of cfg.batch_size each (see _prepare_minibatches_jit's
+            # own assert total_bs % utd_ratio == 0) -- so the TOTAL batch this
+            # call needs is cfg.batch_size * cfg.utd_ratio, matching exactly
+            # how BatchProcessor.__init__ computes its own total_bs for the
+            # real training iterators. Passing cfg.batch_size alone here
+            # (24, not divisible by utd_ratio=20) is what the previous
+            # attempt got wrong.
+            _total_bs = cfg.batch_size * cfg.utd_ratio
+            _warmup_n = _total_bs + cfg.replan_steps + 1  # safety margin for "next" index lookups
             for _field in ("dones", "masks", "is_hil", "hil_chunk", "rewards"):
                 if _field in replay_buffer.dataset_dict:
                     replay_buffer.dataset_dict[_field][:_warmup_n] = 0
@@ -566,7 +575,7 @@ def main(_):
             _true_size = replay_buffer._size
             replay_buffer._size = max(_true_size, _warmup_n)
             try:
-                _warmup_indices = np.arange(cfg.batch_size)
+                _warmup_indices = np.arange(_total_bs)
                 # sample_jax's raw output still uses the buffer's own field
                 # names (base_image, left_wrist_image, ...) -- agent.update()
                 # expects the assembled "image"/"next_image" dict structure
@@ -575,7 +584,7 @@ def main(_):
                 # via sample_jax's own data_sharding= param), matching
                 # next_batch()'s own proven on-policy-branch ordering exactly
                 # rather than inventing a different one here.
-                _warmup_raw = replay_buffer.sample_jax(cfg.batch_size, indices=_warmup_indices)
+                _warmup_raw = replay_buffer.sample_jax(_total_bs, indices=_warmup_indices)
                 _warmup_batch = replay_buffer._convert_to_openpi_format(_warmup_raw)
                 _warmup_batch = replay_buffer.apply_data_sharding(_warmup_batch, data_sharding)
             finally:
@@ -586,11 +595,24 @@ def main(_):
             del _discard_agent, _discard_info
 
             # Second pass warms the use_success_batch=True branch too (see
-            # comment block above) -- same synthetic batch reused as the
-            # placeholder actor_batch, since only its SHAPE matters here.
-            _discard_agent2, _discard_info2 = agent.update(agent, _warmup_batch, cfg.utd_ratio, _warmup_batch)
+            # comment block above). That branch's actor_batch goes through
+            # its OWN separate prepare_critic_batch call (see
+            # _update_finalize_jit), NOT the utd_ratio-based minibatch
+            # splitting _prepare_minibatches_jit does -- so it expects
+            # cfg.batch_size directly, not total_bs. Sampled separately here
+            # rather than reusing _warmup_batch, which is the wrong size for
+            # this specific argument.
+            _actor_warmup_indices = np.arange(cfg.batch_size)
+            replay_buffer._size = max(_true_size, cfg.batch_size + cfg.replan_steps + 1)
+            try:
+                _actor_warmup_raw = replay_buffer.sample_jax(cfg.batch_size, indices=_actor_warmup_indices)
+                _actor_warmup_batch = replay_buffer._convert_to_openpi_format(_actor_warmup_raw)
+                _actor_warmup_batch = replay_buffer.apply_data_sharding(_actor_warmup_batch, data_sharding)
+            finally:
+                replay_buffer._size = _true_size
+            _discard_agent2, _discard_info2 = agent.update(agent, _warmup_batch, cfg.utd_ratio, _actor_warmup_batch)
             jax.block_until_ready(_discard_agent2)
-            del _discard_agent2, _discard_info2
+            del _discard_agent2, _discard_info2, _actor_warmup_batch
 
             del _warmup_batch
             gc.collect()
