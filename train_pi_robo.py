@@ -1,5 +1,6 @@
 #! /usr/bin/env python
 import os
+import gc
 import logging
 import time
 from collections import deque
@@ -493,6 +494,69 @@ def main(_):
         pretrain_buffer = offline_replay_buffer if cfg.offline_ratio > 0 else replay_buffer
     else:
         pretrain_buffer = None
+
+    # ── Discarded compile-only warm-up, resumed runs only ───────────────────
+    # Why: agent.update()'s first-ever call (and thus first-ever JIT
+    # compilation of the whole update pipeline) is otherwise gated behind
+    # `training_log.ep_count >= 10` in the main loop below, which resets to 0
+    # on every resume regardless of prior training -- see that check. On a
+    # resumed run this delays first compilation ~700+ steps in, by which
+    # point whatever compile-time peak memory that first compilation needs
+    # has to coexist with everything accumulated in the meantime, on top of
+    # the checkpoint restore's own ~18GB. This repeatedly produced
+    # RESOURCE_EXHAUSTED crashes at that exact point (never on a fresh run,
+    # which never carries the extra restore memory).
+    #
+    # Triggering that same compilation HERE instead -- immediately after
+    # restore, before rollout collection has a chance to add anything else
+    # to the picture -- is a genuine attempt at reducing what's
+    # simultaneously resident at the moment of peak demand, not just
+    # relocating the same peak. Both static branches of _update_finalize_jit
+    # (use_success_batch True and False) are warmed deliberately, so neither
+    # is deferred to whenever a real success episode first appears online.
+    #
+    # Result is fully discarded (never assigned back to `agent`) -- this
+    # changes WHEN compilation happens, nothing about what gets computed or
+    # trained on. jax.block_until_ready() forces the compile+execute to
+    # genuinely finish now rather than lazily deferring; gc.collect()
+    # releases the discarded arrays' Python-side references afterward so
+    # JAX's allocator can reclaim whatever was compile-time-only.
+    #
+    # Wrapped in try/except: this is a best-effort optimization, not a
+    # required step. If it fails for any reason (e.g. too little demo data
+    # to sample success_only=True from), the run falls back to the original
+    # behavior (compilation deferred to the ep_count gate as before) rather
+    # than failing a run that might not even have hit the crash this exists
+    # for.
+    if resuming and pretrain_buffer is not None and len(pretrain_buffer) >= cfg.batch_size:
+        try:
+            logging.info("[warmup] Triggering discarded warm-up compilation of agent.update() "
+                         "right after restore (both use_success_batch branches), before rollout "
+                         "collection accumulates further memory pressure...")
+            _warmup_batch = pretrain_buffer.sample_jax(cfg.batch_size, data_sharding=data_sharding)
+            try:
+                _warmup_actor_batch = pretrain_buffer.sample_jax(
+                    cfg.batch_size, data_sharding=data_sharding, success_only=True
+                )
+            except Exception:
+                logging.warning("[warmup] No success_only demo data available for the "
+                               "use_success_batch=True branch -- warming the False branch only.")
+                _warmup_actor_batch = None
+
+            _discard_agent, _discard_info = agent.update(agent, _warmup_batch, cfg.utd_ratio, _warmup_actor_batch)
+            jax.block_until_ready(_discard_agent)
+            if _warmup_actor_batch is not None:
+                _discard_agent2, _discard_info2 = agent.update(agent, _warmup_batch, cfg.utd_ratio, None)
+                jax.block_until_ready(_discard_agent2)
+                del _discard_agent2, _discard_info2
+
+            del _discard_agent, _discard_info, _warmup_batch, _warmup_actor_batch
+            gc.collect()
+            logging.info("[warmup] Compile-only warm-up complete; agent unchanged "
+                         "(warm-up result discarded, never assigned).")
+        except Exception as e:
+            logging.warning("[warmup] Warm-up compilation attempt failed (%s) -- continuing "
+                           "with the original deferred-compilation behavior instead.", e)
 
     # ── Actor BC warm-start (XQCfD-style "policy pretraining") ──────────────
     # Only on a fresh run, same rationale as critic pretraining below. Runs
