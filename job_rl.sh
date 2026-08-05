@@ -26,7 +26,7 @@ CONFIG=${2:-configs/task/maniskill/stack_cube_expo_ft.yaml}
 SFT_CHECKPOINT=${3:-}
 cd ~/projects/expo-ft
 source scripts/setup_env.sh "$VENV"
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.97
 python3 scripts/run_pipeline.py \
     --config "$CONFIG" \
     --stage rl \
