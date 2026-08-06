@@ -590,9 +590,18 @@ def main(_):
             finally:
                 replay_buffer._size = _true_size
 
+            # agent's buffers may be donated inside update()'s own internal
+            # JIT calls (see expo_ft.py's donate_argnames=("agent",) on
+            # _prepare_minibatches_jit/_critic_update_step_jit/
+            # _update_finalize_jit) -- reusing the SAME agent reference for
+            # a second call after donation would be unsafe (its buffers may
+            # already be reused/invalid). Chaining instead: the second warm-up
+            # call uses the first call's own (still-discarded) result as its
+            # input, so the original `agent` reference is only ever used
+            # once, by the first call.
             _discard_agent, _discard_info = agent.update(agent, _warmup_batch, cfg.utd_ratio, None)
             jax.block_until_ready(_discard_agent)
-            del _discard_agent, _discard_info
+            del _discard_info
 
             # Second pass warms the use_success_batch=True branch too (see
             # comment block above). That branch's actor_batch goes through
@@ -610,14 +619,16 @@ def main(_):
                 _actor_warmup_batch = replay_buffer.apply_data_sharding(_actor_warmup_batch, data_sharding)
             finally:
                 replay_buffer._size = _true_size
-            _discard_agent2, _discard_info2 = agent.update(agent, _warmup_batch, cfg.utd_ratio, _actor_warmup_batch)
+            _discard_agent2, _discard_info2 = _discard_agent.update(_discard_agent, _warmup_batch, cfg.utd_ratio, _actor_warmup_batch)
             jax.block_until_ready(_discard_agent2)
-            del _discard_agent2, _discard_info2, _actor_warmup_batch
+            del _discard_agent, _discard_agent2, _discard_info2, _actor_warmup_batch
 
             del _warmup_batch
             gc.collect()
             logging.info("[warmup] Compile-only warm-up complete; agent unchanged "
-                         "(warm-up result discarded, never assigned).")
+                         "(warm-up result discarded, never assigned; only the "
+                         "original `agent` reference passed to update() -- the "
+                         "chained second call never reused it after donation).")
         except Exception as e:
             logging.warning("[warmup] Warm-up compilation attempt failed (%s) -- continuing "
                            "with the original deferred-compilation behavior instead.", e)

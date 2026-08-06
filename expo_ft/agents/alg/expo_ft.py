@@ -1038,13 +1038,18 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         info = {**actor_info, **critic_info}
         return new_agent.cache_infer_params(), info
 
-    @partial(jax.jit, static_argnames=("utd_ratio",))
+    @partial(jax.jit, static_argnames=("utd_ratio",), donate_argnames=("agent",))
     def _prepare_minibatches_jit(self, agent, batch: DatasetDict, utd_ratio: int):
         """Everything _update_jit did BEFORE the critic-update loop:
         augmentation, prepare_critic_batch, reshape into utd_ratio
         minibatches, sharding. Unchanged from before — this part never
         involved lax.scan or remat, so it isn't implicated in the bug this
-        split works around; it's just been extracted into its own function."""
+        split works around; it's just been extracted into its own function.
+
+        donate_argnames=("agent",): input agent's buffers can be reused
+        in-place for the returned new_agent -- safe since update()'s call
+        site always immediately reassigns its local `agent` variable to
+        this call's return, never touching the pre-call reference again."""
         batch = batch.copy()
         rng, key1 = jax.random.split(agent.rng)
         rng, key2 = jax.random.split(rng)
@@ -1079,15 +1084,28 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
 
         return new_agent, minibatches
 
-    @jax.jit
+    @partial(jax.jit, donate_argnames=("agent",))
     def _critic_update_step_jit(self, agent, mb):
         """One critic update on one minibatch. Compiled once (JIT caches on
         first call, since its input shapes never change across the
         utd_ratio calls) and reused for every call in update()'s Python
-        loop — replaces one step of the former jax.lax.scan."""
+        loop — replaces one step of the former jax.lax.scan.
+
+        donate_argnames=("agent",) is the important part here specifically:
+        called utd_ratio (e.g. 20) times per outer training step, with
+        `agent` reassigned from each call's return value every loop
+        iteration (see update()). Without donation, JAX has no guarantee
+        the input agent's buffers are safe to reuse, so each of those 20
+        calls could allocate an entirely fresh copy of the full agent
+        state (critic params, optimizer state, ...) instead of overwriting
+        the previous one in place -- a large, avoidable memory
+        amplification jax.lax.scan never had (its loop-carried state is
+        donated/reused across iterations by construction). This is the
+        likely actual cause of OOMs reappearing even on fresh runs at the
+        original, previously-working N/n_edit_samples values."""
         return agent.update_critic(mb)
 
-    @partial(jax.jit, static_argnames=("use_success_batch",))
+    @partial(jax.jit, static_argnames=("use_success_batch",), donate_argnames=("agent",))
     def _update_finalize_jit(self, agent, last_minibatch, actor_batch: DatasetDict = None, use_success_batch: bool = False):
         """Everything _update_jit did AFTER the critic-update loop: actor,
         residual actor, and temperature updates using the last minibatch.
