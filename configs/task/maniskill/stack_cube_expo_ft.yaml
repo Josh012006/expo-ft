@@ -74,7 +74,7 @@ replan_steps: 8            # number of actions to execute from each action chunk
 fsdp_devices: 1            # number of GPUs for FSDP sharding (1 = single GPU, no sharding)
 
 num_data_rl: 50
-rl_resume_dir: null # "logs/stack_cube/stack_cube_expo_ft_2026-08-01_06-17-03-10261069_rl"
+rl_resume_dir: "logs/stack_cube/stack_cube_expo_ft_2026-08-06_17-18-31-10305551_rl"
 
 model_cls: "EXPOLearner"  # selects both configs/model/*.py (via run_pipeline.py) and the FLAGS.config path used by train_pi_robo.py
 
@@ -113,8 +113,8 @@ rl_fixed_temperature: null      # if set (e.g. 0.1), bypasses the learned SAC
                                   # to test whether the unconverged/climbing alpha itself
                                   # contributes to instability (see July 2026 notes)
 rl_edit_scale: 0.05              # max magnitude of residual action added by edit policy
-rl_N: 8                          # number of base-VLA (no-edit) candidates compared per argmax step
-rl_n_edit_samples: 8              # number of edited (residual-corrected) candidates compared per argmax step
+rl_N: 10                          # number of base-VLA (no-edit) candidates compared per argmax step
+rl_n_edit_samples: 10              # number of edited (residual-corrected) candidates compared per argmax step
 rl_use_double_q_selection: false # decouple candidate selection (online critic ensemble) from evaluation (target critic ensemble, unchanged) -- addresses the argmax self-referential overestimation mechanism, adapted for REDQ ensemble-subsampling. Same mechanism as EXPOLearner, off by default here too (matches pre-existing behavior). Set true to test its separate contribution on this architecture.
 rl_critic_weight_decay: null    # if set (e.g. 1.0e-4), L2 weight decay on critic + encoder params (adamw)
 rl_critic_grad_clip_norm: null  # if set (e.g. 1.0), clips critic + encoder grads to this global norm

@@ -599,9 +599,24 @@ def main(_):
             # call uses the first call's own (still-discarded) result as its
             # input, so the original `agent` reference is only ever used
             # once, by the first call.
-            _discard_agent, _discard_info = agent.update(agent, _warmup_batch, cfg.utd_ratio, None)
+            # CRITICAL: donation must never touch the REAL, persistent
+            # `agent` object -- it's reused for the rest of training
+            # (sample_actions, etc.) right after this block. The earlier
+            # "chain the second call through the first's result" fix only
+            # protected the SECOND warmup call; it missed that the FIRST
+            # call itself passes the real `agent` as the donated argument,
+            # letting JAX free ITS buffers too. That's exactly what caused
+            # "RuntimeError: Array has been deleted with shape=uint32[2]"
+            # later in sample_actions -- agent.rng's buffer had already
+            # been donated away during warmup. A genuine, independent
+            # .copy() of every array leaf here ensures donation only ever
+            # touches a throwaway copy, never the real agent.
+            _warmup_agent = jax.tree_util.tree_map(
+                lambda x: x.copy() if isinstance(x, jax.Array) else x, agent
+            )
+            _discard_agent, _discard_info = _warmup_agent.update(_warmup_agent, _warmup_batch, cfg.utd_ratio, None)
             jax.block_until_ready(_discard_agent)
-            del _discard_info
+            del _discard_info, _warmup_agent
 
             # Second pass warms the use_success_batch=True branch too (see
             # comment block above). That branch's actor_batch goes through
@@ -619,6 +634,9 @@ def main(_):
                 _actor_warmup_batch = replay_buffer.apply_data_sharding(_actor_warmup_batch, data_sharding)
             finally:
                 replay_buffer._size = _true_size
+            # _discard_agent is already a throwaway copy's descendant (never
+            # shared any buffers with the real, persistent agent to begin
+            # with), so chaining through it here remains safe.
             _discard_agent2, _discard_info2 = _discard_agent.update(_discard_agent, _warmup_batch, cfg.utd_ratio, _actor_warmup_batch)
             jax.block_until_ready(_discard_agent2)
             del _discard_agent, _discard_agent2, _discard_info2, _actor_warmup_batch
