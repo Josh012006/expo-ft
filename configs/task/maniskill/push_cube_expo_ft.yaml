@@ -82,7 +82,7 @@ model_cls: "EXPOLearner"  # selects both configs/model/*.py (via run_pipeline.py
 # ── RL Checkpointing ──────────────────────────────────────────────
 checkpoint_model: true
 checkpoint_interval: 1000  # save checkpoint every N steps (0 = only save at end)
-checkpoint_buffer: false   # save replay buffer transitions to disk at each step
+checkpoint_buffer: true   # save replay buffer transitions to disk at each step
 keep_period: 10000         # keep one checkpoint every N steps (older ones are deleted)
 max_to_keep: 1
 

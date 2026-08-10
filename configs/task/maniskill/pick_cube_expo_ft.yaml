@@ -81,7 +81,7 @@ model_cls: "EXPOLearner"  # selects both configs/model/*.py (via run_pipeline.py
 # ── RL Checkpointing ──────────────────────────────────────────────
 checkpoint_model: true
 checkpoint_interval: 1000  # save checkpoint every N steps (0 = only save at end)
-checkpoint_buffer: false   # save replay buffer transitions to disk at each step
+checkpoint_buffer: true   # save replay buffer transitions to disk at each step
 keep_period: 20000         # keep one checkpoint every N steps (older ones are deleted)
 max_to_keep: 1
 
@@ -114,7 +114,7 @@ rl_fixed_temperature: null      # if set (e.g. 0.1), bypasses the learned SAC
                                   # temperature entirely — a diagnostic Jesse suggested
                                   # to test whether the unconverged/climbing alpha itself
                                   # contributes to instability (see July 2026 notes)
-rl_edit_scale: 0.05              # max magnitude of residual action added by edit policy
+rl_edit_scale: 0.2              # max magnitude of residual action added by edit policy
 rl_N: 8                          # number of base-VLA (no-edit) candidates compared per argmax step
 rl_n_edit_samples: 8              # number of edited (residual-corrected) candidates compared per argmax step
 rl_use_double_q_selection: false # decouple candidate selection (online critic ensemble) from evaluation (target critic ensemble, unchanged) -- addresses the argmax self-referential overestimation mechanism, adapted for REDQ ensemble-subsampling. Same mechanism as EXPOLearner, off by default here too (matches pre-existing behavior). Set true to test its separate contribution on this architecture.

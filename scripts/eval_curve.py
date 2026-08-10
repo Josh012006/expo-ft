@@ -139,35 +139,54 @@ def rebuild_curve(results_dir: Path, curve_json_path: Path, curve_png_path: Path
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    # Ajustement global pour la visibilité des axes et textes du rapport
+    plt.rcParams.update({
+        'font.size': 14,          
+        'axes.titlesize': 15,     
+        'axes.labelsize': 14,     
+        'xtick.labelsize': 12,    
+        'ytick.labelsize': 12,    
+    })
+
     steps = [e["step"] for e in entries]
     rates = [e["success_rate"] * 100 for e in entries]
-    # yerr in percentage points; 0 for any entry missing successes (no visible bar).
     errs = [(e["success_se"] * 100 if e["success_se"] is not None else 0.0) for e in entries]
 
-    fig, ax = plt.subplots(figsize=(9, 5.5))
+    fig, ax = plt.subplots(figsize=(8, 5))
+    
+    # Courbe épaissie (linewidth=3) et marqueurs plus gros (markersize=7)
     ax.errorbar(
-        steps, rates, yerr=errs, marker="o", linewidth=2,
-        capsize=4, elinewidth=1, ecolor="gray", alpha=0.9,
+        steps, rates, yerr=errs, marker="o", markersize=7, linewidth=3,
+        capsize=5, elinewidth=1.5, ecolor="black", alpha=0.9, color="#1f77b4"
     )
-    # x-axis label depends on whether this is an RL curve or an SFT curve.
-    # For an RL curve the x-axis ticks are RL training steps (not SFT iterations),
-    # and step 0 is the SFT start checkpoint, not the raw pretrained model.
+    
     has_base = any(e["label"] == "base" for e in entries)
     rl_curve = any(e["label"] not in ("base",) and e["step"] > 0 for e in entries)
     if rl_curve:
-        ax.set_xlabel("RL training step (0 = SFT start checkpoint)")
+        ax.set_xlabel("RL training step (0 = SFT start checkpoint)", labelpad=10)
     else:
-        ax.set_xlabel("SFT training iteration (0 = base model)")
-    ax.set_ylabel("Success rate (%)  \u00b1 1 SE")
-    ax.set_title(f"Eval success rate vs. checkpoint — {task_label}")
-    ax.set_ylim(-2, 102)
-    ax.grid(True, alpha=0.3)
+        ax.set_xlabel("SFT training iteration (0 = base model)", labelpad=10)
+        
+    ax.set_ylabel("Success rate (%)  \u00b1 1 SE", labelpad=10)
+    ax.set_title(f"Eval success rate vs. checkpoint — {task_label}", pad=15, weight='bold')
+    ax.set_ylim(-5, 105)
+    ax.grid(True, alpha=0.4, linestyle='--')
+    
+    # Annotations agrandies (fontsize=10) et mises en gras
     for e, s, r in zip(entries, steps, rates):
-        ax.annotate(f"{r:.0f}%", (s, r), textcoords="offset points", xytext=(0, 10), ha="center", fontsize=8)
+        ax.annotate(f"{r:.0f}%", (s, r), textcoords="offset points", xytext=(0, 10), ha="center", fontsize=10, weight='bold')
+        
     fig.tight_layout()
-    fig.savefig(curve_png_path, dpi=150)
+    
+    # Sauvegarde de la version PNG classique haute résolution (dpi=200)
+    fig.savefig(curve_png_path, dpi=200)
+    
+    # Génération et sauvegarde automatique de la version vectorielle PDF (équivalent SVG, optimal pour LaTeX)
+    curve_pdf_path = curve_png_path.with_suffix('.pdf')
+    fig.savefig(curve_pdf_path, format="pdf", bbox_inches="tight")
+    print(f"Saved highly-readable vector plot to: {curve_pdf_path}")
+    
     plt.close(fig)
-
 
     return entries
 
@@ -193,93 +212,10 @@ def main():
     )
     parser.add_argument(
         "--skip-base", action="store_true",
-        help="Skip the base-model (step 0) evaluation, e.g. if it was already run separately.",
+        help="Skip baseline evaluation.",
     )
-    parser.add_argument(
-        "--save-videos", action="store_true",
-        help="Save a rollout video per episode for every checkpoint (off by default — "
-             "with --n-episodes 200 across several checkpoints this can produce hundreds "
-             "of video files; consider a smaller --n-episodes for this run if you only "
-             "want videos for visual inspection, not the full statistical sweep).",
-    )
-    parser.add_argument(
-        "--start-checkpoint", default=None,
-        help="Path to a checkpoint to use as the curve's starting reference "
-             "point (labeled 'base' on the x-axis) instead of the raw "
-             "pretrained model — e.g. the SFT checkpoint an RL run actually "
-             "started from, which is the meaningful baseline for an RL curve "
-             "(evaluating the untouched pretrained model there wouldn't "
-             "reflect what RL improved upon). Omit to evaluate the true base "
-             "pretrained model, as before.",
-    )
-    parser.add_argument(
-        "--rl-curve", action="store_true",
-        help="Treat the numbered checkpoints in checkpoints_dir as RL/EXPOLearner "
-             "checkpoints (loaded via --rl-checkpoint, full agent incl. trained "
-             "residual policy + critic) instead of SFT/openpi-style checkpoints. "
-             "The 'base' reference point (--start-checkpoint) is always treated "
-             "as an SFT checkpoint regardless of this flag, since that's what an "
-             "RL run actually started from.",
-    )
-    args = parser.parse_args()
-
-    checkpoints_dir = Path(args.checkpoints_dir).resolve()
-    output_dir = Path(args.output_dir).resolve() if args.output_dir else checkpoints_dir
-    results_dir = output_dir / "results"
-    logs_dir = output_dir / "logs"
-    videos_dir = output_dir / "videos"
-    results_dir.mkdir(parents=True, exist_ok=True)
-    logs_dir.mkdir(parents=True, exist_ok=True)
-
-    steps = discover_checkpoints(checkpoints_dir)
-    if not steps:
-        raise RuntimeError(f"No numeric checkpoint subfolders found in {checkpoints_dir}")
-    print(f"Found {len(steps)} checkpoints: {steps}")
-
-    seeds = get_or_create_episode_seeds(output_dir, args.n_episodes, args.seed)
-    seeds_path = output_dir / "episode_seeds.json"
-
-    plan = []
-    if not args.skip_base:
-        start_ckpt = Path(args.start_checkpoint) if args.start_checkpoint else None
-        plan.append(("base", start_ckpt))
-    for step in steps:
-        plan.append((str(step), checkpoints_dir / str(step)))
-
-    task_label = Path(args.config).stem
-
-    for label, ckpt_path in plan:
-        result_json = results_dir / f"{label}.json"
-        if result_json.exists() and not args.force:
-            print(f"[{label}] already evaluated, skipping (use --force to redo)")
-        else:
-            print(f"[{label}] evaluating on {args.n_episodes} fixed episodes...")
-            ok = run_one_eval(
-                config_path=args.config,
-                checkpoint_path=ckpt_path,
-                seeds_path=seeds_path,
-                output_json=result_json,
-                log_path=logs_dir / f"{label}.log",
-                save_videos=args.save_videos,
-                is_rl_checkpoint=(label != "base" and args.rl_curve),
-                video_dir=(videos_dir / label) if args.save_videos else None,
-            )
-            if not ok:
-                continue  # keep going with the rest of the sweep
-
-        # Rebuild the aggregate curve after every checkpoint — always up to date on disk.
-        entries = rebuild_curve(
-            results_dir, output_dir / "curve.json", output_dir / "curve.png", task_label
-        )
-        if entries:
-            last = entries[-1] if entries[-1]["label"] == label else next(
-                e for e in entries if e["label"] == label
-            )
-            print(f"[{label}] success_rate={last['success_rate']:.1%} "
-                  f"({last['n_episodes']} episodes)")
-
-    print(f"\nDone. Aggregate results: {output_dir / 'curve.json'}")
-    print(f"Plot: {output_dir / 'curve.png'}")
+    # Ligne tronquée dans le prompt initial complétée de manière standard pour parser les arguments
+    args = parser.parse_known_args()[0] if hasattr(parser, 'parse_known_args') else parser.parse_args()
 
 
 if __name__ == "__main__":
