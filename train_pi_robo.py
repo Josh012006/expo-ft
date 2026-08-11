@@ -122,6 +122,41 @@ def run_rigorous_eval(agent, eval_env, episode_seeds, cfg):
     return success_rate, stderr
 
 
+def reconstruct_success_window(replay_buffer, success_rate_window):
+    """On resume, when checkpoint_buffer=true has restored real past
+    transitions (see restore_replay_buffer in expo_ft/data/replay_buffer.py
+    -- files are named by step and reloaded via insert() in that same
+    order, so the buffer's own index order IS true temporal order), rebuild
+    eval/success_rate's rolling window directly from that restored history
+    instead of leaving it empty. Without this, _success_window stays empty
+    on every resume (it's a separate in-memory list, never populated by
+    batch_processor.restore() itself) and eval/success_rate silently
+    reports nothing until success_rate_window BRAND NEW episodes complete
+    post-resume -- with a typical PushCube episode length, that's ~20K
+    steps of pure silence on a metric checkpoint_buffer was specifically
+    meant to make resume-safe.
+
+    dones marks each episode's LAST transition; is_success at that same
+    index is that episode's outcome (matches exactly how the live
+    training loop appends to _success_window -- see the two call sites of
+    training_log._success_window.append(...) in this file). Returns up to
+    the last `success_rate_window` such outcomes, in original temporal
+    order (oldest of the kept ones first) -- if fewer than
+    success_rate_window episodes exist in the restored buffer, returns
+    all of them (a partial pre-fill is still strictly better than none:
+    it shrinks whatever real wait remains instead of eliminating it)."""
+    size = replay_buffer._size
+    if size == 0:
+        return []
+    dones = np.asarray(replay_buffer.dataset_dict["dones"][:size])
+    is_success = np.asarray(replay_buffer.dataset_dict["is_success"][:size])
+    episode_end_indices = np.flatnonzero(dones)
+    if len(episode_end_indices) == 0:
+        return []
+    kept = episode_end_indices[-success_rate_window:]
+    return is_success[kept].astype(float).tolist()
+
+
 def main(_):
     init_logging()
 
@@ -585,6 +620,15 @@ def main(_):
             logging.info("Resuming from step %d", start_step)
         batch_processor.restore(checkpoint_dir_path, up_to_step=latest_step)
 
+    # Computed here (right after restore, while the restored buffer is
+    # freshest) but only actually USED later at training_log._success_window's
+    # own initialization, since training_log doesn't exist yet at this point.
+    # See reconstruct_success_window()'s own docstring for why this exists.
+    _restored_success_window = (
+        reconstruct_success_window(batch_processor.replay_buffer, int(getattr(cfg, "success_rate_window", 200)))
+        if resuming and cfg.checkpoint_buffer else []
+    )
+
     # Demos live in offline_replay_buffer when offline_ratio > 0 (the normal
     # ExpoFT setup); BatchProcessor's constructor instead seeds them into the
     # online replay_buffer when offline_ratio == 0 — follow whichever buffer
@@ -1015,7 +1059,13 @@ def main(_):
     wandb.define_metric("eval_rigorous/success_rate_stderr", step_metric="training/global_step")
 
     success_rate_window = getattr(cfg, "success_rate_window", 200)
-    training_log._success_window = []
+    training_log._success_window = _restored_success_window
+    if _restored_success_window:
+        logging.info(f"[resume] Reconstructed eval/success_rate's rolling window from "
+                     f"{len(_restored_success_window)} restored episode(s) in the checkpointed "
+                     f"replay buffer ({'full' if len(_restored_success_window) >= success_rate_window else 'partial'} "
+                     f"window of {success_rate_window}) -- no need to wait for that many brand-new "
+                     f"episodes post-resume before this metric reports again.")
 
     # Rigorous deterministic eval AT INITIALIZATION (step 0), fresh runs
     # only -- matches Jesse's explicit request ("This includes at
