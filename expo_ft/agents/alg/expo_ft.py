@@ -155,7 +155,7 @@ def batch_encode(encoder_fn, encoder_params, observations, stop_gradient=False):
     return encoded
 
 
-@partial(jax.jit, static_argnames="apply_fn")
+@partial(jax.jit, static_argnames=("apply_fn", "deterministic"))
 def _sample_actions(rng, apply_fn, params, observations: jnp.ndarray, states, actions, deterministic: bool = False) -> jnp.ndarray:
     key, rng = jax.random.split(rng)
     dist = apply_fn({"params": params}, observations, actions=actions, p=states)
