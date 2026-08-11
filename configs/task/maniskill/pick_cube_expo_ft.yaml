@@ -64,7 +64,7 @@ seed: 42
 max_episodes: 1000
 max_steps_per_episode: 120
 batch_size: 24             # number of transitions sampled from replay buffer per gradient update
-utd_ratio: 40              # gradient updates performed per new transition collected
+utd_ratio: 20              # gradient updates performed per new transition collected
 offline_ratio: 0.5         # fraction of each training batch drawn from the offline demo buffer during sampling. Means exactly this at every value, including 0.0 -- does NOT by itself control whether demos are used at all (see rl_seed_demos_online below).
 rl_seed_demos_online: false  # if true, ALSO seed demos directly into the online replay buffer (matches the EXPO paper's own single-buffer convention, independent of offline_ratio's value). With this false AND offline_ratio: 0.0, demos are not inserted anywhere -- pure off-policy training on collected rollout samples only.
 update_type: "episode"     # when to trigger updates: "episode", "step", or "batch"
@@ -95,7 +95,19 @@ max_to_keep: 1
 # progress without ever touching the real training step axis.
 success_rate_window: 200
 
-
+# Rigorous, held-out, deterministic evaluation -- Jesse's proposed protocol.
+# eval/success_rate above is a rolling window over stochastic ONLINE
+# training episodes; it's a useful proxy but not a substitute for this.
+# Runs rl_eval_episodes deterministic episodes (residual actor's mode, not
+# a sample) on fixed seeds every rl_eval_interval steps, including at
+# initialization (step 0), logged separately under eval_rigorous/*. Uses a
+# SEPARATE environment instance from training, in-process (not a
+# subprocess: XLA_PYTHON_CLIENT_MEM_FRACTION reserves most of the GPU for
+# the whole lifetime of the training process, so a separate eval subprocess
+# launched while training is still alive would starve for GPU memory).
+rl_eval_interval: 20000    # 0 disables this feature entirely (no eval_env created, zero overhead)
+rl_eval_episodes: 200      # reduce toward 50 if this meaningfully slows down training
+rl_eval_seed: 42           # master seed for the fixed episode list (matches eval_curve.py's own default)
 
 actor_success_only: true        # if true, actor batch is sampled only from successful transitions
 

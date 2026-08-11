@@ -156,9 +156,14 @@ def batch_encode(encoder_fn, encoder_params, observations, stop_gradient=False):
 
 
 @partial(jax.jit, static_argnames="apply_fn")
-def _sample_actions(rng, apply_fn, params, observations: jnp.ndarray, states, actions) -> jnp.ndarray:
+def _sample_actions(rng, apply_fn, params, observations: jnp.ndarray, states, actions, deterministic: bool = False) -> jnp.ndarray:
     key, rng = jax.random.split(rng)
     dist = apply_fn({"params": params}, observations, actions=actions, p=states)
+    if deterministic:
+        # TanhTransformedDistribution.mode() = tanh(base_gaussian.mean()) --
+        # the standard deterministic action for a squashed-Gaussian policy.
+        # See expo_ft/distributions/tanh_transformed.py.
+        return dist.mode(), rng
     return dist.sample(seed=key), rng
 
 
@@ -527,9 +532,9 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             "target_critic_params": jax.device_put(self.target_critic.params, s),
         })
 
-    def _sample_residual(self, key, residual_params, encoded_obs, states, base_actions):
+    def _sample_residual(self, key, residual_params, encoded_obs, states, base_actions, deterministic: bool = False):
         r_samples, rng = _sample_actions(
-            key, self.residual_actor.apply_fn, residual_params, encoded_obs, states, base_actions
+            key, self.residual_actor.apply_fn, residual_params, encoded_obs, states, base_actions, deterministic=deterministic
         )
         residual_scaled = self._apply_residual_xyzg_mask(r_samples * self.edit_scale)
         combined = residual_scaled + base_actions
@@ -557,7 +562,14 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             return jnp.concatenate(q_list)
         return compute_q(critic_fn, critic_params, obs, actions, states, self.num_min_qs)
 
-    def sample_actions(self, observations, only_base_actions=False):
+    def sample_actions(self, observations, only_base_actions=False, deterministic: bool = False):
+        # deterministic: use the residual actor's mode (tanh of the Gaussian
+        # mean) instead of a stochastic sample. Only the trained residual is
+        # affected -- the frozen base VLA's own sampling (self.actor.sample_actions
+        # above, N candidates) stays stochastic regardless, since flow-matching
+        # models have no equivalent well-defined "mode" the way a Gaussian does,
+        # and it's not something we trained. The argmax-over-candidates
+        # selection itself was already deterministic given fixed candidates.
         # Keep inference-time randomness on the same single device as inference params
         # to avoid cross-device gather/indexing mismatches.
         infer_sharding = self.actor.infer_sharding
@@ -615,7 +627,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
                 r_states = jnp.repeat(jnp.expand_dims(transformed_states[0], axis = 0), self.n_edit_samples, axis=0)
                 base_actions = transformed_actions.copy()[:self.n_edit_samples]
 
-                r_samples, _, rng = self._sample_residual(key, _residual_actor_params, r_observations, r_states, base_actions)
+                r_samples, _, rng = self._sample_residual(key, _residual_actor_params, r_observations, r_states, base_actions, deterministic=deterministic)
                 transformed_actions = jnp.concatenate([base_actions, r_samples], axis=0)
 
                 r_modified = r_samples.reshape(self.n_edit_samples, self.replan_steps, self.action_dim)

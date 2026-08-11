@@ -77,7 +77,7 @@ def get_or_create_episode_seeds(output_dir: Path, n_episodes: int, master_seed: 
     return seeds
 
 
-def run_one_eval(config_path, checkpoint_path, seeds_path, output_json, log_path, save_videos=False, is_rl_checkpoint=False, video_dir=None):
+def run_one_eval(config_path, checkpoint_path, seeds_path, output_json, log_path, save_videos=False, is_rl_checkpoint=False, video_dir=None, deterministic=False):
     cmd = [
         sys.executable, str(REPO_ROOT / "scripts" / "eval_policy.py"),
         "--config", str(config_path),
@@ -91,6 +91,8 @@ def run_one_eval(config_path, checkpoint_path, seeds_path, output_json, log_path
     if checkpoint_path is not None:
         flag = "--rl-checkpoint" if is_rl_checkpoint else "--checkpoint"
         cmd += [flag, str(checkpoint_path)]
+    if deterministic:
+        cmd.append("--deterministic")
 
     print(f"\n$ {' '.join(cmd)}")
     with open(log_path, "w") as logf:
@@ -197,7 +199,8 @@ def main():
     parser.add_argument(
         "--checkpoints-dir", required=True,
         help="Directory containing numeric checkpoint subfolders, e.g. "
-             "logs/stack_cube/<run>/sft/<sft_config_name>/<sft_exp_name>/",
+             "logs/stack_cube/<run>/sft/<sft_config_name>/<sft_exp_name>/ for an "
+             "SFT sweep, or <run>/checkpoints for an RL sweep (--rl-curve).",
     )
     parser.add_argument("--n-episodes", type=int, default=50)
     parser.add_argument(
@@ -214,8 +217,84 @@ def main():
         "--skip-base", action="store_true",
         help="Skip baseline evaluation.",
     )
-    # Ligne tronquée dans le prompt initial complétée de manière standard pour parser les arguments
-    args = parser.parse_known_args()[0] if hasattr(parser, 'parse_known_args') else parser.parse_args()
+    parser.add_argument(
+        "--rl-curve", action="store_true",
+        help="Evaluate RL/EXPOLearner checkpoints (via eval_policy.py's "
+             "--rl-checkpoint) instead of SFT/openpi-style ones. "
+             "--checkpoints-dir should then point at an RL run's own "
+             "checkpoints/ directory (numeric step subfolders).",
+    )
+    parser.add_argument(
+        "--start-checkpoint", default=None,
+        help="With --rl-curve: path to the SFT checkpoint step dir the RL run "
+             "started from (e.g. .../sft/.../<step>). Evaluated once as the "
+             "step=0 point, so the RL curve reads continuously from its actual "
+             "starting point instead of jumping in cold at the first RL "
+             "checkpoint. Ignored without --rl-curve.",
+    )
+    parser.add_argument(
+        "--deterministic", action="store_true",
+        help="Evaluate RL checkpoints with the residual actor's mode instead of "
+             "a stochastic sample (passed through to eval_policy.py). Only "
+             "applies to RL checkpoints, which have a trained residual to be "
+             "deterministic about -- ignored for --start-checkpoint/baseline SFT "
+             "evaluation, which doesn't.",
+    )
+    parser.add_argument(
+        "--save-videos", action="store_true",
+        help="Save rollout videos for every evaluated checkpoint. Off by "
+             "default: a sweep over many checkpoints would otherwise write "
+             "hundreds of videos.",
+    )
+    args = parser.parse_args()
+
+    checkpoints_dir = Path(args.checkpoints_dir).resolve()
+    output_dir = Path(args.output_dir).resolve() if args.output_dir else checkpoints_dir
+    results_dir = output_dir / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir = output_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    curve_json_path = output_dir / "curve.json"
+    curve_png_path = output_dir / "curve.png"
+    task_label = Path(args.config).stem
+
+    episode_seeds = get_or_create_episode_seeds(output_dir, args.n_episodes, args.seed)
+    seeds_path = output_dir / "episode_seeds.json"
+
+    def maybe_run(label, checkpoint_path, is_rl_checkpoint, deterministic):
+        output_json = results_dir / f"{label}.json"
+        if output_json.exists() and not args.force:
+            print(f"Skipping {label} (already evaluated; use --force to re-run)")
+            return
+        ok = run_one_eval(
+            config_path=args.config,
+            checkpoint_path=checkpoint_path,
+            seeds_path=seeds_path,
+            output_json=output_json,
+            log_path=logs_dir / f"{label}.log",
+            save_videos=args.save_videos,
+            is_rl_checkpoint=is_rl_checkpoint,
+            deterministic=deterministic,
+        )
+        # Rebuilt after EVERY checkpoint, not just once at the end, per this
+        # file's own docstring: "a sweep that gets killed partway still
+        # leaves an up-to-date plot on disk."
+        if ok:
+            rebuild_curve(results_dir, curve_json_path, curve_png_path, task_label)
+
+    if args.rl_curve:
+        if args.start_checkpoint is not None and not args.skip_base:
+            maybe_run("base", args.start_checkpoint, is_rl_checkpoint=False, deterministic=False)
+        for step in discover_checkpoints(checkpoints_dir):
+            maybe_run(str(step), checkpoints_dir / str(step), is_rl_checkpoint=True, deterministic=args.deterministic)
+    else:
+        if not args.skip_base:
+            maybe_run("base", None, is_rl_checkpoint=False, deterministic=False)
+        for step in discover_checkpoints(checkpoints_dir):
+            maybe_run(str(step), checkpoints_dir / str(step), is_rl_checkpoint=False, deterministic=False)
+
+    entries = rebuild_curve(results_dir, curve_json_path, curve_png_path, task_label)
+    print(f"\nDone: {len(entries)} points on the curve. See {curve_png_path}")
 
 
 if __name__ == "__main__":

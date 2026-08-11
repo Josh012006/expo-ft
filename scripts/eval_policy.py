@@ -25,8 +25,18 @@ from expo_ft.utils.config_loader import load_task_config, get_sft_config_name
 from expo_ft.env.env_factory import make_env_wrapper
 
 def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_action_stats=False,
-             episode_seeds=None, output_json=None, diagnose_subconditions=False, rl_checkpoint_path=None):
+             episode_seeds=None, output_json=None, diagnose_subconditions=False, rl_checkpoint_path=None,
+             deterministic=False):
     """
+    deterministic: when True, the residual actor uses its mode (tanh of the
+    Gaussian mean) instead of a stochastic sample -- see expo_ft.py's
+    sample_actions docstring for why only the residual is affected, not the
+    frozen base VLA's own sampling. Matches the same deterministic protocol
+    train_pi_robo.py's periodic in-training rigorous eval uses (Jesse's
+    proposed evaluation protocol). Defaults to False, preserving this
+    script's original (stochastic) behavior for anyone not explicitly
+    opting in.
+
     episode_seeds: optional list[int] of length n_episodes. When provided, env.reset()
     is called with seed=episode_seeds[ep] for each episode — guarantees the SAME initial
     conditions (object/goal positions) across different checkpoints, for a fair
@@ -245,7 +255,7 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
 
         while not done and steps < cfg.max_steps_per_episode:
             if not action_plan:
-                action_chunk, agent, _ = agent.sample_actions(obs, only_base_actions=only_base_actions)
+                action_chunk, agent, _ = agent.sample_actions(obs, only_base_actions=only_base_actions, deterministic=deterministic)
                 all_actions.append(action_chunk)
                 if ep == 0 and steps == 0:
                     print(f"\n--- DEBUG EP 0 STEP 0 ---")
@@ -392,6 +402,13 @@ if __name__ == "__main__":
              "PickCube-v1's is_obj_placed / is_robot_static) was ever True, and "
              "whether they were ever True at the SAME step.",
     )
+    parser.add_argument(
+        "--deterministic", action="store_true",
+        help="Use the residual actor's mode (tanh of the Gaussian mean) instead of "
+             "a stochastic sample. The frozen base VLA's own sampling is unaffected "
+             "either way (flow-matching models have no equivalent deterministic mode). "
+             "Matches train_pi_robo.py's periodic in-training rigorous eval protocol.",
+    )
     args = parser.parse_args()
 
     cfg = load_task_config(args.config)
@@ -429,4 +446,5 @@ if __name__ == "__main__":
         output_json=args.output_json,
         diagnose_subconditions=args.diagnose_subconditions,
         rl_checkpoint_path=args.rl_checkpoint,
+        deterministic=args.deterministic,
     )

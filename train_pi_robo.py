@@ -1,9 +1,11 @@
 #! /usr/bin/env python
 import os
 import gc
+import json
 import logging
 import time
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import tqdm
@@ -46,6 +48,79 @@ config_flags.DEFINE_config_file(
     "File path to the training hyperparameter configuration.",
     lock_config=False,
 )
+
+
+def get_or_create_episode_seeds(output_dir, n_episodes, master_seed):
+    """Mirrors scripts/eval_curve.py's own get_or_create_episode_seeds()
+    EXACTLY (same generation logic: np.random.default_rng(master_seed),
+    same cache file name/location) so a periodic in-training eval here uses
+    the IDENTICAL fixed seed list eval_curve.py would generate for the SAME
+    (output_dir, n_episodes, master_seed) -- true apples-to-apples
+    comparability with the SFT baseline's own evaluation, without needing to
+    locate or copy any specific file: same inputs, same deterministic PRNG,
+    same seeds, wherever this is called from. Kept as a separate copy here
+    (not imported from scripts/eval_curve.py) to avoid a fragile
+    cross-directory import; if eval_curve.py's own version ever changes,
+    this one must be updated to match, or the two would silently diverge."""
+    output_dir = Path(output_dir)
+    seeds_path = output_dir / "episode_seeds.json"
+    if seeds_path.exists():
+        with open(seeds_path) as f:
+            seeds = json.load(f)
+        if len(seeds) != n_episodes:
+            raise ValueError(
+                f"Existing {seeds_path} has {len(seeds)} seeds but rl_eval_episodes={n_episodes}. "
+                f"Delete the file to regenerate, or fix rl_eval_episodes to match."
+            )
+        return seeds
+    rng = np.random.default_rng(master_seed)
+    seeds = rng.integers(0, 2**31 - 1, size=n_episodes).tolist()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with open(seeds_path, "w") as f:
+        json.dump(seeds, f, indent=2)
+    logging.info(f"[rigorous-eval] Generated {n_episodes} fixed episode seeds "
+                 f"(master_seed={master_seed}): {seeds_path}")
+    return seeds
+
+
+def run_rigorous_eval(agent, eval_env, episode_seeds, cfg):
+    """Deterministic, fixed-seed evaluation -- Jesse's proposed protocol.
+    Runs episode_seeds' episodes with agent.sample_actions(..., deterministic=True)
+    (residual actor's mode, not a stochastic sample -- see expo_ft.py's
+    sample_actions docstring) and returns (success_rate, stderr).
+
+    Deliberately does NOT touch the `agent` object passed in: uses its own
+    local `eval_agent` variable, reassigned across this function's own
+    rollout steps exactly like sample_actions() always requires (each call
+    returns a new agent with an advanced .rng), but that variable is purely
+    local and discarded when this function returns. The caller's own
+    `agent` (and its .rng sequence) is completely unaffected by having run
+    this evaluation -- training resumes exactly as if this detour never
+    happened, only wandb gets the new eval_rigorous/* numbers."""
+    from collections import deque
+    eval_agent = agent
+    successes = []
+    for ep in tqdm.tqdm(range(len(episode_seeds)), desc="[rigorous-eval]", disable=not FLAGS.tqdm):
+        obs = eval_env.reset(seed=int(episode_seeds[ep]))
+        done = False
+        steps = 0
+        success = False
+        action_plan = deque()
+        while not done and steps < cfg.max_steps_per_episode:
+            if not action_plan:
+                action_chunk, eval_agent, _ = eval_agent.sample_actions(obs, deterministic=True)
+                action_plan.extend(action_chunk[:cfg.replan_steps])
+            action = action_plan.popleft()
+            eval_env.step(action.tolist())
+            done, success, _, _ = eval_env.get_info_for_step()
+            obs = eval_env.get_observation()
+            steps += 1
+        successes.append(float(success))
+    successes = np.asarray(successes)
+    success_rate = float(successes.mean())
+    stderr = float(successes.std(ddof=1) / np.sqrt(len(successes))) if len(successes) > 1 else 0.0
+    return success_rate, stderr
+
 
 def main(_):
     init_logging()
@@ -298,6 +373,35 @@ def main(_):
         env = make_env_wrapper(env_creation_request=train_env_creation_request, cfg=cfg)
     env.reset()
     logging.info(f"Created training environment {env.env_id}")
+
+    # Separate environment instance for periodic rigorous (deterministic,
+    # fixed-seed) evaluation -- see run_rigorous_eval() below. Kept
+    # completely separate from the training env so a mid-episode training
+    # rollout is never disturbed by an eval detour. Only created when the
+    # feature is actually enabled (rl_eval_interval > 0), matching how
+    # rl_critic_pretrain_steps/rl_actor_pretrain_steps etc. are opt-in.
+    rl_eval_interval = int(getattr(cfg, "rl_eval_interval", 0) or 0)
+    rl_eval_episodes = int(getattr(cfg, "rl_eval_episodes", 200))
+    rl_eval_seed = int(getattr(cfg, "rl_eval_seed", 42))
+    eval_env = None
+    if rl_eval_interval > 0:
+        eval_env_creation_request = {
+            "example_action": example_action,
+            "env_usage": "eval",
+            "video_dir": None,
+        }
+        if cfg.env_wrapper == "droid":
+            eval_env = EnvClientWrapper(
+                env_creation_request=eval_env_creation_request,
+                host="localhost",
+                port=8102,
+            )
+        else:
+            eval_env = make_env_wrapper(env_creation_request=eval_env_creation_request, cfg=cfg)
+        eval_env.reset()
+        logging.info(f"Created separate rigorous-eval environment {eval_env.env_id} "
+                     f"(every {rl_eval_interval} steps, {rl_eval_episodes} episodes, "
+                     f"deterministic actor, fixed seeds from master_seed={rl_eval_seed})")
 
     # model_cls already read near the top of main() (see hyperparameter
     # override block above) — reused here for the learner-import dispatch.
@@ -903,9 +1007,33 @@ def main(_):
     wandb.define_metric("training/global_step")
     wandb.define_metric("training/*", step_metric="training/global_step")
     wandb.define_metric("eval/success_rate", step_metric="training/global_step")
+    # Deterministic, fixed-seed rigorous eval (Jesse's proposed protocol) --
+    # deliberately a DIFFERENT metric name from eval/success_rate above
+    # (that one is the in-training rolling window over stochastic online
+    # episodes) so the two are never confused on the same dashboard.
+    wandb.define_metric("eval_rigorous/success_rate", step_metric="training/global_step")
+    wandb.define_metric("eval_rigorous/success_rate_stderr", step_metric="training/global_step")
 
     success_rate_window = getattr(cfg, "success_rate_window", 200)
     training_log._success_window = []
+
+    # Rigorous deterministic eval AT INITIALIZATION (step 0), fresh runs
+    # only -- matches Jesse's explicit request ("This includes at
+    # initialization, so after 0 steps"). Gated the same way priming is
+    # (not resuming): on a resumed run there's no meaningful "step 0" to
+    # re-evaluate, and the periodic in-loop calls below will still cover
+    # this run at its own eval_interval boundaries.
+    if not resuming and eval_env is not None:
+        episode_seeds = get_or_create_episode_seeds(checkpoint_dir_path, rl_eval_episodes, rl_eval_seed)
+        logging.info(f"[rigorous-eval] Running initialization (step 0) eval: "
+                     f"{rl_eval_episodes} deterministic episodes, fixed seeds...")
+        success_rate, stderr = run_rigorous_eval(agent, eval_env, episode_seeds, cfg)
+        wandb.log({
+            "eval_rigorous/success_rate": success_rate,
+            "eval_rigorous/success_rate_stderr": stderr,
+            "training/global_step": 0,
+        })
+        logging.info(f"[rigorous-eval] step 0: success_rate={success_rate:.3f} +/- {stderr:.3f}")
 
     if not resuming and success_rate_window > 0:
         logging.info(f"[priming] Evaluating the starting model on {success_rate_window} real "
@@ -1122,6 +1250,27 @@ def main(_):
                 logging.info(f"Saved agent checkpoint at step {i} (interval={cfg.checkpoint_interval})")
             except Exception as e:
                 logging.error(f"Could not save model checkpoint: {e}")
+
+        # Periodic rigorous deterministic eval (Jesse's proposed protocol) --
+        # see run_rigorous_eval()'s own docstring for why this is safe to
+        # call mid-training: it never touches the real `agent`/its .rng
+        # sequence, only reads it. i>0 skips step 0 here since that's
+        # already covered by the dedicated initialization eval above (fresh
+        # runs) -- on a resumed run there was no such initialization call,
+        # but the periodic boundary will still be hit at the next multiple
+        # of rl_eval_interval regardless.
+        if eval_env is not None and i > 0 and i % rl_eval_interval == 0:
+            try:
+                episode_seeds = get_or_create_episode_seeds(checkpoint_dir_path, rl_eval_episodes, rl_eval_seed)
+                success_rate, stderr = run_rigorous_eval(agent, eval_env, episode_seeds, cfg)
+                wandb.log({
+                    "eval_rigorous/success_rate": success_rate,
+                    "eval_rigorous/success_rate_stderr": stderr,
+                    "training/global_step": i,
+                })
+                logging.info(f"[rigorous-eval] step {i}: success_rate={success_rate:.3f} +/- {stderr:.3f}")
+            except Exception as e:
+                logging.error(f"[rigorous-eval] Failed at step {i}: {e}")
 
         if cfg.checkpoint_buffer and (has_action or action_type == "human"):
             try:
