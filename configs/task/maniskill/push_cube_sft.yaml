@@ -7,7 +7,7 @@
 # ── Environment ────────────────────────────────────────────────
 env_id: "PushCube-v1"
 language_instruction: "push the cube to the goal region"
-control_hz: 10
+control_hz: 15
 max_episode_steps: 120
 env_type: "sim"  # "sim" for simulation, "droid" for real robot
 env_wrapper: "maniskill"  # "maniskill" ou "droid" (real robot)
