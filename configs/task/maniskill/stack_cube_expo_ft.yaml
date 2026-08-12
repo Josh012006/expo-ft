@@ -12,6 +12,7 @@ max_episode_steps: 120
 env_type: "sim"  # "sim" for simulation, "droid" for real robot
 env_wrapper: "maniskill"  # "maniskill" ou "droid" (real robot)
 sim_backend: "physx_cpu"
+reward_mode: "sparse"           # gym.make() never set this before -> ManiSkill defaulted to "normalized_dense" (dense, shaped, per-step reward, NOT sparse 0/1). Kept in sync across all Environment sections per this file's own note.
 
 # Control mode config
 control_mode: "pd_joint_delta_pos"
@@ -74,7 +75,7 @@ replan_steps: 8            # number of actions to execute from each action chunk
 fsdp_devices: 1            # number of GPUs for FSDP sharding (1 = single GPU, no sharding)
 
 num_data_rl: 50
-rl_resume_dir: null # "logs/stack_cube/stack_cube_expo_ft_2026-08-10_22-07-55-10336738_rl"
+rl_resume_dir: "logs/stack_cube/stack_cube_expo_ft_2026-08-12_03-15-15-10345306_rl"
 
 model_cls: "EXPOLearner"  # selects both configs/model/*.py (via run_pipeline.py) and the FLAGS.config path used by train_pi_robo.py
 
