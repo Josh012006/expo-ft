@@ -83,11 +83,28 @@ def get_or_create_episode_seeds(output_dir, n_episodes, master_seed):
     return seeds
 
 
-def run_rigorous_eval(agent, eval_env, episode_seeds, cfg):
+def run_rigorous_eval(agent, eval_env, episode_seeds, cfg, only_base_actions=False):
     """Deterministic, fixed-seed evaluation -- Jesse's proposed protocol.
     Runs episode_seeds' episodes with agent.sample_actions(..., deterministic=True)
     (residual actor's mode, not a stochastic sample -- see expo_ft.py's
     sample_actions docstring) and returns (success_rate, stderr).
+
+    only_base_actions: at step 0 (before any RL training), the residual and
+    critic are freshly, randomly initialized -- deterministic=True only
+    makes their OWN output deterministic, it does NOT mean "no residual
+    contribution." Without only_base_actions=True, the step-0 number would
+    actually measure SFT + an arbitrary untrained-residual offset + an
+    untrained-critic argmax selection, not the clean frozen-SFT baseline
+    Jesse's protocol calls for as the reference point. only_base_actions=True
+    bypasses the whole residual/critic mechanism, matching exactly how
+    eval_policy.py's own baseline mode works. Note this makes the eval
+    genuinely non-deterministic at step 0 regardless of the deterministic=True
+    passed to sample_actions internally -- the frozen base VLA's own
+    sampling stays stochastic either way (no equivalent deterministic mode
+    for a flow-matching model), which is expected and fine: there's no
+    trained residual to speak of yet at step 0, so "deterministic" has
+    nothing to apply to. Should be False for every later, trained-agent
+    call (only_base_actions defaults to False, matching that).
 
     Deliberately does NOT touch the `agent` object passed in: uses its own
     local `eval_agent` variable, reassigned across this function's own
@@ -108,7 +125,7 @@ def run_rigorous_eval(agent, eval_env, episode_seeds, cfg):
         action_plan = deque()
         while not done and steps < cfg.max_steps_per_episode:
             if not action_plan:
-                action_chunk, eval_agent, _ = eval_agent.sample_actions(obs, deterministic=True)
+                action_chunk, eval_agent, _ = eval_agent.sample_actions(obs, only_base_actions=only_base_actions, deterministic=True)
                 action_plan.extend(action_chunk[:cfg.replan_steps])
             action = action_plan.popleft()
             eval_env.step(action.tolist())
@@ -1067,35 +1084,52 @@ def main(_):
                      f"window of {success_rate_window}) -- no need to wait for that many brand-new "
                      f"episodes post-resume before this metric reports again.")
 
-    # Rigorous deterministic eval AT INITIALIZATION (step 0), fresh runs
-    # only -- matches Jesse's explicit request ("This includes at
-    # initialization, so after 0 steps"). Gated the same way priming is
-    # (not resuming): on a resumed run there's no meaningful "step 0" to
-    # re-evaluate, and the periodic in-loop calls below will still cover
-    # this run at its own eval_interval boundaries.
-    if not resuming and eval_env is not None:
-        episode_seeds = get_or_create_episode_seeds(checkpoint_dir_path, rl_eval_episodes, rl_eval_seed)
-        logging.info(f"[rigorous-eval] Running initialization (step 0) eval: "
-                     f"{rl_eval_episodes} deterministic episodes, fixed seeds...")
-        success_rate, stderr = run_rigorous_eval(agent, eval_env, episode_seeds, cfg)
-        wandb.log({
-            "eval_rigorous/success_rate": success_rate,
-            "eval_rigorous/success_rate_stderr": stderr,
-            "training/global_step": 0,
-        })
-        logging.info(f"[rigorous-eval] step 0: success_rate={success_rate:.3f} +/- {stderr:.3f}")
-
+    # ── Unified step-0 baseline pass (fresh runs only) ──────────────────────
+    # One set of success_rate_window fixed-seed episodes, run on the TRAINING
+    # env with only_base_actions=True (the true, clean frozen-SFT baseline --
+    # no trained residual/critic exists yet at step 0, so this is the only
+    # way to avoid biasing every later "did training improve over baseline"
+    # comparison with an arbitrary untrained-residual contribution). This one
+    # pass now serves three purposes at once, instead of two separate
+    # 200-episode passes as before: (1) seeds the replay buffer with real
+    # transitions via batch_processor.insert_transition, exactly as the old
+    # priming phase did: (2) fills training_log._success_window, giving
+    # eval/success_rate its own step-0 value; (3) gives eval_rigorous/
+    # success_rate its step-0 value too, computed from the SAME episode
+    # outcomes.
+    #
+    # Robust to eval_env being None (rl_eval_interval=0, rigorous eval
+    # disabled entirely): this whole pass, and eval/success_rate's own
+    # initialization, do NOT depend on eval_env or rl_eval_interval at
+    # all -- only whether eval_rigorous/* also gets computed and logged
+    # from the same data is conditional on that.
+    #
+    # Uses FIXED episode seeds (get_or_create_episode_seeds, the same
+    # mechanism run_rigorous_eval's periodic calls use) rather than the
+    # env's own natural reset randomness -- makes this step-0 pass
+    # reproducible across different fresh runs of the same task (e.g.
+    # comparing hyperparameter configs, all starting from the identical
+    # 200 conditions), and is what makes deriving eval_rigorous/success_rate
+    # from this same pass valid at all.
     if not resuming and success_rate_window > 0:
-        logging.info(f"[priming] Evaluating the starting model on {success_rate_window} real "
-                     f"episodes before any weight updates (separate from cfg.max_steps budget)...")
+        step0_seeds = get_or_create_episode_seeds(checkpoint_dir_path, success_rate_window, rl_eval_seed)
+        logging.info(f"[step-0] Evaluating the frozen SFT base policy (only_base_actions=True) "
+                     f"on {success_rate_window} fixed-seed episodes -- seeds the replay buffer, "
+                     f"initializes eval/success_rate's rolling window, and (if rl_eval_interval>0) "
+                     f"gives eval_rigorous/success_rate its own step-0 value, all from this one pass...")
         priming_step = 0
-        priming_pbar = tqdm.tqdm(total=success_rate_window, desc="priming", disable=not FLAGS.tqdm)
+        step0_episode_idx = 0
+        priming_pbar = tqdm.tqdm(total=success_rate_window, desc="step-0 eval", disable=not FLAGS.tqdm)
+        env.reset(seed=int(step0_seeds[step0_episode_idx]))
 
         while len(training_log._success_window) < success_rate_window:
             observation = env.get_observation()
 
             if not action_plan and action_type != "human":
-                action_chunk, agent, new_si = agent.sample_actions(observation)
+                # only_base_actions=True: see this block's own comment above
+                # for why -- the clean frozen-SFT baseline, not SFT plus an
+                # arbitrary untrained-residual perturbation.
+                action_chunk, agent, new_si = agent.sample_actions(observation, only_base_actions=True)
                 episode_log.sample_info_history.append(new_si)
                 action_plan.extend(action_chunk[:cfg.replan_steps])
             else:
@@ -1132,7 +1166,6 @@ def main(_):
 
             if done:
                 batch_processor.on_episode_done(success)
-                env.reset()
                 training_log.on_episode_done(episode_log, success, {})
                 training_log._success_window.append(float(success))
                 priming_pbar.update(1)
@@ -1143,15 +1176,38 @@ def main(_):
 
                 episode_log.reset()
                 batch_processor.on_episode_start()
-                observation = env.get_observation()
+                step0_episode_idx += 1
                 done = False
                 action_type = "policy"
                 action_plan.clear()
+                # Always reset (leaves env ready either for this pass's next
+                # fixed-seed episode, or for the main training loop right
+                # after this block, which expects a valid post-reset
+                # observation) -- seeded only while there's a next episode
+                # of THIS pass still to run.
+                if step0_episode_idx < success_rate_window:
+                    env.reset(seed=int(step0_seeds[step0_episode_idx]))
+                else:
+                    env.reset()
+                observation = env.get_observation()
 
         priming_pbar.close()
         wandb.log({"eval/init_progress": 1.0, "eval/init_step": priming_step})
-        logging.info(f"[priming] Done after {priming_step} raw steps -- {success_rate_window} episodes "
-                     f"evaluated, starting success_rate={np.mean(training_log._success_window):.3f}. Real "
+
+        step0_success_rate = float(np.mean(training_log._success_window))
+        step0_stderr = float(np.std(training_log._success_window, ddof=1) / np.sqrt(success_rate_window)) if success_rate_window > 1 else 0.0
+        wandb.log({"eval/success_rate": step0_success_rate, "training/global_step": 0})
+        if eval_env is not None:
+            wandb.log({
+                "eval_rigorous/success_rate": step0_success_rate,
+                "eval_rigorous/success_rate_stderr": step0_stderr,
+                "training/global_step": 0,
+            })
+            logging.info(f"[step-0] eval_rigorous/success_rate={step0_success_rate:.3f} +/- {step0_stderr:.3f} "
+                         f"(derived from this same pass -- no separate rigorous-eval-only rollout needed).")
+
+        logging.info(f"[step-0] Done after {priming_step} raw steps -- {success_rate_window} episodes "
+                     f"evaluated, starting success_rate={step0_success_rate:.3f}. Real "
                      f"training begins now, budget (cfg.max_steps={cfg.max_steps}) untouched by this phase. "
                      f"eval/success_rate and training/* now use training/global_step as their own x-axis, "
                      f"starting fresh at 0 -- checkpoint step "

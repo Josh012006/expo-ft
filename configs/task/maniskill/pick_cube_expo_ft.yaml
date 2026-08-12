@@ -74,7 +74,7 @@ replan_steps: 8            # number of actions to execute from each action chunk
 fsdp_devices: 1            # number of GPUs for FSDP sharding (1 = single GPU, no sharding)
 
 num_data_rl: 50
-rl_resume_dir: "logs/pick_cube/pick_cube_expo_ft_2026-08-10_22-07-55-10336737_rl"
+rl_resume_dir: null # "logs/pick_cube/pick_cube_expo_ft_2026-08-10_22-07-55-10336737_rl"
 
 model_cls: "EXPOLearner"  # selects both configs/model/*.py (via run_pipeline.py) and the FLAGS.config path used by train_pi_robo.py
 
