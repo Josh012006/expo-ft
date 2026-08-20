@@ -1159,14 +1159,23 @@ def main(_):
                      f"on {success_rate_window} fixed-seed episodes -- seeds the replay buffer, "
                      f"initializes eval/success_rate's rolling window, and (if rl_eval_interval>0) "
                      f"gives eval_rigorous/success_rate its own step-0 value, all from this one pass...")
-        # Resume the step number from the actual count of already-saved RAW
-        # TRANSITIONS (replay_buffer._size), not the episode count above --
-        # an episode can span many raw steps, so using the episode count
-        # here would understate how many step0-range files already exist on
-        # disk, and the next save below could then collide with (silently
-        # overwrite) an already-existing higher-numbered file from the
-        # interrupted attempt.
-        priming_step = STEP0_STEP_OFFSET + step0_transitions_restored
+        # Resume the RAW-TRANSITION count from wherever the restored buffer
+        # left off (0 on a genuinely fresh attempt) -- this is a small,
+        # human/wandb-readable number (at most a few thousand for a
+        # realistic success_rate_window), completely SEPARATE from
+        # step0_file_step below. Keeping these two counters distinct is the
+        # important part: priming_step is what gets logged to wandb
+        # (eval/init_step, and indirectly eval/init_progress's own x-axis,
+        # since it's that metric's declared step_metric) and must stay
+        # small; step0_file_step is only ever used for on-disk filenames and
+        # is the one that needs STEP0_STEP_OFFSET, to guarantee no collision
+        # with the main training loop's own step-numbered files. An earlier
+        # version of this fix used ONE variable for both purposes, which
+        # correctly fixed the file-naming collision risk but also
+        # accidentally sent eval/init_step (and eval/init_progress's x-axis)
+        # up into the billions -- this split is the actual fix.
+        priming_step = step0_transitions_restored
+        step0_file_step = STEP0_STEP_OFFSET + step0_transitions_restored
         step0_episode_idx = step0_already_done
         priming_pbar = tqdm.tqdm(total=success_rate_window, initial=step0_already_done, desc="step-0 eval", disable=not FLAGS.tqdm)
         env.reset(seed=int(step0_seeds[step0_episode_idx]))
@@ -1196,6 +1205,7 @@ def main(_):
             start_step_time = time.time()
             done, success, reward, mask = env.get_info_for_step()
             priming_step += 1
+            step0_file_step += 1
 
             episode_log.record_step(observation, len(action_plan), action_type, real_action, reward)
 
@@ -1219,7 +1229,7 @@ def main(_):
                 # covered the MAIN training loop's own saves.
                 if cfg.checkpoint_buffer:
                     try:
-                        save_replay_buffer_transition(checkpoint_dir_path, transition_dict, step=priming_step)
+                        save_replay_buffer_transition(checkpoint_dir_path, transition_dict, step=step0_file_step)
                     except Exception as e:
                         logging.error(f"[step-0] Could not save replay buffer transition: {e}")
             # No agent.update(...) call anywhere in this phase, by design.
