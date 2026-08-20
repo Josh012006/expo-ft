@@ -2,9 +2,10 @@
 
 Sample-efficient RL fine-tuning of π₀.₅ on ManiSkill simulation tasks, using
 the ExpoFT algorithm (frozen VLA + trainable residual policy + critic). Started
-as a port of the original real-robot ExpoFT algorithm to simulation; has since
-grown into a deeper investigation of why RL fine-tuning consistently fails to
-beat the SFT baseline (see Current status).
+as a port of the original real-robot ExpoFT algorithm to simulation; along the
+way turned into a deeper investigation of why RL fine-tuning was failing to
+beat the SFT baseline. PushCube now does (see Current status) — StackCube and
+PickCube are catching up.
 
 > This repo adapts the original real-DROID-robot ExpoFT codebase
 > ([pd-perry/expo-ft](https://github.com/pd-perry/expo-ft)) to run entirely in
@@ -105,104 +106,139 @@ Tasks currently in use: **StackCube-v1**, **PushCube-v1**, **PickCube-v1**
 (the goal-marker visibility patch — see Known Issues — is required for
 PickCube to be usable at all).
 
-## Current status (July 2026)
+## Current status (August 2026)
 
-SFT is fully validated on all three tasks (see Published checkpoints below).
-**RL fine-tuning still does not beat the SFT baseline on any task, with either
-critic architecture tried so far** — but a lot of
-what was an open question in the previous write-up (below, kept for context)
-has since been diagnosed, and two real, independent bugs have been found and
-fixed along the way without resolving the core symptom.
+**PushCube now beats its SFT baseline** — the first task on which RL
+fine-tuning has produced a policy that improves on the frozen starting point,
+using the original (MSE/REDQ) critic architecture, a corrected sparse reward
+signal, and a much higher update-to-data ratio than initially tested (see
+below). StackCube and PickCube do not yet match this, but the most likely
+reason has been identified (a stale, overly small residual-action budget left
+over from earlier testing — see below) and both are being re-run with it
+corrected.
+
+**The reward signal was wrong the whole time the previous write-up below was
+current.** A collaborator flagged implausible-looking critic value estimates,
+which led to finding that ManiSkill's `reward_mode` was never explicitly set
+at environment creation, silently defaulting to a continuous, shaped
+(`normalized_dense`) reward instead of the sparse, binary one this whole
+algorithm (and the original paper) assumes. Confirmed directly by replaying a
+real demonstration and checking that essentially none of its logged reward
+values were exactly zero, where a working sparse signal should be zero almost
+everywhere. A second, independent bug compounded this specifically for the
+categorical critic architecture: its reward normalization divided by a
+running estimate of the reward's own scale, which shrank as success became
+rarer during training, inflating the effective reward for the few remaining
+successes — a self-reinforcing loop, confirmed structurally absent from the
+original MSE/REDQ architecture. `reward_mode: "sparse"` is now set explicitly
+in every task YAML (with a code-level `getattr(cfg, "reward_mode", "sparse")`
+fallback so a future task config that forgets to set it can't silently
+reintroduce this), and `use_reward_normalization` lets the affected
+normalization be bypassed for the categorical architecture under sparse
+reward.
+
+**The maximization-bias mechanism described in the previous write-up is real
+but was not the whole story.** Under the corrected sparse reward, the
+diagnostic metric used to detect it (`misrank_rate`) measurably improved
+(from saturating at 0.92–1.00 under the old dense reward, to 0.72–0.87 under
+sparse) but did not fully disappear — consistent with the bias being a real,
+partial contributor rather than the sole explanation for the earlier
+degradation. Critically: **PushCube's successful run uses no special
+mitigation against this bias at all** — no decoupled candidate selection, no
+frozen critic encoder, no critic pretraining, standard Polyak target update —
+meaning the reward-mode fix and update-ratio tuning alone were sufficient to
+recover strong performance on this task, without any intervention on the
+critic or target-network mechanism itself.
+
+**StackCube and PickCube's lagging results traced to a stale config value,
+not (yet) a deeper problem.** Both tasks' YAMLs still had `rl_edit_scale:
+0.05` — a leftover from an earlier, superseded round of testing — never
+updated when the same field was corrected to `0.2` for PushCube. Given both
+tasks' SFT baselines are meaningfully weaker than PushCube's, a residual
+policy with only a 0.05 budget likely could not meaningfully correct the
+weaker base behavior. Both are being re-run with the corrected value.
+
+**Update-to-data ratio (`utd_ratio`) matters a lot, and pushing it higher
+surfaced a separate engineering problem.** Higher `utd_ratio` produced better
+results, but resuming a run from a checkpoint at `utd_ratio` above ~20
+reliably crashed with an out-of-memory error, while starting the same
+configuration fresh never did. This turned into a substantial debugging
+effort, described in full in the Changelog below — summary: a real upstream
+bug in JAX's handling of `jax.lax.scan` combined with automatic
+rematerialization (confirmed against a public bug report matching this
+project's exact pinned JAX version, `jax==0.5.3`, itself pinned by `openpi`
+and not something this project can freely change) was the original trigger;
+working around it by replacing the scan with a Python-level loop then
+introduced its own, separate memory-donation bug. Both are fixed. Checkpoint
+resuming is now expected to be reliable at high `utd_ratio`.
+
+**A rigorous, deterministic evaluation protocol is now built directly into
+training**, per a collaborator's suggestion that the existing in-training
+rolling-window proxy (`eval/success_rate`) is a useful but insufficient
+substitute for a proper held-out measurement. At fixed, regularly-spaced
+step intervals (`rl_eval_interval`), including once before any training at
+all, the policy is evaluated on `rl_eval_episodes` fixed-seed episodes with
+the residual policy's stochastic sampling replaced by its deterministic mode
+— logged separately as `eval_rigorous/success_rate` (+ standard error) so it
+is never confused with the rolling-window proxy. See RL hyperparameters
+below and Changelog for the full design (including a subtle early bug where
+the very first, "step 0" evaluation point wasn't actually measuring the
+clean frozen baseline it was supposed to).
+
+**GPU utilization stays well under full accelerator usage throughout
+training**, investigated but not resolved. The training loop is
+fundamentally sequential — the accelerator sits idle while each simulated
+environment step is computed on CPU. The most direct fix (running multiple
+environments in parallel) is architecturally unavailable: ManiSkill's
+`physx_cpu` backend hard-disallows `num_envs > 1` (this project's own fork
+confirms this isn't just undocumented — ManiSkill's own changelog lists a bug
+fix for a case where `physx_cpu` used to incorrectly *permit* `num_envs > 1`).
+Switching to `physx_cuda`, the backend that does support it, carries a
+documented risk (from ManiSkill's own docs) of subtly different simulated
+physics from what this project's demonstrations and SFT were generated
+under — judged too risky to introduce without re-validating the whole data
+pipeline. Separately confirmed that `pi0.5`'s own real-world DROID
+pretraining used a 15Hz control frequency, while ManiSkill's default (used
+unmodified by all three tasks here) is 20Hz — a real, confirmed mismatch,
+documented here as a known limitation rather than fixed, since correcting it
+would mean regenerating demonstrations and repeating SFT from scratch. Note
+this is unrelated to this project's own `control_hz` YAML field, which is
+purely a wall-clock pacing throttle in the training loop and has no effect on
+simulated physics or action semantics either way.
+
+<details>
+<summary>Previous write-up (superseded by the above, kept for history)</summary>
+
+RL fine-tuning still does not beat the SFT baseline on any task, with either
+critic architecture tried so far — but a lot of what was an open question in
+the write-up before *that* (further below) has since been diagnosed, and two
+real, independent bugs have been found and fixed along the way without
+resolving the core symptom.
 
 **Critic architecture**: replaced the original scalar-regression critic
 (REDQ-style ensemble, MSE loss against an unbounded TD target) with a
 categorical/distributional one (XQC, arXiv 2509.25174 / XQCfD, arXiv
 2605.10734 — fixed bounded support instead of a scalar, batch norm + weight
-norm on the critic MLP, no ensemble). See
-`expo_ft/networks/categorical_value.py` and `expo_ft/agents/alg/expo_ft_categorical.py`;
-the original architecture is preserved in `expo_ft.py` (moved back to being
-the default since — see below). Result:
-`target_q_max`/`target_q_min` now genuinely converge and stay bounded instead
-of climbing indefinitely (the original architecture's `critic_loss` also grew
-increasingly spiky over training; the new one stays smooth) — but
-`eval/success_rate` still collapses the same way regardless. This was an
-important negative result: it rules out critic-training instability itself as
-the primary driver of the collapse.
+norm on the critic MLP, no ensemble). Result: `target_q_max`/`target_q_min`
+now genuinely converge and stay bounded instead of climbing indefinitely, but
+`eval/success_rate` still collapses the same way regardless — ruling out
+critic-training instability itself as the primary driver.
 
-**Reward/done/mask timing bug (found and fixed)**: in `train_pi_robo.py`'s
-main loop, `env.get_info_for_step()` (reward/done/mask) was being called
-*before* `env.step()` instead of after — so every stored transition received
-the reward resulting from the *previous* action instead of the one actually
-being stored, a systematic one-step misattribution on every transition
-collected online. Also
-delayed episode-done detection by one step. Confirmed via a controlled
-synthetic reproduction (not just re-reading the code) that this is a real,
-structural mismatch between the accumulated n-step reward window and the
-observation transition it's supposed to explain — not a labeling artifact
-compensated for elsewhere. Scope: only the online RL loop; SFT, demo
-generation, and critic pretraining (all separate pipelines) were never
-affected. Fixed by reordering the fetch to happen after `env.step()`. A
-controlled before/after comparison (same hyperparameters otherwise) showed
-`target_q_max` stabilizing similarly to the categorical-critic result above,
-but again no change to `eval/success_rate`. Our tasks use ManiSkill's default
-dense (`normalized_dense`) reward, not sparse — the shaped component of the
-reward is only mildly perturbed by a one-step shift, but the discrete success
-bonus layered on top (`reward[success] += ...`) is exactly the kind of
-discontinuous value this bug would misattribute most.
+**Reward/done/mask timing bug (found and fixed)**: `env.get_info_for_step()`
+was being called before `env.step()` instead of after, so every stored
+transition received the reward from the *previous* action. Fixed by
+reordering. No change to `eval/success_rate` either.
 
-**Current leading hypothesis**: the argmax candidate-selection mechanism
-itself (`EXPOLearner.sample_batch_actions` — the same critic both picks its
-favorite among 16 base+edited candidates *and* evaluates that choice for the
-TD bootstrap target — classic maximization/self-reference bias, closely
-related to why Double Q-learning exists). Two independent, confirmed fixes
-(critic architecture, reward timing) each improved something real and
-measurable without touching `eval/success_rate`, which points at this
-mechanism by elimination rather than direct proof.
+**Leading hypothesis at the time**: the argmax candidate-selection mechanism
+itself (the same critic both picks its favorite candidate and evaluates that
+choice for the TD bootstrap target). Several literature-based mitigations
+(critic pretraining, KL regularization, decoupled selection) were tested
+against it — see the August 2026 Changelog below for how this played out once
+the reward-mode bug (above) was also found and fixed.
 
-**XQCfD mitigations being tested, in order**:
-1. Critic pretraining (BC/TD warm-start on demos before RL starts,
-   `rl_critic_pretrain_steps` in the ExpoFT task YAML) — tested, did not help
-   on its own.
-2. KL regularization against the SFT policy, replacing the generic entropy
-   bonus (`rl_kl_coef`/`rl_kl_ref_std`, computed in closed form in pre-tanh
-   Gaussian space — see `expo_ft.py`'s `update_residual_actor`). **Note:**
-   `rl_kl_coef` is additive alongside the existing entropy bonus in this
-   implementation, not a replacement like in the paper (there, one
-   coefficient serves both roles) — set `rl_entropy_scale: 0.0` for a faithful
-   isolated test. An initial confounded run (KL + entropy both active) showed
-   the most encouraging result of this whole investigation so far:
-   `eval/success_rate` consistently 5–10 points above an entropy-only
-   baseline for most of training. An isolated KL-only test is in progress to
-   confirm how much of that is attributable to KL specifically.
-3. Stationary/HetStat architecture (not yet implemented) — queued.
-
-**Also queued**: decoupled selection/evaluation for the argmax mechanism
-(Double-DQN style — use the *online* critic to select the best candidate,
-the *target* critic to evaluate that specific choice, rather than the target
-critic doing both) — no new critic needed, since ExpoFT already carries an
-online/target pair. Orthogonal to the KL/HetStat changes above (touches
-critic usage, not the residual policy's own loss), so it can be layered on
-top or tested in isolation at any point without reverting anything.
-
-<details>
-<summary>Previous write-up (superseded by the above, kept for history)</summary>
-
-RL fine-tuning currently degrades the SFT policy on every task and every
-hyperparameter configuration tried so far — success rate consistently
-collapses after an initial stable period, correlated in timing with growing
-instability in `training/critic_loss`. This holds even when starting from a
-strong SFT checkpoint (86% success) and even when reproducing the original
-paper's exact `utd_ratio=20` within the paper's own validated training length
-(~20k steps) — that specific test collapsed *faster* than our reduced
-`utd_ratio=2` configuration, showing `utd_ratio` itself (not total training
-duration) is the dominant driver of the instability observed here.
 </details>
 
-See Changelog for the RL-hyperparameter fixes made along the way, and the
-`configs/model/expo_ft_pi_config.py` vs. task-YAML hyperparameter comparison
-below. This remains an open, unresolved research question at the time of
-writing — not a known bug (though several real bugs were found and fixed
-while investigating it).
+
 
 ## Known issues / open items
 
@@ -220,6 +256,21 @@ while investigating it).
   (`expo_ft/env/patches.py`, since ManiSkill hides it from sensor cameras by
   default). Confirmed working and PickCube-v1 is back in the active task set
   (all RL-stage experiments now cover all three tasks).
+- **Control-frequency mismatch with π₀.₅-DROID's training distribution** —
+  confirmed, **not fixed**. `pi0.5`'s own real-world DROID pretraining used
+  15Hz; ManiSkill's default `control_freq` (used unmodified by all three
+  tasks) is 20Hz. Fixing this means regenerating demonstrations and repeating
+  SFT from scratch — deprioritized accordingly. Not to be confused with this
+  project's own `control_hz` YAML field, which is a wall-clock pacing
+  throttle in `train_pi_robo.py`'s loop only, never reaches ManiSkill at all,
+  and does not address this.
+- **GPU utilization stays low, and the most direct fix is unavailable** —
+  `physx_cpu` (required for this project's demo-conversion pipeline, and the
+  backend all demos/SFT were generated under) hard-disallows `num_envs > 1`
+  in ManiSkill, so true environment parallelism isn't possible without
+  switching to `physx_cuda`, which carries a documented risk of subtly
+  different simulated physics from what the demonstrations were generated
+  with. See the August 2026 Changelog for the full investigation.
 
 ## Camera & embodiment configuration (YAML fields)
 
@@ -255,21 +306,59 @@ rl_discount: 0.99                # discount factor gamma for Bellman backup
 rl_tau: 0.005                    # polyak averaging coefficient for critic target network
 rl_init_temperature: 1.0         # initial SAC entropy temperature
 rl_hidden_dims: [256, 256, 256]  # hidden layer sizes for the edit policy MLP
-rl_edit_scale: 0.2               # max magnitude of residual action (paper: 0.05–0.2 by task difficulty)
+rl_edit_scale: 0.2               # max magnitude of residual action (paper: 0.05–0.2 by task
+                                  # difficulty — double check this per-task in the YAML you're
+                                  # actually using; a stale 0.05 leftover on StackCube/PickCube
+                                  # went unnoticed for a while, see Current status)
 actor_success_only: true         # if true, actor batch is sampled only from successful transitions
-utd_ratio: 2                     # gradient updates per new transition collected (paper: 20 — see Current status)
-offline_ratio: 0.5               # fraction of batch from a separate offline demo buffer
-                                  # (paper actually uses 0 — demos inserted directly into the
-                                  # single online buffer; 0.5 is our own deviation, tested as a
-                                  # stability lever, not the paper's default)
+utd_ratio: 20                    # gradient updates per new transition collected — the update
+                                  # that unlocked PushCube's positive result (see Current status);
+                                  # higher was tested and helped further, bounded by GPU memory,
+                                  # not by an inherent instability at this value
+
+reward_mode: "sparse"            # explicit now for a reason — see Current status. Also has a
+                                  # code-level fallback (getattr(cfg, "reward_mode", "sparse")
+                                  # in maniskill_env.py) so omitting this field entirely still
+                                  # can't silently reintroduce the old bug.
+
+offline_ratio: 0.5               # fraction of EACH TRAINING BATCH drawn from the offline demo
+                                  # buffer during sampling. Means exactly this at every value,
+                                  # including 0.0 — does NOT by itself control whether demos are
+                                  # used at all (see rl_seed_demos_online below; this used to be
+                                  # conflated, see Changelog).
+rl_seed_demos_online: false      # if true, ALSO seed demos directly into the online replay
+                                  # buffer (matches the original paper's own single-buffer
+                                  # convention). With this false AND offline_ratio: 0.0, demos
+                                  # are not used anywhere — pure off-policy training on collected
+                                  # rollout samples only. PushCube's successful run used this
+                                  # exact combination.
+
+checkpoint_buffer: true          # save every collected transition to disk (buffers/) so a
+                                  # preempted run's online replay buffer (and eval/success_rate's
+                                  # rolling window) survive a resume instead of restarting empty
+                                  # — see Changelog. Real disk cost: roughly 300KB/transition,
+                                  # dominated by the two camera images; no automatic pruning, so
+                                  # a full 120K-step run leaves ~35GB in buffers/ that you'll want
+                                  # to clean up manually once a run is done being resumed.
+
+# Rigorous, held-out, deterministic evaluation — see Current status.
+rl_eval_interval: 20000          # 0 disables this feature entirely
+rl_eval_episodes: 200            # reduce toward 50 if this meaningfully slows down training
+rl_eval_seed: 42                 # master seed for the fixed episode list
 
 # Categorical critic (XQC/XQCfD-style, bounded support — see Current status)
 rl_num_atoms: 101                # number of fixed support bins
-rl_v_min: -10.0                  # lower bound of the fixed support (NORMALIZED reward units)
-rl_v_max: 20.0                   # upper bound of the fixed support (NORMALIZED reward units)
-rl_reward_scale_decay: 0.99      # EMA decay for the running reward-RMS estimate used to
-                                  # normalize rewards before the Bellman projection, so
-                                  # v_min/v_max stay meaningful without per-task hand-tuning
+rl_v_min: -10.0                  # lower bound of the fixed support (NORMALIZED reward units) —
+                                  # calibrated for the OLD dense reward; needs recalibrating for
+                                  # sparse reward's much narrower true range if you revisit the
+                                  # categorical architecture (see Current status)
+rl_v_max: 20.0                   # upper bound of the fixed support, same caveat as above
+rl_reward_scale_decay: 0.99      # EMA decay for the running reward-RMS estimate — this
+                                  # normalization is what caused the self-reinforcing loop under
+                                  # sparse reward, see Current status; bypass with
+                                  # use_reward_normalization: false
+use_reward_normalization: true   # set false for the categorical architecture under sparse
+                                  # reward — see Current status
 
 # Critic pretraining (XQCfD-style warm-start on demos before RL starts)
 rl_critic_pretrain_steps: 0      # 0 = disabled
@@ -382,6 +471,132 @@ dispatch and `run_pipeline.py`'s model-config lookup as `model_cls:
 absorbs the MSE/REDQ-specific fields it doesn't need) and
 per-task YAMLs, so the categorical architecture is directly A/B-testable against
 the categorical rewrite rather than just preserved as a rollback reference.
+
+## Changelog — memory, resuming, and evaluation (August 2026)
+
+**Checkpoint-resume OOM at high `utd_ratio`, root-caused across several
+layers.** Resuming at `utd_ratio` above ~20 reliably crashed with a
+`RESOURCE_EXHAUSTED` error; fresh runs at the same configuration never did.
+In order of discovery:
+1. The *original* crash (before any fix below) was a hard XLA compiler
+   crash (`Check failed: return_shape->IsTuple()`, not a normal OOM),
+   traced to a confirmed upstream JAX bug (`jax-ml/jax#27748`) where
+   automatic rematerialization becomes ineffective specifically on
+   `jax.remat`-wrapped `jax.lax.scan` — matching this project's exact
+   pinned JAX version (`0.5.3`, itself pinned by `openpi`'s own
+   `pyproject.toml`, not something this project can change). Fixed by
+   restructuring `EXPOLearner.update()`'s `utd_ratio`-many critic updates
+   from one `jax.lax.scan` into three separately-JIT'd functions
+   (`_prepare_minibatches_jit`/`_critic_update_step_jit`/
+   `_update_finalize_jit`) orchestrated by a plain Python loop —
+   mathematically identical (same sequential carry, same RNG consumption
+   order), just compiled differently.
+2. That fix introduced its own, separate memory bug: none of the three
+   split functions had `donate_argnames`, so each of the `utd_ratio`
+   sequential Python-loop calls allocated a fresh full copy of the agent
+   state instead of reusing memory in place — the exact buffer-reuse
+   `jax.lax.scan` provided for free via its loop-carried state. This, not
+   the original scan bug, turned out to be what made even *fresh* runs
+   start crashing at previously-working settings once `utd_ratio`/
+   candidate-count went high enough. Fixed by adding
+   `donate_argnames=("agent",)` to all three split functions.
+3. Donation then surfaced a subtler correctness bug: code that reused the
+   real, persistent `agent` object as input to a discarded/throwaway JIT
+   call (e.g. a compile-warmup pass) could have its buffers silently freed
+   by that donation, corrupting the real agent for the rest of training
+   (`RuntimeError: Array has been deleted`). Fixed by always passing an
+   explicit `.copy()` of every array leaf into any such throwaway call.
+4. Several smaller, independent contributors were also found and fixed:
+   checkpoint restore not passing explicit `restore_args` (falls back to a
+   slower, more memory-costly "read sharding from file" path); the
+   `use_success_batch` static-bool argument compiling a second, separately
+   resident program the first time a successful episode appeared post-resume
+   (fixed, then reverted after finding it was never actually the proximate
+   cause of any of the crashes above); async checkpoint saves not being
+   confirmed complete (`checkpoint_manager.wait_until_finished()`) before
+   training continued.
+
+**Online replay buffer was never actually surviving a resume, silently.**
+Even with all of the above fixed, `training/success_rate` was observed
+declining for a stretch after every resume. Root cause: `checkpoint_buffer`
+existed as a YAML field but its disk-saving call
+(`save_replay_buffer_transition`) was only ever wired into the main training
+loop — meaning every resume silently restarted the online buffer from
+empty regardless of the flag, forcing training to rebuild data diversity
+from scratch each time. Fixed by confirming `checkpoint_buffer: true`
+actually engages end-to-end, and by additionally reconstructing
+`eval/success_rate`'s own rolling window from the restored buffer's
+`dones`/`is_success` history on resume (previously reset to empty
+unconditionally too, meaning this metric silently reported nothing for up
+to ~20K steps after every resume even once the buffer itself was fixed).
+
+**The dedicated step-0 baseline pass (see next section) had the same
+resume gap, closed the same way.** It collects `success_rate_window`
+fixed-seed episodes before real training starts; a preemption mid-pass had
+no way to resume short of redoing the whole thing, even with
+`checkpoint_buffer=true`, since that flag's saving logic didn't cover this
+phase either. Fixed by saving this phase's own transitions too (offset
+step numbers — `10**9 + step`, chosen because `restore_replay_buffer`'s own
+file filter, `str.isdigit()`, is `False` for a leading `-`, so a
+negative-offset scheme would have been silently excluded on restore) and
+detecting/resuming from an interrupted previous attempt at this pass
+specifically, without needing a full agent checkpoint at all — this phase
+never updates the agent's own weights, so there is nothing to restore about
+the agent itself, only which of the fixed-seed episodes were already
+collected.
+
+**Rigorous, deterministic evaluation, integrated directly into training.**
+Per a collaborator's suggestion that `eval/success_rate` (a rolling window
+over stochastic *online* episodes) is a useful proxy but not a substitute
+for a proper held-out measurement: at fixed step intervals (including once
+before any training), the residual policy's stochastic sampling is replaced
+by its deterministic mode (`TanhTransformedDistribution.mode()`, i.e.
+`tanh(mean)` — the frozen base VLA's own flow-matching sampling stays
+stochastic either way, it has no equivalent closed-form mode) and evaluated
+on a fixed, cached set of episode seeds reused across every evaluation
+point. Logged as `eval_rigorous/success_rate` (+ standard error), on its own
+`eval_env` instance kept fully separate from the training environment.
+Found and fixed along the way: the very first ("step 0") evaluation point
+needs `only_base_actions=True` specifically — without it, "step 0" measures
+the frozen SFT VLA plus an arbitrary, untrained, randomly-initialized
+residual/critic contribution, not the clean baseline every later comparison
+is implicitly measured against. The same fix was needed for the
+pre-existing `eval/success_rate` initialization pass, which had the
+identical issue; the two were then consolidated into one shared pass
+(instead of two separate 200-episode rollouts) once both were measuring
+the same thing. `scripts/eval_curve.py`'s `main()` was separately found to
+be completely non-functional (parsed its CLI arguments but never called
+any of `discover_checkpoints`/`run_one_eval`/`rebuild_curve`) and was
+rebuilt, restoring `--rl-curve`/`--start-checkpoint`/`--deterministic`.
+
+**GPU utilization investigated, not resolved.** Stays well under full
+accelerator usage throughout training. Root cause: the training loop is
+fundamentally sequential (VLA inference on GPU, then one simulated
+environment step on CPU, repeated), with no overlap between the two. The
+most direct fix — running multiple environments in parallel — is
+architecturally unavailable under `physx_cpu` (ManiSkill's own changelog
+lists a bug fix for a case where this backend used to incorrectly *permit*
+`num_envs > 1`; it's a hard `num_envs=1` lock, not just an unsupported
+combination). `physx_cuda` does support it, but ManiSkill's own
+documentation warns that CPU and GPU-parallelized physics backends are not
+guaranteed to produce identical simulated results, particularly for
+precision-sensitive tasks — since this project's demonstrations and SFT
+were generated entirely on `physx_cpu`, switching the live training
+environment to `physx_cuda` risks a silent distribution mismatch between
+what SFT learned from and what RL would train against, on the same order of
+risk as the original DROID action-space mismatch this project already had
+to diagnose once. Judged not worth the risk without first re-validating the
+whole data pipeline under the new backend. Separately confirmed (via
+`openpi`'s own docs) that `pi0.5`'s real-world DROID pretraining used a
+15Hz control frequency, while ManiSkill's own default `control_freq`
+(unmodified by any of this project's three tasks) is 20Hz — a real,
+confirmed mismatch, documented here as a known limitation rather than
+fixed, since correcting it means regenerating demonstrations and repeating
+SFT. This project's own `control_hz` YAML field is unrelated to either of
+the above: it is a pure wall-clock pacing throttle inside
+`train_pi_robo.py`'s own loop, never passed to ManiSkill's `gym.make()` at
+all, so changing it is always safe but also does not address the
+`control_freq` mismatch just described.
 
 ## Changelog — key fixes made while adapting to ManiSkill (July 2026)
 
@@ -543,8 +758,11 @@ PyTorch conversion is provided) are published on HuggingFace:
 - [`josh11234/ExpoFT-Pi05-PushCube-v1-SFT-86p`](https://huggingface.co/josh11234/ExpoFT-Pi05-PushCube-v1-SFT-86p) (86% success on 200 held-out seeds)
 - [`josh11234/ExpoFT-Pi05-PickCube-v1-SFT`](https://huggingface.co/josh11234/ExpoFT-Pi05-PickCube-v1-SFT) (22% success on 200 held-out seeds)
 
-No RL checkpoints are published — RL has not yet produced a policy that
-improves on these SFT baselines (see Current status above).
+**No RL checkpoints are published here yet.** PushCube's RL run now beats its
+SFT baseline (see Current status above) — worth publishing once the
+StackCube/PickCube re-runs with the corrected `rl_edit_scale` are in and the
+full picture across all three tasks is settled, rather than publishing one
+result at a time.
 
 ## Original paper
 
