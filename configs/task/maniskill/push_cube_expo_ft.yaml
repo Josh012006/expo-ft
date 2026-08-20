@@ -75,7 +75,7 @@ replan_steps: 4            # number of actions to execute from each action chunk
 fsdp_devices: 1            # number of GPUs for FSDP sharding (1 = single GPU, no sharding)
 
 num_data_rl: 50
-rl_resume_dir: "logs/push_cube/push_cube_expo_ft_2026-08-03_19-17-41-10278580_rl"
+rl_resume_dir: "logs/push_cube/push_cube_expo_ft_2026-08-14_16-40-59-10375587_rl"
 
 model_cls: "EXPOLearner"  # selects both configs/model/*.py (via run_pipeline.py) and the FLAGS.config path used by train_pi_robo.py
 
@@ -83,7 +83,7 @@ model_cls: "EXPOLearner"  # selects both configs/model/*.py (via run_pipeline.py
 checkpoint_model: true
 checkpoint_interval: 1000  # save checkpoint every N steps (0 = only save at end)
 checkpoint_buffer: true   # save replay buffer transitions to disk at each step
-keep_period: 10000         # keep one checkpoint every N steps (older ones are deleted)
+keep_period: 20000         # keep one checkpoint every N steps (older ones are deleted)
 max_to_keep: 1
 
 # ── eval/success_rate ───────────────────────────────────────────────

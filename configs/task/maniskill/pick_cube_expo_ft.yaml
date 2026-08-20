@@ -66,7 +66,7 @@ max_episodes: 1000
 max_steps_per_episode: 120
 batch_size: 24             # number of transitions sampled from replay buffer per gradient update
 utd_ratio: 20              # gradient updates performed per new transition collected
-offline_ratio: 0.5         # fraction of each training batch drawn from the offline demo buffer during sampling. Means exactly this at every value, including 0.0 -- does NOT by itself control whether demos are used at all (see rl_seed_demos_online below).
+offline_ratio: 0.0         # fraction of each training batch drawn from the offline demo buffer during sampling. Means exactly this at every value, including 0.0 -- does NOT by itself control whether demos are used at all (see rl_seed_demos_online below).
 rl_seed_demos_online: false  # if true, ALSO seed demos directly into the online replay buffer (matches the EXPO paper's own single-buffer convention, independent of offline_ratio's value). With this false AND offline_ratio: 0.0, demos are not inserted anywhere -- pure off-policy training on collected rollout samples only.
 update_type: "episode"     # when to trigger updates: "episode", "step", or "batch"
 num_updates: 1             # number of gradient updates per trigger
@@ -75,7 +75,7 @@ replan_steps: 8            # number of actions to execute from each action chunk
 fsdp_devices: 1            # number of GPUs for FSDP sharding (1 = single GPU, no sharding)
 
 num_data_rl: 50
-rl_resume_dir: null # "logs/pick_cube/pick_cube_expo_ft_2026-08-10_22-07-55-10336737_rl"
+rl_resume_dir: null # "logs/pick_cube/pick_cube_expo_ft_2026-08-12_03-15-15-10345301_rl"
 
 model_cls: "EXPOLearner"  # selects both configs/model/*.py (via run_pipeline.py) and the FLAGS.config path used by train_pi_robo.py
 
@@ -127,7 +127,7 @@ rl_fixed_temperature: null      # if set (e.g. 0.1), bypasses the learned SAC
                                   # temperature entirely — a diagnostic Jesse suggested
                                   # to test whether the unconverged/climbing alpha itself
                                   # contributes to instability (see July 2026 notes)
-rl_edit_scale: 0.2              # max magnitude of residual action added by edit policy
+rl_edit_scale: 1.0              # max magnitude of residual action added by edit policy
 rl_N: 8                          # number of base-VLA (no-edit) candidates compared per argmax step
 rl_n_edit_samples: 8              # number of edited (residual-corrected) candidates compared per argmax step
 rl_use_double_q_selection: false # decouple candidate selection (online critic ensemble) from evaluation (target critic ensemble, unchanged) -- addresses the argmax self-referential overestimation mechanism, adapted for REDQ ensemble-subsampling. Same mechanism as EXPOLearner, off by default here too (matches pre-existing behavior). Set true to test its separate contribution on this architecture.
