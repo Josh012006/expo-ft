@@ -1113,13 +1113,62 @@ def main(_):
     # from this same pass valid at all.
     if not resuming and success_rate_window > 0:
         step0_seeds = get_or_create_episode_seeds(checkpoint_dir_path, success_rate_window, rl_eval_seed)
+
+        # Large fixed offset for this pass's own saved-transition step
+        # numbers: guaranteed far beyond any realistic cfg.max_steps (real
+        # training steps top out in the 1e5-1e6 range for these tasks), so
+        # step-0 saves can never collide with real training-step saves in
+        # the same buffers/ directory. Must stay non-negative: restore_replay_buffer
+        # filters filenames with str.isdigit(), which is False for a
+        # leading "-", so a negative offset would be silently excluded on
+        # restore -- this bit us once already while designing this.
+        STEP0_STEP_OFFSET = 10**9
+
+        # Detect a step-0 pass that was interrupted by preemption: no agent
+        # checkpoint exists yet (real training never started, hence
+        # `resuming=False` above), but if checkpoint_buffer=true, some of
+        # THIS pass's own transitions may already be saved to disk from a
+        # previous attempt. Restore them and skip the seeds already
+        # covered, instead of redoing the whole pass from scratch -- this
+        # phase never updates the agent's own weights ("No agent.update(...)
+        # call anywhere in this phase, by design", below), so there is
+        # nothing to restore about the agent itself: the SFT checkpoint
+        # freshly loaded via pi05_weight_loader_path already IS the correct,
+        # unchanged starting point either way. Only the already-collected
+        # transitions and episode outcomes are worth recovering.
+        step0_already_done = 0
+        step0_transitions_restored = 0
+        if cfg.checkpoint_buffer:
+            try:
+                batch_processor.restore(checkpoint_dir_path)
+                step0_transitions_restored = batch_processor.replay_buffer._size
+                _restored_step0_window = reconstruct_success_window(batch_processor.replay_buffer, success_rate_window)
+                if _restored_step0_window:
+                    training_log._success_window = _restored_step0_window
+                    step0_already_done = len(_restored_step0_window)
+                    logging.info(f"[step-0] Found {step0_already_done} already-completed episode(s) "
+                                 f"({step0_transitions_restored} raw transitions) saved from an interrupted "
+                                 f"previous attempt at this same pass -- resuming from episode "
+                                 f"{step0_already_done + 1}/{success_rate_window} instead of restarting "
+                                 f"from scratch.")
+            except Exception as e:
+                logging.warning(f"[step-0] Could not check for an interrupted previous attempt "
+                                 f"({e}) -- starting this pass from episode 1 as normal.")
+
         logging.info(f"[step-0] Evaluating the frozen SFT base policy (only_base_actions=True) "
                      f"on {success_rate_window} fixed-seed episodes -- seeds the replay buffer, "
                      f"initializes eval/success_rate's rolling window, and (if rl_eval_interval>0) "
                      f"gives eval_rigorous/success_rate its own step-0 value, all from this one pass...")
-        priming_step = 0
-        step0_episode_idx = 0
-        priming_pbar = tqdm.tqdm(total=success_rate_window, desc="step-0 eval", disable=not FLAGS.tqdm)
+        # Resume the step number from the actual count of already-saved RAW
+        # TRANSITIONS (replay_buffer._size), not the episode count above --
+        # an episode can span many raw steps, so using the episode count
+        # here would understate how many step0-range files already exist on
+        # disk, and the next save below could then collide with (silently
+        # overwrite) an already-existing higher-numbered file from the
+        # interrupted attempt.
+        priming_step = STEP0_STEP_OFFSET + step0_transitions_restored
+        step0_episode_idx = step0_already_done
+        priming_pbar = tqdm.tqdm(total=success_rate_window, initial=step0_already_done, desc="step-0 eval", disable=not FLAGS.tqdm)
         env.reset(seed=int(step0_seeds[step0_episode_idx]))
 
         while len(training_log._success_window) < success_rate_window:
@@ -1162,6 +1211,17 @@ def main(_):
                 if _last_si and "base_action" in _last_si:
                     transition_dict["base_actions"] = _last_si["base_action"]
                 batch_processor.insert_transition(transition_dict)
+                # Persist this pass's own transitions to disk too (offset
+                # step numbers, see STEP0_STEP_OFFSET above) -- without
+                # this, a preemption mid-pass had no way to resume short of
+                # redoing the whole 200 episodes, even with
+                # checkpoint_buffer=true, since that flag previously only
+                # covered the MAIN training loop's own saves.
+                if cfg.checkpoint_buffer:
+                    try:
+                        save_replay_buffer_transition(checkpoint_dir_path, transition_dict, step=priming_step)
+                    except Exception as e:
+                        logging.error(f"[step-0] Could not save replay buffer transition: {e}")
             # No agent.update(...) call anywhere in this phase, by design.
 
             if done:
