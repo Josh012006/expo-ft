@@ -94,6 +94,9 @@ rl_lr: 3.0e-4                     # learning rate for critic and edit policy
 rl_discount: 0.99               # discount factor gamma for Bellman backup
 rl_tau: 0.005                   # polyak averaging coefficient for target network soft update
 rl_init_temperature: 1.0        # initial entropy temperature (controls exploration vs exploitation)
+rl_temp_lr: 3.0e-4              # learning rate for the temperature/alpha optimizer, decoupled from rl_lr
+                                  # (previously orphaned -- silently stuck at 3e-4 regardless of rl_lr;
+                                  # kept at the same 3e-4 default here, now independently tunable)
 rl_adjust_target_entropy: true   # if true, target entropy accounts for edit_scale's log-Jacobian
                                   # correction (target = -action_dim/2 + action_dim*log(edit_scale));
                                   # if false, this correction is omitted, which can badly miscalibrate

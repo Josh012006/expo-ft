@@ -208,6 +208,13 @@ def main(_):
         # --- unchanged from before this refactor: byte-for-byte identical ---
         FLAGS.config.actor_lr         = float(getattr(cfg, "rl_lr", FLAGS.config.actor_lr))
         FLAGS.config.critic_lr        = float(getattr(cfg, "rl_lr", FLAGS.config.critic_lr))
+        # NOTE: previously orphaned -- temp_lr silently stayed at whatever
+        # FLAGS.config.temp_lr (3e-4, from sac_config.py) already was,
+        # decoupled from rl_lr above and with no YAML field to override it
+        # independently. Wired here the same way as the other rl_* fields;
+        # default is unchanged (falls back to FLAGS.config.temp_lr) for any
+        # YAML that doesn't set rl_temp_lr yet.
+        FLAGS.config.temp_lr          = float(getattr(cfg, "rl_temp_lr", FLAGS.config.temp_lr))
         FLAGS.config.discount         = float(getattr(cfg, "rl_discount", FLAGS.config.discount))
         FLAGS.config.tau              = float(getattr(cfg, "rl_tau", FLAGS.config.tau))
         FLAGS.config.init_temperature = float(getattr(cfg, "rl_init_temperature", FLAGS.config.init_temperature))

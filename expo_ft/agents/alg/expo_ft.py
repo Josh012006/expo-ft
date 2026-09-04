@@ -799,6 +799,19 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             dist = self.residual_actor.apply_fn({"params": actor_params}, observations, actions=batch["actions"], training=True, p=batch['states'], rngs={"dropout": dropout_key},)
             actions = dist.sample(seed=key)
 
+            # Pre-tanh Gaussian stats (diagnostic, ported from
+            # expo_ft_categorical.py) -- lets us see directly whether the
+            # residual policy is staying spread out (high std) or
+            # concentrating on the actions the critic favors, independent
+            # of what training/entropy or training/temperature show. Two
+            # separate quantities: this is the pre-tanh/pre-edit_scale
+            # Gaussian's own std, distinct from mean_residual_scaled_norm
+            # (logged elsewhere), which is POST-tanh and POST-edit_scale
+            # and saturates, so it doesn't show the same thing.
+            base_dist = dist.distribution
+            residual_mean = base_dist.mean()
+            residual_std = base_dist.stddev()
+
             log_probs = dist.log_prob(actions)
             residual_scaled = self._apply_residual_xyzg_mask(actions * self.edit_scale)
             # Subtract log of action scale for each action dimension
@@ -831,6 +844,8 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
                 "residual_actor_loss": residual_actor_loss,
                 "entropy": -log_probs.mean(),
                 "temperature": jnp.asarray(temperature),
+                "residual_mean_norm": jnp.linalg.norm(residual_mean, axis=-1).mean(),
+                "residual_std_mean": residual_std.mean(),
             }
 
         grads, actor_info = jax.grad(residual_actor_loss_fn, has_aux=True)(self.residual_actor.params)
