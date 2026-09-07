@@ -71,7 +71,7 @@ rl_seed_demos_online: false  # if true, ALSO seed demos directly into the online
 update_type: "episode"     # when to trigger updates: "episode", "step", or "batch"
 num_updates: 1             # number of gradient updates per trigger
 num_batch: 1               # number of episodes to accumulate before updating (only used when update_type="batch")
-replan_steps: 8            # number of actions to execute from each action chunk before replanning (action_horizon=16)
+replan_steps: 4            # number of actions to execute from each action chunk before replanning (action_horizon=16)
 fsdp_devices: 1            # number of GPUs for FSDP sharding (1 = single GPU, no sharding)
 
 num_data_rl: 50
