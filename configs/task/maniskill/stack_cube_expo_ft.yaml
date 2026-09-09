@@ -64,7 +64,7 @@ sft_use_lora: true         # use LoRA fine-tuning (faster, less memory than full
 seed: 42
 max_episodes: 1000
 max_steps_per_episode: 120
-batch_size: 32             # number of transitions sampled from replay buffer per gradient update
+batch_size: 24             # number of transitions sampled from replay buffer per gradient update
 utd_ratio: 20              # gradient updates performed per new transition collected
 offline_ratio: 0.0         # fraction of each training batch drawn from the offline demo buffer during sampling. Means exactly this at every value, including 0.0 -- does NOT by itself control whether demos are used at all (see rl_seed_demos_online below).
 rl_seed_demos_online: false  # if true, ALSO seed demos directly into the online replay buffer (matches the EXPO paper's own single-buffer convention, independent of offline_ratio's value). With this false AND offline_ratio: 0.0, demos are not inserted anywhere -- pure off-policy training on collected rollout samples only.
