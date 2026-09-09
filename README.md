@@ -119,7 +119,7 @@ pattern specific to that task. With this fix, **`edit_scale=0.2` on StackCube
 reaches 0.755 success rate (deterministic, 200-episode `eval_rigorous`) after
 2500 training episodes.**
 
-A collaborator's hypothesis that a slow-reacting SAC entropy temperature was
+An hypothesis that a slow-reacting SAC entropy temperature was
 the underlying cause was tested directly and mostly ruled out — but doing so
 surfaced a real structural finding: the residual policy's exploration width
 sits at a fixed point that maximizes the entropy of a Gaussian squashed
