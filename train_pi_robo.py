@@ -1081,6 +1081,13 @@ def main(_):
     # episodes) so the two are never confused on the same dashboard.
     wandb.define_metric("eval_rigorous/success_rate", step_metric="training/global_step")
     wandb.define_metric("eval_rigorous/success_rate_stderr", step_metric="training/global_step")
+    # Same protocol, but with n_edit_samples=0: the trained critic still
+    # picks (argmax) among the N raw/un-edited VLA candidate samples, but the
+    # residual actor is never invoked. Isolates how much of eval_rigorous's
+    # improvement over the frozen-SFT baseline comes from the critic's
+    # candidate selection alone, vs. the residual correction on top of it.
+    wandb.define_metric("eval_rigorous_critic_only/success_rate", step_metric="training/global_step")
+    wandb.define_metric("eval_rigorous_critic_only/success_rate_stderr", step_metric="training/global_step")
 
     success_rate_window = getattr(cfg, "success_rate_window", 200)
     training_log._success_window = _restored_success_window
@@ -1454,6 +1461,27 @@ def main(_):
                 logging.info(f"[rigorous-eval] step {i}: success_rate={success_rate:.3f} +/- {stderr:.3f}")
             except Exception as e:
                 logging.error(f"[rigorous-eval] Failed at step {i}: {e}")
+
+            # Critic-only variant: agent.replace() is a cheap struct copy (n_edit_samples
+            # is a static, non-pytree field) -- the real `agent` below is completely
+            # unaffected, same as run_rigorous_eval's own non-mutation guarantee above.
+            # Same episode_seeds as the call above, for a like-for-like comparison.
+            try:
+                critic_only_agent = agent.replace(n_edit_samples=0)
+                critic_only_success_rate, critic_only_stderr = run_rigorous_eval(
+                    critic_only_agent, eval_env, episode_seeds, cfg
+                )
+                wandb.log({
+                    "eval_rigorous_critic_only/success_rate": critic_only_success_rate,
+                    "eval_rigorous_critic_only/success_rate_stderr": critic_only_stderr,
+                    "training/global_step": i,
+                })
+                logging.info(
+                    f"[rigorous-eval-critic-only] step {i}: "
+                    f"success_rate={critic_only_success_rate:.3f} +/- {critic_only_stderr:.3f}"
+                )
+            except Exception as e:
+                logging.error(f"[rigorous-eval-critic-only] Failed at step {i}: {e}")
 
         if cfg.checkpoint_buffer and (has_action or action_type == "human"):
             try:

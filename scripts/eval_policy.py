@@ -26,7 +26,7 @@ from expo_ft.env.env_factory import make_env_wrapper
 
 def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_action_stats=False,
              episode_seeds=None, output_json=None, diagnose_subconditions=False, rl_checkpoint_path=None,
-             deterministic=False):
+             deterministic=False, critic_only=False):
     """
     deterministic: when True, the residual actor uses its mode (tanh of the
     Gaussian mean) instead of a stochastic sample -- see expo_ft.py's
@@ -48,6 +48,14 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
     and tracks, per episode, whether each boolean sub-condition of a composite
     success criterion (e.g. PickCube-v1's is_obj_placed / is_robot_static) was ever
     True, and whether they were ever True AT THE SAME STEP. Printed as a summary at
+
+    critic_only: n_edit_samples=0 -- the trained critic still picks (argmax)
+    among the N raw/un-edited VLA candidate samples, but the residual actor
+    is never invoked. agent.replace() is a cheap struct copy (n_edit_samples
+    is a static, non-pytree field), applied right after the RL checkpoint is
+    restored -- doesn't touch the actual restored weights. Only meaningful
+    with rl_checkpoint_path set (no trained critic otherwise); ignored for
+    checkpoint_path/baseline.
 
     rl_checkpoint_path: path to an RL/EXPOLearner checkpoint STEP directory
     (e.g. ".../checkpoints/40000"), as opposed to `checkpoint_path` which is
@@ -229,6 +237,10 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
         agent = agent.cache_infer_params()
         only_base_actions = False  # let the trained residual policy + critic actually run
         print("RL checkpoint restored — evaluating full agent (VLA + residual policy + critic).")
+        if critic_only:
+            agent = agent.replace(n_edit_samples=0)
+            print("--critic-only: n_edit_samples=0 — critic selects among raw VLA "
+                  "samples only, residual actor is never invoked.")
 
     # Config-driven keys
     state_obs_key  = cfg.state_obs_key
@@ -409,6 +421,15 @@ if __name__ == "__main__":
              "either way (flow-matching models have no equivalent deterministic mode). "
              "Matches train_pi_robo.py's periodic in-training rigorous eval protocol.",
     )
+    parser.add_argument(
+        "--critic-only", action="store_true",
+        help="Evaluate with n_edit_samples=0: the trained critic still picks among "
+             "the N raw (un-edited) VLA candidate samples via argmax, but the "
+             "residual actor is never invoked. Isolates how much of the improvement "
+             "over the frozen SFT baseline comes from the critic's candidate "
+             "selection alone, vs. the residual correction on top of it. Only "
+             "meaningful with --rl-checkpoint; no-op otherwise.",
+    )
     args = parser.parse_args()
 
     cfg = load_task_config(args.config)
@@ -447,4 +468,5 @@ if __name__ == "__main__":
         diagnose_subconditions=args.diagnose_subconditions,
         rl_checkpoint_path=args.rl_checkpoint,
         deterministic=args.deterministic,
+        critic_only=args.critic_only,
     )
