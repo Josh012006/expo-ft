@@ -1086,8 +1086,8 @@ def main(_):
     # residual actor is never invoked. Isolates how much of eval_rigorous's
     # improvement over the frozen-SFT baseline comes from the critic's
     # candidate selection alone, vs. the residual correction on top of it.
-    wandb.define_metric("eval_rigorous_critic_only/success_rate", step_metric="training/global_step")
-    wandb.define_metric("eval_rigorous_critic_only/success_rate_stderr", step_metric="training/global_step")
+    wandb.define_metric("eval_rigorous/success_rate_critic_only", step_metric="training/global_step")
+    wandb.define_metric("eval_rigorous/success_rate_critic_only_stderr", step_metric="training/global_step")
 
     success_rate_window = getattr(cfg, "success_rate_window", 200)
     training_log._success_window = _restored_success_window
@@ -1472,8 +1472,8 @@ def main(_):
                     critic_only_agent, eval_env, episode_seeds, cfg
                 )
                 wandb.log({
-                    "eval_rigorous_critic_only/success_rate": critic_only_success_rate,
-                    "eval_rigorous_critic_only/success_rate_stderr": critic_only_stderr,
+                    "eval_rigorous/success_rate_critic_only": critic_only_success_rate,
+                    "eval_rigorous/success_rate_critic_only_stderr": critic_only_stderr,
                     "training/global_step": i,
                 })
                 logging.info(
