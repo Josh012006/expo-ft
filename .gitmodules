@@ -5,3 +5,7 @@
 	path = expo_ft/agents/vla/openpi
 	url = https://github.com/Josh012006/openpi.git
 	branch = expo_ft
+[submodule "expo_ft/third_party/IsaacLab"]
+	path = expo_ft/third_party/IsaacLab
+	url = https://github.com/Josh012006/IsaacLab.git
+	branch = expo_ft

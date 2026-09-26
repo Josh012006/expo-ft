@@ -19,3 +19,4 @@ logs
 third_party/robocasa
 third_party/robosuite
 weights-backup/
+.venv-isaaclab/
