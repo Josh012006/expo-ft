@@ -2,7 +2,7 @@
 
 import logging
 import time
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple, Any, Optional
 
 import numpy as np
 import websockets.sync.client
@@ -126,9 +126,18 @@ class EnvClient:
         response = self._call_operation("create_env", prepared_request)
         return response["env_id"], response["task_description"]
     
-    def reset(self, env_id: str) -> Tuple[Dict[str, Any], bool]:
-        """Reset a environment."""
-        response = self._call_operation("reset", {"env_id": env_id})
+    def reset(self, env_id: str, seed: Optional[int] = None) -> Tuple[Dict[str, Any], bool]:
+        """Reset a environment.
+
+        `seed` is optional and additive to the original protocol: omitted
+        (None), the request carries no seed field and a server that predates
+        this parameter behaves exactly as before. Added for Isaac Lab/FORGE's
+        fixed-seed evaluation — see expo_ft/env/isaaclab/forge_server.py.
+        """
+        request = {"env_id": env_id}
+        if seed is not None:
+            request["seed"] = seed
+        response = self._call_operation("reset", request)
         observation = response["observation"]
         return observation, response["done"]
     
@@ -184,9 +193,13 @@ class EnvClientWrapper:
                     logging.warning(f"{op_name} recovery failed ({e}); retrying recovery...")
                     time.sleep(10)
     
-    def reset(self):
-        """Reset the environment and return observation."""
-        observation, _ = self._call("reset", lambda: self.client.reset(self.env_id))
+    def reset(self, seed: Optional[int] = None):
+        """Reset the environment and return observation.
+
+        `seed` is forwarded to the server when given (see EnvClient.reset);
+        omitted, behavior is unchanged from before this parameter existed.
+        """
+        observation, _ = self._call("reset", lambda: self.client.reset(self.env_id, seed=seed))
         return observation
     
     def step(self, action):
@@ -207,5 +220,3 @@ class EnvClientWrapper:
     def get_info_for_step(self):
         """Evaluate termination after a step: (done, success, reward, continuation_mask)."""
         return self._call("get_info_for_step", lambda: self.client.get_info_for_step(self.env_id))
-    
-    
