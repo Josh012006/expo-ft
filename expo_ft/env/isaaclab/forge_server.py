@@ -2,7 +2,17 @@
 
 Run inside .venv-isaaclab ONLY (needs isaacsim/isaaclab installed):
 
+    export CUBLAS_WORKSPACE_CONFIG=:4096:8
     python -m expo_ft.env.isaaclab.forge_server --config configs/task/isaaclab/peg_insert_forge_pi05.yaml
+
+The CUBLAS_WORKSPACE_CONFIG export is required, not optional, and must be set
+BEFORE this process starts — CUDA initializes as soon as Isaac Sim/AppLauncher
+comes up, and PyTorch's own deterministic-algorithms setting (forced by
+ForgeBackend.reset() for reproducible reset(seed=...) results, see below) has
+no effect on CuBLAS ops without it: reset() raises a RuntimeError instead.
+Confirmed in testing: with this set, reset(seed=N) now reproduces the exact
+same joint_position bit-for-bit across separate server runs; without it,
+observed drift up to ~0.03 rad on panda_joint1 between runs with the same seed.
 
 This process owns the physical world (the simulation) and is the SERVER in
 this project's client-server convention — the same role the real DROID
@@ -147,12 +157,23 @@ class ForgeBackend:
         return {"error": f"unknown debug kind: {kind}"}
 
     def reset(self, env_id: str, seed):
-        # Gymnasium/Isaac Lab standard reset(seed=...) contract. Confirm on
-        # the first live run that this actually re-seeds FORGE's fixed-asset
-        # randomization (not yet verified end-to-end) — if not, fall back to
-        # torch.manual_seed(seed) before calling reset().
+        # env.reset(seed=...) internally calls configure_seed(seed) with
+        # torch_deterministic left at its default False (isaaclab/utils/seed.py),
+        # which explicitly sets cudnn.benchmark=True / cudnn.deterministic=False
+        # — non-deterministic GPU kernels are allowed even with a fixed seed.
+        # The random *draws* are reproducible; the physics computation itself
+        # (in particular the 0.25s grasp-settling loop inside _reset_idx,
+        # which involves GPU contact resolution) isn't guaranteed to be, and
+        # testing confirmed joint_position after reset(seed=1) drifting by
+        # ~0.01-0.03 rad on panda_joint1 across repeated calls with the same
+        # seed. Calling configure_seed ourselves with torch_deterministic=True
+        # BEFORE env.reset() (and not passing seed to env.reset() itself, to
+        # avoid a second, non-deterministic reseed overwriting this one) is
+        # the fix being tested for that.
         if seed is not None:
-            self.env.reset(seed=int(seed))
+            from isaaclab.utils.seed import configure_seed
+            configure_seed(int(seed), torch_deterministic=True)
+            self.env.reset()
         else:
             self.env.reset()
         self.env.step(self._zero_action)  # let camera/observation buffers populate
