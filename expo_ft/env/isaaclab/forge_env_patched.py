@@ -111,6 +111,15 @@ class ForgeEnvJointPosPi05(ForgeEnv):
         delta_arm = self.actions[:, 0:7]
         gripper_cmd = self.actions[:, 7]  # assumed DROID convention: 0=open, 1=closed
 
+        # FORGE's own _apply_action (which we fully replace) sets these two —
+        # they feed only its dense reward's action penalty (_get_rewards,
+        # pos_error = norm(self.delta_pos)), which we don't use (sparse,
+        # ground-truth success instead). Isaac Lab's step() calls
+        # _get_rewards() unconditionally regardless, so these must exist to
+        # avoid an AttributeError even though their value is never read by us.
+        self.delta_pos = torch.zeros_like(self.fingertip_midpoint_pos)
+        self.delta_yaw = torch.zeros(self.num_envs, device=self.device)
+
         target = self.ctrl_target_joint_pos.clone()
         target[:, 0:7] = self.joint_pos[:, 0:7] + delta_arm
         finger_width = (1.0 - gripper_cmd).clamp(0.0, 1.0) * GRIPPER_OPEN_WIDTH

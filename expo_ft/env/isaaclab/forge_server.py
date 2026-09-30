@@ -19,6 +19,9 @@ a formality here (there is only ever one instance to hand out), not a
 task switch.
 """
 import argparse
+import logging
+import os
+import signal
 import sys
 
 import yaml
@@ -35,6 +38,33 @@ with open(args.config) as f:
 args.headless = True
 args.enable_cameras = True
 app = AppLauncher(args).app
+
+# AppLauncher installs its own SIGINT handler that attempts a Kit-internal
+# shutdown sequence and, observed in testing, never actually returns —
+# Ctrl+C did nothing and the GPU stayed allocated. Defining the handler here
+# (needs `app` in scope) but NOT registering it yet — see main(), where it's
+# installed as the LAST thing before serve_forever(). Registering it here
+# instead didn't survive: Kit/Isaac Sim scene construction (ForgeEnvJointPosPi05
+# below) apparently re-installs its own handler sometime after AppLauncher
+# but before the env is fully built, silently overwriting ours again.
+_backend_holder = {"backend": None}
+
+
+def _handle_shutdown_signal(signum, frame):
+    # print(..., flush=True) as well as logging: if Kit has redirected/buffered
+    # Python's logging output, this is a second, harder-to-swallow channel to
+    # confirm the handler actually fired at all versus hanging in cleanup.
+    print(f"[forge_server] received {signal.Signals(signum).name} — shutting down.", flush=True)
+    logging.info("Received signal %s — shutting down.", signal.Signals(signum).name)
+    backend = _backend_holder["backend"]
+    try:
+        if backend is not None:
+            backend.env.close()
+        app.close()
+    except Exception:
+        logging.exception("Error during shutdown cleanup (continuing to exit anyway):")
+    os._exit(0)
+
 
 # Everything Isaac-Sim-dependent is imported only after AppLauncher exists.
 import torch  # noqa: E402
@@ -92,6 +122,19 @@ class ForgeBackend:
     def create_env(self, request: dict):
         return self._env_id, self.prompt
 
+    def get_joint_names(self):
+        """Diagnostic only, not part of the Backend protocol proper — lets the
+        smoke test verify the [0:7]=arm, [7:9]=fingers indexing assumption
+        against this USD's actual DOF order instead of trusting it blind."""
+        return list(self.env._robot.data.joint_names)
+
+    def debug(self, request: dict):
+        """Dispatched by ws_env_server's optional "debug" operation."""
+        kind = request.get("kind")
+        if kind == "joint_names":
+            return self.get_joint_names()
+        return {"error": f"unknown debug kind: {kind}"}
+
     def reset(self, env_id: str, seed):
         # Gymnasium/Isaac Lab standard reset(seed=...) contract. Confirm on
         # the first live run that this actually re-seeds FORGE's fixed-asset
@@ -107,18 +150,23 @@ class ForgeBackend:
         return obs, False
 
     def step(self, env_id: str, action):
-        action_t = torch.as_tensor(action, dtype=torch.float32, device=self.env.device).reshape(1, -1)
-        _, reward, terminated, truncated, _ = self.env.step(action_t)
+        # torch.tensor() (not as_tensor) — msgpack_numpy unpacks into
+        # read-only arrays; as_tensor's zero-copy share triggered a
+        # writable-tensor-from-read-only-array warning.
+        action_t = torch.tensor(action, dtype=torch.float32, device=self.env.device).reshape(1, -1)
+        _, _dense_reward_unused, terminated, truncated, _ = self.env.step(action_t)
         self._last_done = bool(terminated.item() or truncated.item())
-        self._last_reward = float(reward.item())
-        # Sparse, ground-truth success — see design-decisions summary for why
-        # FORGE's own dense _get_rewards() isn't used (depends on the 7th
-        # native-action dimension we don't have).
+        # Sparse, ground-truth reward = success indicator — see design-decisions
+        # summary for why FORGE's own dense _get_rewards() (discarded above,
+        # it's what produced the smoothly-decaying ~0.29->0.23 values seen in
+        # testing) isn't used: it depends on the 7th native-action dimension
+        # we don't have.
         self._last_success = bool(
             self.env._get_curr_successes(
                 success_threshold=self.env.cfg_task.success_threshold, check_rot=False
             )[0].item()
         )
+        self._last_reward = 1.0 if self._last_success else 0.0
         return action, "policy"
 
     def get_observation(self, env_id: str) -> dict:
@@ -136,8 +184,14 @@ class ForgeBackend:
             # Not consumed by pi05_droid_jointpos — logged for tactile-phase
             # diagnostics and future use. force_threshold follows FORGE's own
             # native randomization (per design decision), not a fixed value.
-            "extra/ft_force": getattr(env, "ft_force", torch.zeros(1, 3))[0].detach().cpu().numpy().astype("float32"),
-            "extra/force_threshold": float(getattr(env, "force_threshold", torch.zeros(1))[0].item()),
+            # Direct attribute access (no getattr default): these names come
+            # straight from forge_env.py's own _get_observations(), so a
+            # wrong name here should crash loudly, not silently return zeros
+            # (which is exactly what the previous getattr(..., "ft_force",
+            # ...) / getattr(..., "force_threshold", ...) version did — those
+            # attributes don't exist on the env at all).
+            "extra/ft_force": env.force_sensor_smooth[0, 0:3].detach().cpu().numpy().astype("float32"),
+            "extra/force_threshold": float(env.contact_penalty_thresholds[0].item()),
         }
 
     def get_info_for_step(self, env_id: str):
@@ -147,16 +201,19 @@ class ForgeBackend:
 
 def main():
     backend = ForgeBackend(cfg_yaml)
+    _backend_holder["backend"] = backend  # so _handle_shutdown_signal can reach it
     server = WsEnvServer(
         backend,
         host=cfg_yaml.get("server_host", "0.0.0.0"),
         port=cfg_yaml.get("server_port", 8102),
     )
-    try:
-        server.serve_forever()
-    finally:
-        backend.env.close()
-        app.close()
+    # Registered LAST, after ForgeBackend/ForgeEnvJointPosPi05 has finished
+    # building the scene — see the comment above _handle_shutdown_signal for
+    # why registering this any earlier didn't survive.
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    print("[forge_server] shutdown handler armed — Ctrl+C should now work.", flush=True)
+    server.serve_forever()  # returns only via _handle_shutdown_signal's os._exit(0)
 
 
 if __name__ == "__main__":
