@@ -154,6 +154,16 @@ class ForgeBackend:
             return self.get_joint_names()
         if kind == "joint_velocity":
             return self.env.joint_vel[0, 0:7].detach().cpu().numpy().tolist()
+        if kind == "fingertip_pose":
+            # Ground truth INDEPENDENT of our _apply_action: computed by
+            # FORGE's own _compute_intermediate_values (inherited, unmodified)
+            # from the robot's actual simulated rigid-body pose, not from
+            # anything our joint-delta code writes. Used to check that a
+            # joint-space delta produces sensible, smooth EEF-space motion,
+            # not just a round trip in joint-angle terms.
+            pos = self.env.fingertip_midpoint_pos[0].detach().cpu().numpy().tolist()
+            quat = self.env.fingertip_midpoint_quat[0].detach().cpu().numpy().tolist()
+            return {"pos": pos, "quat": quat}
         return {"error": f"unknown debug kind: {kind}"}
 
     def reset(self, env_id: str, seed):

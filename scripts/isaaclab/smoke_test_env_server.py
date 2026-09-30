@@ -182,6 +182,21 @@ obs3 = env.reset(seed=1)
 os.makedirs(args.out, exist_ok=True)
 start_pos = obs3["observation/joint_position"][args.move_joint]
 
+
+def get_fingertip_pose():
+    """FORGE-native ground truth — computed by FORGE's own unmodified
+    _compute_intermediate_values from the robot's actual simulated pose, not
+    by anything our joint-delta _apply_action writes. Independent check that
+    the round trip also makes sense in EEF space, not just in joint angles."""
+    r = env._client.client._call_operation(
+        "debug", {"env_id": env.env_id, "kind": "fingertip_pose"}
+    )["result"]
+    return np.array(r["pos"]), np.array(r["quat"])
+
+
+fingertip_pos_start, _ = get_fingertip_pose()
+print(f"\nfingertip_pos (FORGE-native, before round trip): {np.round(fingertip_pos_start, 4)}")
+
 move_fwd = np.zeros(8, dtype=np.float32)
 move_fwd[args.move_joint] = args.delta
 move_bwd = np.zeros(8, dtype=np.float32)
@@ -200,6 +215,9 @@ for t in range(args.move_steps):
               f"expected drift ~{args.delta * (t + 1):+.4f})")
 
 mid_pos = last_obs["observation/joint_position"][args.move_joint]
+fingertip_pos_mid, _ = get_fingertip_pose()
+print(f"fingertip_pos (FORGE-native, at mid): {np.round(fingertip_pos_mid, 4)}  "
+      f"(moved {np.linalg.norm(fingertip_pos_mid - fingertip_pos_start):.4f} m from start)")
 for name, frame_tag in (("exterior_image_1_left", "exterior"), ("wrist_image_left", "wrist")):
     iio.imwrite(f"{args.out}/{frame_tag}_mid.png", last_obs[f"observation/{name}"])
 
@@ -222,6 +240,22 @@ for _ in range(settle_steps):
     last_obs = env.get_observation()
 print(f"settled joint[{args.move_joint}] after {settle_steps} hold steps: "
       f"{last_obs['observation/joint_position'][args.move_joint]:.4f}")
+
+fingertip_pos_end, _ = get_fingertip_pose()
+fingertip_round_trip_error = np.linalg.norm(fingertip_pos_end - fingertip_pos_start)
+print(f"fingertip_pos (FORGE-native, at end): {np.round(fingertip_pos_end, 4)}  "
+      f"(round-trip error in EEF space: {fingertip_round_trip_error:.4f} m)")
+if fingertip_round_trip_error > 0.03:
+    print("FAIL — the gripper did not return near its starting position in real "
+          "3D space (FORGE's own fingertip_midpoint_pos), even if the joint "
+          "angle looked fine. This would mean the joint-angle round trip is "
+          "passing for a reason unrelated to genuinely sensible motion — e.g. "
+          "a different joint configuration reaching a similar angle, or the "
+          "EEF taking a path that doesn't actually retrace itself.")
+else:
+    print("PASS — confirmed independently of our own code: FORGE's own "
+          "fingertip tracking shows the gripper genuinely returned to "
+          "roughly where it started in real space, not just in joint angle.")
 
 end_pos = last_obs["observation/joint_position"][args.move_joint]
 for name, frame_tag in (("exterior_image_1_left", "exterior"), ("wrist_image_left", "wrist")):
