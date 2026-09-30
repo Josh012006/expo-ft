@@ -144,3 +144,15 @@ class ForgeEnvJointPosPi05(ForgeEnv):
         self.delta_yaw = torch.zeros(self.num_envs, device=self.device)
 
         self._robot.set_joint_position_target(self._target_joint_pos)
+        # FORGE's own _reset_idx (inherited unmodified) calls
+        # close_gripper_in_place() in a 0.25s settling loop right after reset,
+        # which computes torques via FORGE's task-space controller and applies
+        # them with set_joint_effort_target() on the ARM DOFs — not just the
+        # gripper, despite the name. That call is sticky: whatever value it
+        # last set stays applied every physics step until overwritten, and we
+        # never touch effort target ourselves (position control only), so the
+        # last reset-time torque silently persisted for the entire episode —
+        # confirmed as the cause of the constant (non-decaying) drift measured
+        # on joint[0]/joint[2] in testing. Explicitly zeroed every step so no
+        # stray effort command can ever linger, regardless of what reset does.
+        self._robot.set_joint_effort_target(torch.zeros_like(self._target_joint_pos))

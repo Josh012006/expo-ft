@@ -74,6 +74,51 @@ print(f"\nreset(seed=1) #2 — joint_position: {obs2['observation/joint_position
 print("  (different from reset #1 above if FORGE's fixed-asset randomization "
       "is actually seeded, which is itself worth checking)")
 
+# -- 1b. pure hold test: ALL-ZERO actions, no round trip, no gripper test in
+# between — isolates whether any joint drifts with zero commanded delta.
+# Motivated by a real anomaly: joint[0]'s reading drifted ~-0.47 rad between
+# reset(seed=1) and the start of the round-trip test in an earlier run, across
+# phases (gripper test) that sent delta=0 for joint 0 explicitly.
+# If _apply_action's hold behavior (target = current + 0) is correct, every
+# joint should stay flat here; a joint that drifts while never commanded is a
+# real bug, not a contact or gravity effect.
+print("\npure hold (all-zero action) drift check, 60 steps from reset(seed=1):")
+hold_only = np.zeros(8, dtype=np.float32)
+hold_start = obs2["observation/joint_position"].copy()
+for t in range(60):
+    env.step(hold_only)
+    if t % 10 == 9:
+        pos = env.get_observation()["observation/joint_position"]
+        vel = env._client.client._call_operation(
+            "debug", {"env_id": env.env_id, "kind": "joint_velocity"}
+        )["result"]
+        drift = pos - hold_start
+        print(f"  step {t}: joint_position={np.round(pos, 4)}  drift={np.round(drift, 4)}")
+        print(f"           joint_velocity={np.round(vel, 4)}  "
+              f"(near-zero here + still-changing position above = real bug, not settling)")
+hold_end = env.get_observation()["observation/joint_position"]
+hold_drift = hold_end - hold_start
+print(f"total drift over 60 held steps: {np.round(hold_drift, 4)}")
+print("per-joint verdict (threshold 0.02 rad, zero delta commanded the whole time):")
+any_bug = False
+for j in range(7):
+    flag = "BUG" if abs(hold_drift[j]) > 0.02 else "ok "
+    if flag == "BUG":
+        any_bug = True
+    print(f"  joint[{j}] ({joint_names[j]}): drift={hold_drift[j]:+.4f}  [{flag}]")
+if any_bug:
+    print("\nAt least one joint drifted with zero commanded delta — this is not "
+          "contact or gravity, something is setting a nonzero target for that "
+          "joint even when action[joint]==0. Check ctrl_target_joint_pos "
+          "handling in forge_env_patched.py._pre_physics_step for that index.")
+else:
+    print("\nPASS — no joint drifts meaningfully under an all-zero action. If this "
+          "differs from the earlier round-trip run's baseline anomaly, the drift "
+          "there was likely caused by the gripper-test phase specifically, not "
+          "a standing bug — worth re-checking with those steps included instead.")
+
+
+
 # -- 4. force/threshold not flat zero ---------------------------------------
 print(f"\nextra/ft_force: {obs2['extra/ft_force']}")
 print(f"extra/force_threshold: {obs2['extra/force_threshold']}")
@@ -121,6 +166,7 @@ else:
 # side effects on the held peg (moved or dropped) would otherwise contaminate
 # the arm's contact conditions here and confound the result.
 obs3 = env.reset(seed=1)
+
 # The forward-only drift check above (drift ~= delta * steps) can't actually
 # tell a correct delta ("target = current_joint_pos + action") from a bug
 # that applies the action as an ABSOLUTE target ("target = action") instead:

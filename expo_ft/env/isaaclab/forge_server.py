@@ -92,7 +92,16 @@ def build_env(cfg_yaml: dict):
     # Isaac Lab's own defaults for this robot (isaaclab_assets FRANKA_PANDA_CFG).
     for group in ("panda_arm1", "panda_arm2"):
         env_cfg.robot.actuators[group].stiffness = 80.0
-        env_cfg.robot.actuators[group].damping = 4.0
+        # damping=4 is Isaac Lab's own FRANKA_PANDA_CFG default; too soft to
+        # track a deliberate joint-delta move precisely (round-trip test
+        # error ~0.09 rad at this value). Bumped to 40 for tracking accuracy
+        # only — the earlier drift that first motivated this change turned
+        # out to be an unrelated bug (a stale set_joint_effort_target() left
+        # standing by FORGE's own reset-time close_gripper_in_place() loop,
+        # fixed in _apply_action below), confirmed fixed independently of
+        # this gain. This value is purely a tracking-quality choice now, no
+        # longer tangled with that bug.
+        env_cfg.robot.actuators[group].damping = 40.0
 
     # One render per env step (env step = decimation physics steps).
     env_cfg.sim.render_interval = env_cfg.decimation
@@ -133,6 +142,8 @@ class ForgeBackend:
         kind = request.get("kind")
         if kind == "joint_names":
             return self.get_joint_names()
+        if kind == "joint_velocity":
+            return self.env.joint_vel[0, 0:7].detach().cpu().numpy().tolist()
         return {"error": f"unknown debug kind: {kind}"}
 
     def reset(self, env_id: str, seed):
