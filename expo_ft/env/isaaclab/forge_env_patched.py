@@ -95,22 +95,45 @@ class ForgeEnvJointPosPi05(ForgeEnv):
         self.scene.sensors["wrist_cam"] = self._wrist_cam
 
     def _pre_physics_step(self, action):
-        """Store the raw action, no EMA smoothing (see module docstring)."""
+        """Compute and cache the joint-position TARGET once per env.step()
+        (this is called once), not once per decimation substep. This is the
+        fix for the bug found in testing: _apply_action runs `decimation`
+        times (8) per env.step() (confirmed in isaaclab's DirectRLEnv.step()),
+        and the original version recomputed `self.joint_pos + delta_arm`
+        fresh on every one of those calls using the LIVE, already-moving
+        joint position — so the delta kept getting re-added on top of
+        wherever the arm had already drifted to mid-step, instead of being
+        applied once. FORGE's own original _apply_action never hits this
+        because it targets a essentially-static reference frame (the fixed
+        asset's observed pose, not the live end-effector position); our
+        joint-delta action has no such stable frame to lean on, so the
+        target has to be captured explicitly, once, before the decimation
+        loop starts — exactly like ManiSkill's pd_joint_delta_pos does.
+
+        No EMA smoothing of the action itself (see module docstring).
+        """
         env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(env_ids) > 0:
             self._reset_buffers(env_ids)
         self.actions = action.clone().to(self.device)
 
-    def _apply_action(self):
-        """8D action -> joint position targets. No task-space math, no
-        hand-derived impedance law: current + delta, tracked by PhysX's
-        implicit PD actuator (gains patched in forge_server.py)."""
         if self.last_update_timestamp < self._robot._data._sim_timestamp:
             self._compute_intermediate_values(dt=self.physics_dt)
 
         delta_arm = self.actions[:, 0:7]
         gripper_cmd = self.actions[:, 7]  # assumed DROID convention: 0=open, 1=closed
 
+        target = self.ctrl_target_joint_pos.clone()
+        target[:, 0:7] = self.joint_pos[:, 0:7] + delta_arm  # current pos read ONCE, here
+        finger_width = (1.0 - gripper_cmd).clamp(0.0, 1.0) * GRIPPER_OPEN_WIDTH
+        target[:, 7:9] = finger_width.unsqueeze(-1)
+
+        self.ctrl_target_joint_pos[:] = target
+        self._target_joint_pos = target  # held fixed across all decimation substeps
+
+    def _apply_action(self):
+        """Apply the FIXED target computed once in _pre_physics_step — no
+        recomputation here, deliberately (see that method's docstring)."""
         # FORGE's own _apply_action (which we fully replace) sets these two —
         # they feed only its dense reward's action penalty (_get_rewards,
         # pos_error = norm(self.delta_pos)), which we don't use (sparse,
@@ -120,10 +143,4 @@ class ForgeEnvJointPosPi05(ForgeEnv):
         self.delta_pos = torch.zeros_like(self.fingertip_midpoint_pos)
         self.delta_yaw = torch.zeros(self.num_envs, device=self.device)
 
-        target = self.ctrl_target_joint_pos.clone()
-        target[:, 0:7] = self.joint_pos[:, 0:7] + delta_arm
-        finger_width = (1.0 - gripper_cmd).clamp(0.0, 1.0) * GRIPPER_OPEN_WIDTH
-        target[:, 7:9] = finger_width.unsqueeze(-1)
-
-        self.ctrl_target_joint_pos[:] = target
-        self._robot.set_joint_position_target(target)
+        self._robot.set_joint_position_target(self._target_joint_pos)

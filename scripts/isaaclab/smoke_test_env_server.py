@@ -164,6 +164,19 @@ for t in range(args.move_steps):
         pos = last_obs["observation/joint_position"][args.move_joint]
         print(f"backward step {t}: joint[{args.move_joint}] = {pos:.4f}")
 
+# Settle: hold position (zero delta) for a few extra steps before reading
+# end_pos. Gains are deliberately soft (80/4); reading the position right on
+# the last backward step risks measuring a transient still catching up
+# rather than where the controller actually settles. This does NOT apply
+# any further motion, only lets PD tracking finish converging.
+settle_steps = max(5, args.move_steps // 3)
+hold_action = np.zeros(8, dtype=np.float32)
+for _ in range(settle_steps):
+    env.step(hold_action)
+    last_obs = env.get_observation()
+print(f"settled joint[{args.move_joint}] after {settle_steps} hold steps: "
+      f"{last_obs['observation/joint_position'][args.move_joint]:.4f}")
+
 end_pos = last_obs["observation/joint_position"][args.move_joint]
 for name, frame_tag in (("exterior_image_1_left", "exterior"), ("wrist_image_left", "wrist")):
     iio.imwrite(f"{args.out}/{frame_tag}_after.png", last_obs[f"observation/{name}"])
