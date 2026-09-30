@@ -80,7 +80,47 @@ print(f"extra/force_threshold: {obs2['extra/force_threshold']}")
 if obs2["extra/force_threshold"] == 0.0:
     print("  WARNING: still exactly 0.0 — check contact_penalty_thresholds randomization range in the task cfg.")
 
+# -- 3b. gripper close/open, isolated from the arm round trip ---------------
+# gripper_position was seen stuck at ~0.0053 during the arm-only round trip
+# above, with gripper_cmd=0 (open) sent the whole time. That number is very
+# close to FORGE's own reset-time grip width for the peg
+# (diameter/2 * 1.25 ~= 0.005-0.0051 for PegInsert's peg, per
+# factory_env.py) — i.e. the peg is physically wedged between the fingers,
+# so an "open" command pushes against that contact and can't win. Not
+# necessarily a bug in the gripper control path itself, just never
+# exercised without something in the way. Command CLOSE (1.0) then OPEN
+# (0.0) explicitly and check the two settle at genuinely different values —
+# that's what actually tells the control path apart from "always stuck".
+close_action = np.zeros(8, dtype=np.float32)
+close_action[7] = 1.0
+open_action = np.zeros(8, dtype=np.float32)
+open_action[7] = 0.0
+
+for _ in range(10):
+    env.step(close_action)
+gripper_closed = env.get_observation()["observation/gripper_position"][0]
+
+for _ in range(10):
+    env.step(open_action)
+gripper_open = env.get_observation()["observation/gripper_position"][0]
+
+print(f"\ngripper close(1.0) -> {gripper_closed:.4f}   open(0.0) -> {gripper_open:.4f}")
+if abs(gripper_open - gripper_closed) > 0.002:
+    print("PASS — gripper responds to the command (values genuinely differ); "
+          "the peg-contact explanation above is consistent with this.")
+else:
+    print("Still stuck across an explicit close/open toggle — that IS a real "
+          "bug in the gripper control path (mapping sign/scale, or the "
+          "actuator not responding at all), not just peg contact. Check "
+          "GRIPPER_OPEN_WIDTH / the (1.0 - gripper_cmd) mapping in "
+          "forge_env_patched.py._apply_action.")
+
 # -- 3 & 5. deliberate nonzero action on one joint, then its exact opposite -
+# Reset first (same seed as obs2, so the starting joint_position is directly
+# comparable) — isolates this from the gripper open/close test above, whose
+# side effects on the held peg (moved or dropped) would otherwise contaminate
+# the arm's contact conditions here and confound the result.
+obs3 = env.reset(seed=1)
 # The forward-only drift check above (drift ~= delta * steps) can't actually
 # tell a correct delta ("target = current_joint_pos + action") from a bug
 # that applies the action as an ABSOLUTE target ("target = action") instead:
@@ -94,7 +134,7 @@ if obs2["extra/force_threshold"] == 0.0:
 # in this env, essentially never near zero) — so that bug fails this check
 # clearly rather than looking approximately plausible.
 os.makedirs(args.out, exist_ok=True)
-start_pos = obs2["observation/joint_position"][args.move_joint]
+start_pos = obs3["observation/joint_position"][args.move_joint]
 
 move_fwd = np.zeros(8, dtype=np.float32)
 move_fwd[args.move_joint] = args.delta
@@ -102,7 +142,7 @@ move_bwd = np.zeros(8, dtype=np.float32)
 move_bwd[args.move_joint] = -args.delta
 
 for name, frame_tag in (("exterior_image_1_left", "exterior"), ("wrist_image_left", "wrist")):
-    iio.imwrite(f"{args.out}/{frame_tag}_before.png", obs2[f"observation/{name}"])
+    iio.imwrite(f"{args.out}/{frame_tag}_before.png", obs3[f"observation/{name}"])
 
 last_obs = None
 for t in range(args.move_steps):
