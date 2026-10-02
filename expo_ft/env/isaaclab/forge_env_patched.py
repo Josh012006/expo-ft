@@ -73,6 +73,22 @@ def _look_at_quat_opengl(eye, target):
 class ForgeEnvJointPosPi05(ForgeEnv):
     """FORGE + cameras + 8D joint-position-delta action interface."""
 
+    def __init__(self, cfg, render_mode=None, gripper_can_open: bool = True, **kwargs):
+        """gripper_can_open: when False, the policy's gripper channel
+        (action[:, 7]) is ignored every step and the gripper target is left
+        at whatever it already was — which, since nothing else ever writes
+        it in that case, stays at FORGE's own reset-time grasp width
+        (close_gripper_in_place(), factory_env.py) for the entire episode.
+        Added because the pretrained checkpoint's zero-shot gripper output
+        tends to open the gripper early in an episode (plausible cause:
+        DROID demonstrations overwhelmingly start reaching toward an object
+        with the gripper open, not already holding one — an episode-start
+        condition FORGE's own task never matches) — dropping the held peg
+        before any insertion attempt is possible. This is a blunt, temporary
+        workaround, not a fix to that distribution mismatch itself."""
+        self._gripper_can_open = gripper_can_open
+        super().__init__(cfg, render_mode=render_mode, **kwargs)
+
     def _setup_scene(self):
         super()._setup_scene()
 
@@ -125,8 +141,12 @@ class ForgeEnvJointPosPi05(ForgeEnv):
 
         target = self.ctrl_target_joint_pos.clone()
         target[:, 0:7] = self.joint_pos[:, 0:7] + delta_arm  # current pos read ONCE, here
-        finger_width = (1.0 - gripper_cmd).clamp(0.0, 1.0) * GRIPPER_OPEN_WIDTH
-        target[:, 7:9] = finger_width.unsqueeze(-1)
+        if self._gripper_can_open:
+            finger_width = (1.0 - gripper_cmd).clamp(0.0, 1.0) * GRIPPER_OPEN_WIDTH
+            target[:, 7:9] = finger_width.unsqueeze(-1)
+        # else: target[:, 7:9] left as cloned from self.ctrl_target_joint_pos,
+        # i.e. whatever it already was — the policy's gripper output is never
+        # read into the command at all.
 
         self.ctrl_target_joint_pos[:] = target
         self._target_joint_pos = target  # held fixed across all decimation substeps

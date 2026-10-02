@@ -116,10 +116,27 @@ def build_env(cfg_yaml: dict):
     # One render per env step (env step = decimation physics steps).
     env_cfg.sim.render_interval = env_cfg.decimation
 
+    # FORGE's own native episode_length_s (10.0 for PegInsert) truncates
+    # episodes at 150 steps @ 15Hz, enforced inside Isaac Lab's own
+    # DirectRLEnv base class (done=truncated) — independently of, and before,
+    # anything the client's own max_steps_per_episode (task YAML) checks.
+    # Raising that client-side value alone has no effect; this is the actual
+    # knob. YAML expresses this in STEPS (max_episode_length), matching the
+    # client's own max_steps_per_episode convention — converted to seconds
+    # here since that's the unit Isaac Lab's own cfg field expects. Uses
+    # env_cfg's own decimation/physics dt rather than a hardcoded 15 Hz, so
+    # this stays correct if either ever changes.
+    if "max_episode_length" in cfg_yaml:
+        dt_per_step = env_cfg.decimation * env_cfg.sim.dt
+        env_cfg.episode_length_s = cfg_yaml["max_episode_length"] * dt_per_step
+
     if not cfg_yaml.get("realtime_throttle", False):
         pass  # default: run as fast as the GPU allows (see task YAML comment)
 
-    env = ForgeEnvJointPosPi05(cfg=env_cfg, render_mode=None)
+    env = ForgeEnvJointPosPi05(
+        cfg=env_cfg, render_mode=None,
+        gripper_can_open=cfg_yaml.get("gripper_can_open", True),
+    )
     return env, task_name
 
 
