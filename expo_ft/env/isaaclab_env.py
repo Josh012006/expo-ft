@@ -16,6 +16,7 @@ extra/* namespace for tactile-phase diagnostics not yet consumed anywhere —
 so, also unlike ManiSkillEnvWrapper, there is no _parse_obs step here.
 """
 import logging
+import os
 
 import numpy as np
 
@@ -40,11 +41,34 @@ class IsaacLabEnvWrapper:
         self._success = False
         self._reward = 0.0
 
+        # Video recording — mirrors ManiSkillEnvWrapper's own pattern (manual
+        # frame accumulation + imageio write at episode boundaries), added
+        # here because eval_policy.py passes video_dir through
+        # env_creation_request expecting every env wrapper to handle it the
+        # same way; this one previously just silently ignored it.
+        self._video_dir = env_creation_request.get("video_dir", None)
+        if self._video_dir is not None:
+            os.makedirs(self._video_dir, exist_ok=True)
+        self._frames = []
+        self._episode_count = 0
+
         logging.info(f"IsaacLabEnvWrapper: connected, task={self.task_description!r}")
+
+    def _flush_video(self):
+        """Write the accumulated frames of the episode just finished. Called
+        from reset() (previous episode) and close() (the last one, which
+        never gets a following reset() to trigger it)."""
+        if self._video_dir is not None and len(self._frames) > 0:
+            path = os.path.join(self._video_dir, f"episode_{self._episode_count}.mp4")
+            import imageio.v3 as iio
+            iio.imwrite(path, self._frames, fps=10, codec="libx264")
+            self._frames = []
+            self._episode_count += 1
 
     def reset(self, **reset_kwargs):
         """reset_kwargs: currently only `seed` is forwarded to the server —
         see env_client.EnvClient.reset for the wire-protocol side of this."""
+        self._flush_video()
         obs = self._client.reset(seed=reset_kwargs.get("seed"))
         self._done = False
         self._success = False
@@ -64,7 +88,20 @@ class IsaacLabEnvWrapper:
         return real_action, action_type
 
     def get_observation(self):
-        return self._client.get_observation()
+        """Frame capture is hooked here, not step(): eval_policy.py's loop
+        calls step() -> get_info_for_step() -> get_observation() exactly
+        once each per env step, so this is called exactly once per frame
+        with no extra round-trip and no risk of duplicate frames for that
+        calling pattern. (A script that calls get_observation() more than
+        once per step with video_dir set would get extra frames — none of
+        the current callers do.)"""
+        obs = self._client.get_observation()
+        if self._video_dir is not None:
+            ext = np.asarray(obs["observation/exterior_image_1_left"], dtype=np.uint8)
+            wrist = np.asarray(obs["observation/wrist_image_left"], dtype=np.uint8)
+            tiled = np.concatenate([ext, wrist], axis=1)  # side by side, same height
+            self._frames.append(tiled)
+        return obs
 
     def get_info_for_step(self):
         mask = 1.0 - float(self._done)
@@ -74,4 +111,4 @@ class IsaacLabEnvWrapper:
         return dict(self._info)
 
     def close(self):
-        pass  # the server owns the environment lifecycle, not this wrapper
+        self._flush_video()

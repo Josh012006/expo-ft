@@ -1,32 +1,55 @@
-# FORGE (Isaac Lab) / pi05_droid_jointpos zero-shot eval — tactile-phase, first server test.
+# FORGE (Isaac Lab) / pi05_droid_jointpos zero-shot eval.
 #
-# Read by TWO different processes:
+# Read by THREE different processes:
 #   - forge_server.py (in .venv-isaaclab)      reads: task_name, realtime_throttle,
 #                                                       server_host, server_port
-#   - IsaacLabEnvWrapper / eval scripts (.venv) reads: env_wrapper, server_host,
-#                                                       server_port, language_instruction
+#   - IsaacLabEnvWrapper (.venv)                reads: server_host, server_port
+#   - eval_policy.py / make_env_wrapper (.venv) reads: everything else below
 
 env_wrapper: "isaaclab"
+env_id: "ForgePegInsert"   # label only (output filenames/logging) — no functional effect
 
-# -- Server side ---------------------------------------------------------
+# -- Server side -------------------------------------------------------------
 task_name: "Isaac-Forge-PegInsert-Direct-v0"
 
 # Wall-clock pacing of env.step() on the server. False = run as fast as the
 # GPU allows. This does NOT affect what pi05_droid_jointpos sees or does:
 # FORGE's simulated seconds per env step (1/15s, via decimation=8 @ 120Hz
 # physics) already matches the checkpoint's 15Hz pretraining assumption
-# regardless of this flag — see design-decisions summary. Kept as a flag
-# for later visual debugging / real-deployment latency testing, not
-# because it's needed for policy correctness now.
+# regardless of this flag. Kept as a flag for later visual debugging /
+# real-deployment latency testing, not because it's needed for policy
+# correctness now.
 realtime_throttle: false
 
-# -- Shared ----------------------------------------------------------------
-server_host: "localhost"   # override to the env-server node's hostname once
-                             # client and server run as separate SLURM jobs
-                             # (topology not yet decided — see summary)
+# -- Shared (client + server) -------------------------------------------------
+server_host: "localhost"   # override to the env-server node's hostname if
+                             # client and server end up on separate SLURM jobs
 server_port: 8102
 
-# -- Client side (eval_policy.py / train_pi_robo.py) -----------------------
+# -- Policy / checkpoint (eval_policy.py) ------------------------------------
 language_instruction: "Insert the peg into the socket."
-droid_checkpoint: "pi05_droid_jointpos"   # public PI checkpoint, NOT this project's
-                                     # own ManiSkill LoRA SFT — see summary
+model_cls: "EXPOLearner"
+use_cartesian_state: false   # joint-space action, not cartesian — picks the
+                              # "..._joint_state" openpi config (correct norm
+                              # stats: gs://openpi-assets/checkpoints/pi05_droid_jointpos/assets)
+sft_use_lora: true            # only affects which openpi config name is resolved;
+                              # irrelevant to weight loading itself when no
+                              # --checkpoint is passed (pure base-weights eval)
+skip_repack_transforms: true
+
+# -- Observation / action shapes (make_dummy_transition, JAX static shapes) --
+camera_height: 224
+camera_width: 224
+state_obs_key: "observation/joint_position"
+state_obs_dim: 7
+output_action_dim: 8   # 7 joint-position deltas + gripper
+
+# -- Rollout ------------------------------------------------------------------
+# 10s episode_length_s, FORGE's own native value for PegInsert
+# (factory_tasks_cfg.py / forge_env_cfg.py: ForgeTaskPegInsertCfg), at 15Hz.
+max_steps_per_episode: 500
+# Matches ManiSkill's replan_steps:action_horizon ratio (8:16) at pi05's
+# action_horizon=15 for DROID. Not a correctness requirement like
+# max_steps_per_episode — a reactivity/compute tradeoff, worth revisiting
+# once real rollout behavior is visible.
+replan_steps: 8
