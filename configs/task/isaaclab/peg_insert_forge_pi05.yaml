@@ -3,9 +3,10 @@
 # Read by THREE different processes:
 #   - forge_server.py (in .venv-isaaclab)      reads: task_name, realtime_throttle,
 #                                                       server_host, server_port,
-#                                                       max_episode_length, gripper_can_open
+#                                                       max_steps_per_episode, gripper_can_open
 #   - IsaacLabEnvWrapper (.venv)                reads: server_host, server_port
-#   - eval_policy.py / make_env_wrapper (.venv) reads: everything else below
+#   - eval_policy.py / make_env_wrapper (.venv) reads: everything else below,
+#                                                       including max_steps_per_episode too
 
 env_wrapper: "isaaclab"
 env_id: "ForgePegInsert"   # label only (output filenames/logging) — no functional effect
@@ -21,16 +22,6 @@ task_name: "Isaac-Forge-PegInsert-Direct-v0"
 # real-deployment latency testing, not because it's needed for policy
 # correctness now.
 realtime_throttle: false
-
-# Episode truncation, in STEPS (not seconds) — same convention as
-# max_steps_per_episode below. Converted to episode_length_s in
-# forge_server.py using env_cfg.decimation * env_cfg.sim.dt (not a hardcoded
-# 15Hz), then overrides FORGE's own native value (150 steps / 10s for
-# PegInsert) on the env's own cfg before construction. This is the field
-# that actually controls truncation — max_steps_per_episode below is only
-# the client eval loop's own extra cap, and has no effect once it's set
-# higher than this value (FORGE's own done=truncated fires first).
-max_episode_length: 500
 
 # When false, action[:, 7] (the gripper channel) is ignored every step and
 # the gripper is held at FORGE's own reset-time grasp width for the whole
@@ -63,11 +54,19 @@ state_obs_dim: 7
 output_action_dim: 8   # 7 joint-position deltas + gripper
 
 # -- Rollout ------------------------------------------------------------------
-# Client-side eval-loop cap only (scripts/eval_policy.py's own while loop) —
-# kept equal to max_episode_length above so neither ever cuts an episode
-# short before the other; the server's own truncation (max_episode_length)
-# is what actually matters now.
-max_steps_per_episode: 500
+# Episode length, in STEPS, read by BOTH sides — one field, not two:
+#   - forge_server.py converts it to episode_length_s (env_cfg.decimation *
+#     env_cfg.sim.dt) and overrides FORGE's own native value (150 steps/10s
+#     for PegInsert) on the env's cfg before construction — this is what
+#     actually makes Isaac Lab set done=truncated.
+#   - scripts/eval_policy.py's own rollout loop also reads it directly
+#     (`while ... steps < cfg.max_steps_per_episode`), as a redundant safety
+#     cap in case the server's own done signal is ever late/missing.
+# Previously two separate fields (max_episode_length server-side,
+# max_steps_per_episode client-side) that could silently drift apart —
+# raising one alone had no effect while the other, smaller, value kept
+# truncating episodes first.
+max_steps_per_episode: 150
 # Matches ManiSkill's replan_steps:action_horizon ratio (8:16) at pi05's
 # action_horizon=15 for DROID. Not a correctness requirement like
 # max_steps_per_episode — a reactivity/compute tradeoff, worth revisiting
