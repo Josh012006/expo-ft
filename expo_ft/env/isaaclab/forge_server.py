@@ -235,6 +235,25 @@ class ForgeBackend:
         self._last_reward = 1.0 if self._last_success else 0.0
         return action, "policy"
 
+    def _peg_socket_offset(self):
+        """(x, y, z) in metres, env frame: held peg base minus its TARGET pose in the socket.
+        Same quantities FORGE's own _get_curr_successes() uses (factory_utils helpers), computed
+        from fresh asset poses: xy = norm(offset[:2]) is FORGE's `xy_dist` (success needs < 2.5 mm)
+        and z = its `z_disp` (success needs it below a height threshold). Diagnostic only."""
+        from isaaclab_tasks.direct.factory import factory_utils
+        env = self.env
+        held_pos = env._held_asset.data.root_pos_w - env.scene.env_origins
+        fixed_pos = env._fixed_asset.data.root_pos_w - env.scene.env_origins
+        held_base_pos, _ = factory_utils.get_held_base_pose(
+            held_pos, env._held_asset.data.root_quat_w, env.cfg_task.name,
+            env.cfg_task.fixed_asset_cfg, env.num_envs, env.device,
+        )
+        target_pos, _ = factory_utils.get_target_held_base_pose(
+            fixed_pos, env._fixed_asset.data.root_quat_w, env.cfg_task.name,
+            env.cfg_task.fixed_asset_cfg, env.num_envs, env.device,
+        )
+        return (held_base_pos - target_pos)[0].detach().cpu().numpy()
+
     def get_observation(self, env_id: str) -> dict:
         env = self.env
         ext = env._exterior_cam.data.output["rgb"][0].cpu().numpy()
@@ -258,6 +277,9 @@ class ForgeBackend:
             # attributes don't exist on the env at all).
             "extra/ft_force": env.force_sensor_smooth[0, 0:3].detach().cpu().numpy().astype("float32"),
             "extra/force_threshold": float(env.contact_penalty_thresholds[0].item()),
+            # Per-step peg-to-socket offset (see _peg_socket_offset); the client wrapper
+            # turns it into a per-episode summary.
+            "extra/peg_socket_offset": self._peg_socket_offset().astype("float32"),
         }
 
     def get_info_for_step(self, env_id: str):
