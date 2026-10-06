@@ -97,10 +97,14 @@ class IsaacLabEnvWrapper:
         the current callers do.)"""
         obs = self._client.get_observation()
         if self._video_dir is not None:
-            ext = np.asarray(obs["observation/exterior_image_1_left"], dtype=np.uint8)
-            wrist = np.asarray(obs["observation/wrist_image_left"], dtype=np.uint8)
-            tiled = np.concatenate([ext, wrist], axis=1)  # side by side, same height
-            self._frames.append(tiled)
+            # sim server emits "observation/..." keys, the real-robot server plain keys
+            ext = obs.get("observation/exterior_image_1_left", obs.get("exterior_image_1_left"))
+            wrist = obs.get("observation/wrist_image_left", obs.get("wrist_image_left"))
+            if ext is not None and wrist is not None:
+                tiled = np.concatenate(
+                    [np.asarray(ext, dtype=np.uint8), np.asarray(wrist, dtype=np.uint8)], axis=1
+                )  # side by side, same height
+                self._frames.append(tiled)
         return obs
 
     def get_info_for_step(self):

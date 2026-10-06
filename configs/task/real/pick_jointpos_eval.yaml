@@ -1,0 +1,26 @@
+# Client side (GPU machine) for scripts/eval_policy.py against the REAL robot server
+# (client/run_client.py + configs/task/pick_jointpos.py). Pure base-weights run: no --checkpoint.
+#
+#   python scripts/eval_policy.py --config configs/task/real/pick_jointpos_eval.yaml --n-episodes 1 \
+#       --video-dir logs/eval_videos/real_pick_zeroshot
+
+env_wrapper: "remote"          # same wrapper as the FORGE simulation: only the server differs
+env_id: "RealPick"
+server_host: "localhost"       # the robot machine, reached through the SSH tunnel (scripts/set_server.sh)
+server_port: 8102
+
+language_instruction: "pick up the cube"     # keep identical to configs/task/pick.py
+model_cls: "EXPOLearner"
+use_cartesian_state: false
+sft_use_lora: true
+skip_repack_transforms: false  # REAL robot sends un-prefixed keys; openpi's repack maps them
+
+camera_height: 180             # real_base.py image_size = (180, 320); openpi resizes to 224 itself
+camera_width: 320
+state_obs_key: "joint_position"
+state_obs_dim: 7
+output_action_dim: 8
+
+max_steps_per_episode: 120     # = auto_reset_steps in pick_jointpos.py
+replan_steps: 8
+chunk_action_reference: "chunk_start_state"   # model output = offsets from the joint state at plan time

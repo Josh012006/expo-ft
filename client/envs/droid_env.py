@@ -10,6 +10,11 @@ from client.real_utils.detector import PickBlocksDetector
 from client.real_utils.detector import LightPlugDetector
 from client.real_utils.detector import success_detector_manual
 
+# Franka Panda joint limits (rad), from the Franka documentation. Used only by the
+# joint-position safety clamp below, shrunk by `joint_limit_margin`.
+FRANKA_Q_MIN = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
+FRANKA_Q_MAX = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973])
+
     
 class DroidEnv(RobotEnv):
     def __init__(
@@ -33,6 +38,10 @@ class DroidEnv(RobotEnv):
         camera_intrinsics = None,
         camera_extrinsics = None,
         record_camera = None,
+        joint_action_semantics = "absolute",
+        max_joint_step = 0.08,
+        joint_limit_margin = 0.05,
+        invert_gripper_observation = False,
         **kwargs,
     ):
         super().__init__(
@@ -67,6 +76,34 @@ class DroidEnv(RobotEnv):
         self._raw_frame_buffer = []
         self._record_frame_buffer = []
         self._ep_count = 0
+
+        # --- joint-position mode (pi05_droid_jointpos) ----------------------
+        # Active when action_space == "joint_position". The 8D action is then
+        # [7 joint targets, gripper]. "absolute": the 7 values ARE the joint targets
+        # (what openpi's serving returns for pi05_droid_jointpos, and what DROID's own
+        # joint_position action space consumes). "step_delta": they are per-step
+        # increments added to the measured joint position. Either way every target is
+        # rate-limited (max_joint_step rad per control step, relative to the MEASURED
+        # position) and clipped to the Franka joint limits before it reaches the robot.
+        self._joint_mode = (action_space == "joint_position")
+        if joint_action_semantics not in ("absolute", "step_delta"):
+            raise ValueError(f"joint_action_semantics must be 'absolute' or 'step_delta', got {joint_action_semantics!r}")
+        self._joint_semantics = joint_action_semantics
+        self._max_joint_step = float(max_joint_step)
+        self._joint_limit_margin = float(joint_limit_margin)
+        # In the DROID fork, robot_state["gripper_position"] = width / max_width (1 = OPEN)
+        # (franka/robot.py: get_gripper_position), while gripper COMMANDS use 0 = open,
+        # 1 = closed (update_gripper: width = max_width * (1 - command)). openpi's DROID
+        # data uses 0 = open / 1 = closed for the gripper, so a pretrained pi05_droid_*
+        # checkpoint expects the state in that convention. Off by default so that data
+        # and models built with the raw convention keep working unchanged.
+        self._invert_gripper_obs = bool(invert_gripper_observation)
+        self._warned_outside_bounds = False
+        if self._joint_mode and getattr(self, "DoF", 8) != 8:
+            raise RuntimeError(
+                f"joint_position mode expects RobotEnv.DoF == 8 (7 joints + gripper), got {self.DoF}. "
+                "Check action_space / gripper_action_space in the task config."
+            )
 
     def reset(self):
         self._before_reset()
@@ -126,6 +163,17 @@ class DroidEnv(RobotEnv):
         self.prev_obs = raw_obs
         return raw_obs
 
+    @staticmethod
+    def _read_joint_position(raw_obs):
+        """Measured joint positions (7,), from robot_state. Fails loudly (with the
+        keys actually present) instead of guessing, since the exact key name comes
+        from the external DROID library."""
+        state = raw_obs["robot_state"]
+        for key in ("joint_positions", "joint_position"):
+            if key in state:
+                return np.asarray(state[key], dtype=np.float32).reshape(-1)[:7]
+        raise KeyError(f"No joint position in robot_state; available keys: {sorted(state.keys())}")
+
     def transform_observation(self, raw_obs):
         # match the input of DroidDataset
         side_img = process_image_for_obs(raw_obs["image"][self.side_camera_id], bgr_to_rgb=True, image_size=self.image_size)
@@ -135,7 +183,14 @@ class DroidEnv(RobotEnv):
             "exterior_image_2_left": side_img,
             "wrist_image_left": wrist_img,
             "cartesian_position": raw_obs["robot_state"]["cartesian_position"],
-            "gripper_position": raw_obs["robot_state"]["gripper_position"],
+            # Added: required by the joint-state policy (use_cartesian_state=False) and
+            # by scripts/convert_droid_data_to_lerobot.py, which already reads it.
+            "joint_position": self._read_joint_position(raw_obs),
+            "gripper_position": (
+                1.0 - raw_obs["robot_state"]["gripper_position"]
+                if self._invert_gripper_obs
+                else raw_obs["robot_state"]["gripper_position"]
+            ),
             "prompt": self.language_instruction,
         }
         if "camera_intrinsics" in raw_obs and "camera_extrinsics" in raw_obs:
@@ -176,9 +231,44 @@ class DroidEnv(RobotEnv):
         reached = bool((pos <= lows).any() or (pos >= highs).any())
         return reached
 
+    def _joint_step(self, action):
+        """Joint-position step with safety clamps (see __init__)."""
+        action = np.asarray(action, dtype=np.float64).reshape(-1)
+        if action.shape[0] < 8:
+            raise ValueError(f"joint_position mode expects an 8D action (7 joints + gripper), got {action.shape}")
+        action = action[:8]
+        if not np.isfinite(action).all():
+            raise ValueError("Non-finite action refused.")
+        if self.prev_obs is None:
+            raise RuntimeError("joint_position step() needs a prior reset()/get_observation() for the measured state.")
+
+        q = np.asarray(self._read_joint_position(self.prev_obs), dtype=np.float64)
+        target = action[:7].copy() if self._joint_semantics == "absolute" else q + action[:7]
+
+        # 1) rate limit, relative to the measured position
+        target = q + np.clip(target - q, -self._max_joint_step, self._max_joint_step)
+        # 2) workspace bounds: hold position while outside (set bounds=None to disable)
+        if self.bounds is not None and self.reached_boundary(self.prev_obs):
+            if not self._warned_outside_bounds:
+                print("WARNING: end-effector outside workspace bounds, holding position.")
+                self._warned_outside_bounds = True
+            target = q.copy()
+        # 3) joint limits
+        target = np.clip(target, FRANKA_Q_MIN + self._joint_limit_margin, FRANKA_Q_MAX - self._joint_limit_margin)
+
+        gripper = float(np.clip(action[7], 0.0, 1.0))   # DROID: 0 = open, 1 = closed
+        executed = np.concatenate([target, [gripper]])
+        action_info = super().step(executed)
+        self._last_gripper_velocity = float(action_info.get("gripper_velocity", gripper))
+        action_info["executed_action"] = executed
+        return action_info
+
     def step(self, action):
         self._steps_since_reset += 1
-        
+
+        if self._joint_mode:
+            return self._joint_step(action)
+
         action = np.asarray(action, dtype=np.float64)
         # to handle different action spaces
         action = action[:self.DoF]

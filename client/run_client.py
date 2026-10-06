@@ -72,6 +72,15 @@ def _get_human_override_action(task_config: Optional[Any] = None) -> tuple:
         return None, False
 
 
+def _human_override_allowed(task_config, action) -> bool:
+    """The SpaceMouse override writes a 7D cartesian-velocity action into action[:7].
+    On an 8D joint-position action that would overwrite the joint targets, so it is
+    never applied there (and can be disabled per task with human_override=False)."""
+    if not getattr(task_config, "human_override", True):
+        return False
+    return len(action) == 7
+
+
 async def _handle_environment_request(websocket: _server.ServerConnection):
     """Handle robomimic operation requests from training server."""
     global _task_config
@@ -136,7 +145,11 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
                         real_action = sent_action.copy()
                         action_type = "policy"
                         is_human = False
-                        if _task_config is not None and _task_config.env_type == "droid":
+                        if (
+                            _task_config is not None
+                            and _task_config.env_type == "droid"
+                            and _human_override_allowed(_task_config, sent_action)
+                        ):
                             sm_action, is_human = _get_human_override_action(_task_config)
                             if is_human and sm_action is not None:
                                 real_action[:6] = sm_action[:6]
@@ -250,4 +263,3 @@ def main(args: Args) -> None:
 if __name__ == "__main__":
     args = tyro.cli(Args)
     main(args)
-

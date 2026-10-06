@@ -275,6 +275,14 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
                     print(f"action_chunk[0]: {action_chunk[0]}")
                     print(f"Dénormalisé (OpenPI) range - min: {action_chunk.min():.3f}, max: {action_chunk.max():.3f}")
                     print(f"obs {state_obs_key}: {obs.get(state_obs_key, 'MISSING')[:3]}")
+                # pi05_droid_jointpos (and any openpi model trained with DeltaActions): the raw
+                # output is a chunk of offsets from the joint state AT PLAN TIME, not per-step
+                # increments; openpi's serving adds that state back (AbsoluteActions). Our fork's
+                # DROID config applies no such transform, so do it here, only when the task asks.
+                if getattr(cfg, "chunk_action_reference", None) == "chunk_start_state":
+                    anchor = np.asarray(obs[state_obs_key], dtype=np.float32).reshape(-1)[:7]
+                    action_chunk = np.array(action_chunk, dtype=np.float32, copy=True)
+                    action_chunk[:, :7] += anchor
                 action_plan.extend(action_chunk[:cfg.replan_steps])
 
             action = action_plan.popleft()

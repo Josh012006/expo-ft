@@ -79,8 +79,10 @@ def main(
     data_dir = Path(data_dir)
     task_cfg = load_task_config(task_config)
     language_instruction = task_cfg.language_instruction
-    action_key = task_cfg.action_space
-    gripper_key = f"gripper_{task_cfg.gripper_action_space}"
+    # label_action_space lets a task TELEOPERATE in one action space (SpaceMouse =
+    # cartesian_velocity) while saving labels in another (joint_position targets).
+    action_key = getattr(task_cfg, "label_action_space", task_cfg.action_space)
+    gripper_key = f"gripper_{getattr(task_cfg, 'label_gripper_action_space', task_cfg.gripper_action_space)}"
     action_dim = 7 if action_key == "cartesian_velocity" else 8  # 6+1 or 7+1
 
     # Create LeRobot dataset, define features to store
