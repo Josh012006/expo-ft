@@ -62,9 +62,14 @@ def hold_action(obs):
     return np.concatenate([q, [cmd]]).astype(np.float32)
 
 
+force_log = []   # |wrist force/torque sensor force| at every step, to tell contact from a controller error
+
+
 def step(action):
     env.step(action)
-    return env.get_observation()
+    o = env.get_observation()
+    force_log.append(float(np.linalg.norm(o["extra/ft_force"])))
+    return o
 
 
 def fingertip():
@@ -108,6 +113,8 @@ for j in range(7):
     flag = "BUG" if abs(drift[j]) > 0.02 else "ok "
     print(f"  joint[{j}] ({joint_names[j]}): drift={drift[j]:+.4f}  [{flag}]")
 print("HOLD:", "PASS" if np.abs(drift).max() <= 0.02 else "FAIL")
+rest_force = float(np.median(force_log))
+print(f"wrist force at rest (median over the hold): {rest_force:.3f} N")
 
 # -- 4. gripper ---------------------------------------------------------------------------
 if getattr(cfg, "gripper_can_open", True):
@@ -156,6 +163,7 @@ def save(tag, o):
 
 
 save("before", obs)
+force_start = len(force_log)
 q_target = q_start.copy()
 q_target[j] += args.offset
 print(f"\nABSOLUTE RAMP on joint[{j}]: {q_start[j]:+.4f} -> {q_target[j]:+.4f} (offset {args.offset:+.3f} rad)")
@@ -166,6 +174,13 @@ save("mid", o_mid)
 err_reach = abs(q_mid[j] - q_target[j])
 print(f"  after settling at the target: joint[{j}] = {q_mid[j]:+.4f}  (commanded {q_target[j]:+.4f}, error {err_reach:.4f})")
 print("  REACHES THE COMMANDED ABSOLUTE VALUE:", "PASS" if err_reach <= args.tolerance else "FAIL")
+force_at_target = force_log[-1]
+print(f"  wrist force: rest {rest_force:.3f} N, peak during ramp+settle {max(force_log[force_start:]):.3f} N, "
+      f"at the target {force_at_target:.3f} N")
+if err_reach > args.tolerance:
+    print("  -> if the force at the target is far above rest, the arm is PRESSING ON SOMETHING (contact: held peg "
+          "on the socket/table), not a controller error. Re-run with the opposite sign (--offset "
+          f"{-args.offset:+.2f}) or another joint (--move-joint 0 / 6) to compare.")
 
 q_later, _ = settle(q_target, 20)
 creep = abs(q_later[j] - q_mid[j])
