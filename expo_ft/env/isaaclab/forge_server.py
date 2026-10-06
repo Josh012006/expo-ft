@@ -82,7 +82,7 @@ import isaaclab.sim as sim_utils  # noqa: E402
 import isaaclab_tasks  # noqa: E402,F401  (registers Isaac-Forge-*-Direct-v0)
 from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 
-from expo_ft.env.isaaclab.forge_env_patched import ForgeEnvJointPosPi05  # noqa: E402
+from expo_ft.env.isaaclab.forge_env_patched import ForgeEnvJointPosPi05, GRIPPER_OPEN_WIDTH  # noqa: E402
 from expo_ft.env.isaaclab.ws_env_server import WsEnvServer  # noqa: E402
 
 
@@ -90,7 +90,7 @@ def build_env(cfg_yaml: dict):
     task_name = cfg_yaml["task_name"]  # e.g. "Isaac-Forge-PegInsert-Direct-v0"
     env_cfg = parse_env_cfg(task_name, device="cuda:0", num_envs=1)
 
-    # Match pi05_droid_jointpos: 8D (7 joint-position deltas + gripper),
+    # Match pi05_droid_jointpos: 8D (7 absolute joint-position targets + gripper),
     # replacing FORGE's native 7D task-space + success-prediction action.
     env_cfg.action_space = 8
 
@@ -148,7 +148,6 @@ class ForgeBackend:
         self.env, self.task_name = build_env(cfg_yaml)
         self.prompt = cfg_yaml.get("language_instruction", "")
         self._env_id = "isaaclab_forge_0"
-        self._zero_action = torch.zeros((1, self.env.cfg.action_space), device=self.env.device)
         self._last_done = False
         self._last_success = False
         self._last_reward = 0.0
@@ -183,6 +182,14 @@ class ForgeBackend:
             return {"pos": pos, "quat": quat}
         return {"error": f"unknown debug kind: {kind}"}
 
+    def _hold_action(self):
+        """Action that keeps the arm and the gripper where they are. Actions are ABSOLUTE joint
+        targets, so an all-zero action would drive every joint to 0 rad."""
+        data = self.env._robot.data
+        q = data.joint_pos[0, 0:7]
+        cmd = (1.0 - data.joint_pos[0, 7] / GRIPPER_OPEN_WIDTH).clamp(0.0, 1.0)   # 0 open, 1 closed
+        return torch.cat([q, cmd.reshape(1)]).reshape(1, -1).to(self.env.device)
+
     def reset(self, env_id: str, seed):
         # env.reset(seed=...) internally calls configure_seed(seed) with
         # torch_deterministic left at its default False (isaaclab/utils/seed.py),
@@ -203,7 +210,7 @@ class ForgeBackend:
             self.env.reset()
         else:
             self.env.reset()
-        self.env.step(self._zero_action)  # let camera/observation buffers populate
+        self.env.step(self._hold_action())  # let camera/observation buffers populate
         obs = self.get_observation(env_id)
         self._last_done = False
         return obs, False

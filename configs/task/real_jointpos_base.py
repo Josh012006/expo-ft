@@ -10,7 +10,7 @@ from configs.task import real_base
 # Keys a task config must take from this base (everything else stays task-specific).
 JOINT_KEYS = (
     "action_space", "gripper_action_space", "control_hz",
-    "joint_action_semantics", "max_joint_step", "joint_limit_margin",
+    "max_joint_step", "joint_limit_margin",
     "invert_gripper_observation", "human_override",
     "example_action", "state_obs_key", "state_obs_dim", "output_action_dim",
     "use_cartesian_state", "chunk_action_reference",
@@ -26,11 +26,8 @@ def get_config():
     config.gripper_action_space = "position"       # command: 0 = open, 1 = closed
     config.control_hz = 15                          # pi05_droid_jointpos nominal rate
 
-    # What the 7 action values mean when they arrive at DroidEnv.step():
-    #   "absolute"   = joint targets (pi05_droid_jointpos after the chunk-start offset is added
-    #                  back on the client, see chunk_action_reference below)
-    #   "step_delta" = per-step increments on the measured position
-    config.joint_action_semantics = "absolute"
+    # The 7 action values arriving at DroidEnv.step() are ABSOLUTE joint targets (the client adds
+    # the plan-time joint state back onto the model's chunk offsets, see chunk_action_reference).
     # Safety, applied in DroidEnv._joint_step: max |target - measured| per control step (rad).
     # 0.03 rad/step = 0.45 rad/s at 15 Hz: deliberately slow for the first robot tests.
     config.max_joint_step = 0.03

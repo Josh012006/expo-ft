@@ -38,7 +38,6 @@ class DroidEnv(RobotEnv):
         camera_intrinsics = None,
         camera_extrinsics = None,
         record_camera = None,
-        joint_action_semantics = "absolute",
         max_joint_step = 0.08,
         joint_limit_margin = 0.05,
         invert_gripper_observation = False,
@@ -78,17 +77,14 @@ class DroidEnv(RobotEnv):
         self._ep_count = 0
 
         # --- joint-position mode (pi05_droid_jointpos) ----------------------
-        # Active when action_space == "joint_position". The 8D action is then
-        # [7 joint targets, gripper]. "absolute": the 7 values ARE the joint targets
-        # (what openpi's serving returns for pi05_droid_jointpos, and what DROID's own
-        # joint_position action space consumes). "step_delta": they are per-step
-        # increments added to the measured joint position. Either way every target is
-        # rate-limited (max_joint_step rad per control step, relative to the MEASURED
-        # position) and clipped to the Franka joint limits before it reaches the robot.
+        # Active when action_space == "joint_position". The 8D action is [7 ABSOLUTE joint
+        # targets, gripper]: what openpi's serving returns for pi05_droid_jointpos (the client
+        # adds the plan-time joint state back onto the model's chunk offsets, see
+        # scripts/eval_policy.py `chunk_action_reference`), and what DROID's own joint_position
+        # action space consumes. Every target is rate-limited (max_joint_step rad per control
+        # step, relative to the MEASURED position) and clipped to the Franka joint limits
+        # before it reaches the robot.
         self._joint_mode = (action_space == "joint_position")
-        if joint_action_semantics not in ("absolute", "step_delta"):
-            raise ValueError(f"joint_action_semantics must be 'absolute' or 'step_delta', got {joint_action_semantics!r}")
-        self._joint_semantics = joint_action_semantics
         self._max_joint_step = float(max_joint_step)
         self._joint_limit_margin = float(joint_limit_margin)
         # In the DROID fork, robot_state["gripper_position"] = width / max_width (1 = OPEN)
@@ -243,7 +239,7 @@ class DroidEnv(RobotEnv):
             raise RuntimeError("joint_position step() needs a prior reset()/get_observation() for the measured state.")
 
         q = np.asarray(self._read_joint_position(self.prev_obs), dtype=np.float64)
-        target = action[:7].copy() if self._joint_semantics == "absolute" else q + action[:7]
+        target = action[:7].copy()
 
         # 1) rate limit, relative to the measured position
         target = q + np.clip(target - q, -self._max_joint_step, self._max_joint_step)

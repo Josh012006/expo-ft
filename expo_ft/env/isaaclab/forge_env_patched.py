@@ -10,10 +10,14 @@ both confined to this file:
 2. Action interface. Stock FORGE's `_apply_action` consumes a 7D task-space
    vector (pos delta 3 + rot delta 3 [yaw survives] + success-pred 1) and
    drives a hand-written task-space impedance controller. pi05_droid_jointpos
-   outputs something structurally different: an 8D vector — a joint-position
-   DELTA for the 7 arm joints (relative to the current joint state, confirmed
-   against multiple independent sources — NOT already absolute) plus an
-   absolute gripper target. There is no configuration flag in FORGE to accept
+   outputs something structurally different: an 8D vector — 7 ABSOLUTE
+   joint-position targets plus a gripper command (0 = open, 1 = closed).
+   (The raw network output is a chunk of OFFSETS from the joint state at plan
+   time — openpi's DeltaActions encoding; the client adds that state back, the
+   equivalent of openpi's AbsoluteActions: scripts/eval_policy.py,
+   `chunk_action_reference`. What reaches this server is therefore already
+   absolute, and nothing here depends on the live joint position.)
+   There is no configuration flag in FORGE to accept
    this; `_apply_action` is overridden here instead of built as a translation
    layer on top of the original, because the two are physically different
    quantities (Cartesian pose vs. joint position) with no lossless conversion
@@ -24,13 +28,13 @@ both confined to this file:
    isaaclab_tasks/direct/factory/factory_env_cfg.py) are overridden back to
    Isaac Lab's own defaults (80.0 / 4.0) at config-build time in
    forge_server.py, so PhysX's already-existing implicit PD actuator does the
-   compliant tracking — exactly what ManiSkill's `pd_joint_delta_pos` control
-   mode already provides elsewhere in this project. `_apply_action` here is
-   just: current + delta -> set_joint_position_target.
+   compliant tracking — the same PD joint tracking ManiSkill's pd_joint_*
+   controllers provide elsewhere in this project. `_apply_action` here is
+   just: absolute target -> set_joint_position_target.
 
    `_pre_physics_step` is also overridden to skip FORGE's own EMA action
    smoothing (`ema_factor`), which was tuned for the task-space action's
-   scale/semantics and has no established meaning for a joint-position delta.
+   scale/semantics and has no established meaning for a joint-position target.
 
 TODO (flagged, not blocking): gripper normalization. The 8th action
 dimension is passed through as a joint-position target for both finger
@@ -71,7 +75,7 @@ def _look_at_quat_opengl(eye, target):
 
 
 class ForgeEnvJointPosPi05(ForgeEnv):
-    """FORGE + cameras + 8D joint-position-delta action interface."""
+    """FORGE + cameras + 8D action interface: 7 absolute joint targets + gripper."""
 
     def __init__(self, cfg, render_mode=None, gripper_can_open: bool = True, **kwargs):
         """gripper_can_open: when False, the policy's gripper channel
@@ -111,20 +115,14 @@ class ForgeEnvJointPosPi05(ForgeEnv):
         self.scene.sensors["wrist_cam"] = self._wrist_cam
 
     def _pre_physics_step(self, action):
-        """Compute and cache the joint-position TARGET once per env.step()
-        (this is called once), not once per decimation substep. This is the
-        fix for the bug found in testing: _apply_action runs `decimation`
-        times (8) per env.step() (confirmed in isaaclab's DirectRLEnv.step()),
-        and the original version recomputed `self.joint_pos + delta_arm`
-        fresh on every one of those calls using the LIVE, already-moving
-        joint position — so the delta kept getting re-added on top of
-        wherever the arm had already drifted to mid-step, instead of being
-        applied once. FORGE's own original _apply_action never hits this
-        because it targets a essentially-static reference frame (the fixed
-        asset's observed pose, not the live end-effector position); our
-        joint-delta action has no such stable frame to lean on, so the
-        target has to be captured explicitly, once, before the decimation
-        loop starts — exactly like ManiSkill's pd_joint_delta_pos does.
+        """Cache the joint-position TARGET once per env.step().
+
+        _apply_action runs `decimation` (8) times per env.step() (isaaclab's
+        DirectRLEnv.step()); the target is computed here, once, and held fixed
+        across those sub-steps. With absolute targets it does not depend on the
+        live joint position at all, so there is nothing to drift between
+        sub-steps (an earlier version added a per-step increment to the live
+        position on every sub-step and compounded it).
 
         No EMA smoothing of the action itself (see module docstring).
         """
@@ -136,11 +134,11 @@ class ForgeEnvJointPosPi05(ForgeEnv):
         if self.last_update_timestamp < self._robot._data._sim_timestamp:
             self._compute_intermediate_values(dt=self.physics_dt)
 
-        delta_arm = self.actions[:, 0:7]
-        gripper_cmd = self.actions[:, 7]  # assumed DROID convention: 0=open, 1=closed
+        arm_target = self.actions[:, 0:7]     # absolute joint targets (rad)
+        gripper_cmd = self.actions[:, 7]      # DROID convention: 0=open, 1=closed
 
         target = self.ctrl_target_joint_pos.clone()
-        target[:, 0:7] = self.joint_pos[:, 0:7] + delta_arm  # current pos read ONCE, here
+        target[:, 0:7] = arm_target           # used as-is: no dependence on the live position
         if self._gripper_can_open:
             finger_width = (1.0 - gripper_cmd).clamp(0.0, 1.0) * GRIPPER_OPEN_WIDTH
             target[:, 7:9] = finger_width.unsqueeze(-1)

@@ -72,3 +72,8 @@ max_steps_per_episode: 150
 # max_steps_per_episode — a reactivity/compute tradeoff, worth revisiting
 # once real rollout behavior is visible.
 replan_steps: 8
+
+# pi05_droid_jointpos outputs a chunk of OFFSETS from the joint state at plan time (openpi
+# DeltaActions encoding), not per-step increments. eval_policy.py adds that state back once per
+# chunk (= openpi's AbsoluteActions), so the server receives ABSOLUTE joint targets.
+chunk_action_reference: "chunk_start_state"
