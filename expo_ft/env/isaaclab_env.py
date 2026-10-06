@@ -77,10 +77,12 @@ class IsaacLabEnvWrapper:
 
     def step(self, action):
         """Returns (real_executed_action, action_type), matching
-        ManiSkillEnvWrapper.step. `action` is the raw 8D output of
-        pi05_droid_jointpos (7 joint-position deltas + gripper) — no
-        client-side math: the server adds the delta to its own live joint
-        state in _apply_action, since it owns the authoritative physics."""
+        ManiSkillEnvWrapper.step. `action` is 8D: 7 ABSOLUTE joint targets
+        (rad) + the gripper command (0 = open, 1 = closed). The model's raw
+        chunk is a set of OFFSETS from the joint state at plan time; the
+        caller converts it once per chunk (scripts/eval_policy.py,
+        `chunk_action_reference`) — nothing is added to the live state here
+        or on the server."""
         action = np.array(action, dtype=np.float32)
         real_action, action_type = self._client.step(action)
         done, success, reward, _mask = self._client.get_info_for_step()

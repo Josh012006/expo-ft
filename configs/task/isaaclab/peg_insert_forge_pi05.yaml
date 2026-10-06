@@ -51,7 +51,7 @@ camera_height: 224
 camera_width: 224
 state_obs_key: "observation/joint_position"
 state_obs_dim: 7
-output_action_dim: 8   # 7 joint-position deltas + gripper
+output_action_dim: 8   # 7 absolute joint-position targets + gripper command (0 open, 1 closed)
 
 # -- Rollout ------------------------------------------------------------------
 # Episode length, in STEPS, read by BOTH sides — one field, not two:

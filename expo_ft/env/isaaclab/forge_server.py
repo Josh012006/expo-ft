@@ -103,7 +103,7 @@ def build_env(cfg_yaml: dict):
     for group in ("panda_arm1", "panda_arm2"):
         env_cfg.robot.actuators[group].stiffness = 80.0
         # damping=4 is Isaac Lab's own FRANKA_PANDA_CFG default; too soft to
-        # track a deliberate joint-delta move precisely (round-trip test
+        # track a deliberate joint move precisely (round-trip test
         # error ~0.09 rad at this value). Bumped to 40 for tracking accuracy
         # only — the earlier drift that first motivated this change turned
         # out to be an unrelated bug (a stale set_joint_effort_target() left
@@ -174,8 +174,8 @@ class ForgeBackend:
             # Ground truth INDEPENDENT of our _apply_action: computed by
             # FORGE's own _compute_intermediate_values (inherited, unmodified)
             # from the robot's actual simulated rigid-body pose, not from
-            # anything our joint-delta code writes. Used to check that a
-            # joint-space delta produces sensible, smooth EEF-space motion,
+            # anything our joint-target code writes. Used to check that a
+            # joint-space target produces sensible, smooth EEF-space motion,
             # not just a round trip in joint-angle terms.
             pos = self.env.fingertip_midpoint_pos[0].detach().cpu().numpy().tolist()
             quat = self.env.fingertip_midpoint_quat[0].detach().cpu().numpy().tolist()
