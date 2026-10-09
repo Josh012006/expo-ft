@@ -40,10 +40,19 @@ turns it into 7 joint targets with FORGE's own damped-least-squares IK -> `step`
 The label of a frame is the joint-target vector that was actually sent. No relabelling is ever
 needed, and the arm tracks it with the same PD controller the policy will use.
 
+Diagnosis tools (added after the first runs, where `align` never finished)
+--------------------------------------------------------------------------
+  --video-dir DIR     write one mp4 per attempt (exterior | wrist, with step / waypoint / offset
+                      printed under the images) for successes AND failures
+  --align-tol-mm X    xy error (mm) under which `align` is considered done (default 0.2). Raising it
+                      lets the descent start, to see what the peg does at the hole
+  --probe             collect nothing: measure how the arm answers to tiny joint commands, to find
+                      the dead zone seen at the end of the failed attempts (see run_probe)
+
 Usage (server already running, restarted after the forge_server.py change):
     python scripts/isaaclab/collect_waypoint_demos.py \
         --config configs/task/isaaclab/peg_insert_forge_pi05.yaml \
-        --out data/forge_waypoints --num-episodes 20
+        --out demos/isaaclab/ForgePegInsert --num-episodes 20
 """
 import argparse
 import json
@@ -59,11 +68,12 @@ from expo_ft.env.env_client import EnvClient
 # ---- Waypoint parameters (metres unless stated) -----------------------------------------------
 HOVER_MARGIN = 0.010      # peg base is kept this far above the hole's top edge before going in
 INSERT_PUSH = 0.002       # aim this far BELOW the final depth: presses the peg to the bottom
-ALIGN_TOL = 0.0002        # "centred over the hole" = xy error below 0.2 mm (clearance is 0.11 mm)
+ALIGN_TOL_MM = 0.2        # default of --align-tol-mm: "centred over the hole" = xy error below 0.2 mm
 MAX_JOINT_STEP = 0.05     # safety: never command a joint more than this (rad) from its measured angle
 GRIPPER_CLOSED = 1.0      # 0 = open, 1 = closed (DROID convention); the peg stays held all episode
 GRIPPER_TOL = 0.001       # finger position may drift at most 1 mm from its value at reset
 HOLD_AFTER_SUCCESS = 5    # keep recording this many steps once inserted, then stop the episode
+BANNER_H = 32             # height (px) of the text strip under the video frames (224 + 32 = 256: no resize)
 
 
 class Waypoint(NamedTuple):
@@ -74,13 +84,13 @@ class Waypoint(NamedTuple):
     reached: Callable         # offset -> True when we can move on to the next waypoint
 
 
-def make_waypoints(hole_depth):
+def make_waypoints(hole_depth, align_tol):
     hover_z = hole_depth + HOVER_MARGIN                  # offset z of the "above the hole" point
     return [
         Waypoint("lift",   lambda o: (o[0], o[1], hover_z),  0.0,    0.005,  # keep x, y: straight up
                  lambda o: o[2] >= hover_z - 0.002),
         Waypoint("align",  lambda o: (0.0, 0.0, hover_z),    0.005,  0.003,
-                 lambda o: np.linalg.norm(o[:2]) < ALIGN_TOL and abs(o[2] - hover_z) < 0.002),
+                 lambda o: np.linalg.norm(o[:2]) < align_tol and abs(o[2] - hover_z) < 0.002),
         Waypoint("insert", lambda o: (0.0, 0.0, -INSERT_PUSH), 0.0005, 0.0015,  # slow, x, y kept tight
                  lambda o: False),                                              # last one: never "done"
     ]
@@ -97,10 +107,34 @@ RECORDED = {
 }
 
 
-def run_episode(client, env_id, seed, geom, args, rng):
-    """One scripted attempt. Returns (arrays_to_save, info_dict)."""
-    def debug(kind, **kw):   # simulation-only helper ops of forge_server.py
+def make_debug(client, env_id):
+    """Simulation-only helper ops of forge_server.py (a real robot has none of them)."""
+    def debug(kind, **kw):
         return client._call_operation("debug", {"env_id": env_id, "kind": kind, **kw})["result"]
+    return debug
+
+
+# ---- Video ------------------------------------------------------------------------------------
+def video_frame(obs, text):
+    """Exterior and wrist images side by side, with a one-line text strip under them."""
+    from PIL import Image, ImageDraw
+    ext = np.asarray(obs["observation/exterior_image_1_left"], dtype=np.uint8)
+    wrist = np.asarray(obs["observation/wrist_image_left"], dtype=np.uint8)
+    images = np.concatenate([ext, wrist], axis=1)
+    banner = Image.new("RGB", (images.shape[1], BANNER_H), (0, 0, 0))
+    ImageDraw.Draw(banner).text((4, 11), text, fill=(255, 255, 255))
+    return np.concatenate([images, np.asarray(banner)], axis=0)
+
+
+def write_video(path, frames, fps):
+    import imageio.v3 as iio      # same call as IsaacLabEnvWrapper uses for the eval videos
+    iio.imwrite(str(path), np.stack(frames), fps=fps, codec="libx264")
+
+
+# ---- One scripted attempt ---------------------------------------------------------------------
+def run_episode(client, env_id, seed, geom, args, rng):
+    """One scripted attempt. Returns (arrays_to_save, info_dict, video_frames)."""
+    debug = make_debug(client, env_id)
 
     def finger_width():                          # finger joint position in metres (server-side ground truth)
         return float(debug("finger_width"))
@@ -109,13 +143,15 @@ def run_episode(client, env_id, seed, geom, args, rng):
     width0 = finger_width()                      # grasp width at reset: must not change
     gripper_moved, max_drift = False, 0.0
     quat0 = debug("fingertip_pose")["quat"]      # fingertip orientation to hold for the whole episode
-    waypoints = make_waypoints(geom["hole_depth"])
+    waypoints = make_waypoints(geom["hole_depth"], args.align_tol_mm * 1e-3)
     wp = 0
     entered = {waypoints[0].name: 0}             # step at which each waypoint was entered (for the log)
 
     frames = {name: [] for name in RECORDED.values()}
     actions = []
+    video = []
     in_a_row = 0                                 # consecutive steps for which FORGE says "inserted"
+    done = False
     for t in range(args.max_steps):
         offset = np.asarray(obs["extra/peg_socket_offset"], dtype=np.float64)
 
@@ -144,6 +180,10 @@ def run_episode(client, env_id, seed, geom, args, rng):
         for key, name in RECORDED.items():
             frames[name].append(np.asarray(obs[key]))
         actions.append(action)
+        if args.video_dir:
+            mm = offset * 1000.0
+            video.append(video_frame(
+                obs, f"t={t:3d}  {w.name:6s}  xy={np.hypot(mm[0], mm[1]):6.2f} mm  z={mm[2]:5.1f} mm"))
         client.step(env_id, action)
         obs = client.get_observation(env_id)
         done, inserted, _, _ = client.get_info_for_step(env_id)
@@ -158,7 +198,9 @@ def run_episode(client, env_id, seed, geom, args, rng):
 
     arrays = {name: np.stack(vals) for name, vals in frames.items()}
     arrays["actions"] = np.stack(actions)
-    final = np.asarray(obs["extra/peg_socket_offset"], dtype=np.float64)
+    # When the episode times out, env.step() has already auto-reset the simulation: `obs` is then the
+    # first observation of a NEW episode, not the end of this one. Use the last recorded frame instead.
+    final = np.asarray(arrays["peg_socket_offset"][-1] if done else obs["extra/peg_socket_offset"], dtype=np.float64)
     info = {
         "seed": seed,
         "success": in_a_row >= HOLD_AFTER_SUCCESS and not gripper_moved,
@@ -169,19 +211,81 @@ def run_episode(client, env_id, seed, geom, args, rng):
         "max_force_N": float(np.linalg.norm(arrays["ft_force"], axis=1).max()),
         "waypoint_entered_at_step": entered,
     }
-    return arrays, info
+    return arrays, info, video
 
 
+# ---- Probe: how does the arm answer to tiny joint commands? -----------------------------------
+PROBE_AMPLITUDES_MRAD = (0.25, 0.5, 1, 2, 5, 10, 20)
+PROBE_KICK = 0.020        # rad, "awake" mode: 3 steps of this size just before the measurement
+
+
+def run_probe(client, env_id, args):
+    """Collects nothing. Looks for the dead zone seen at the end of the failed attempts, where a
+    command of ~1 mrad per joint produced no motion at all.
+
+    For each amplitude a and each of two modes, the simulation is reset, the arm holds its pose for
+    10 steps, then ONE joint (--probe-joint) is commanded at (measured angle + a) for 12 steps. This
+    is exactly how the demo script builds its targets (relative to the measured angle at every step).
+      rest  : the arm has just been standing still
+      awake : same, but 3 steps of +20 mrad are sent right before, so the arm is moving
+
+    Reading the table (reference: a normal answer is ~12% of the command per step, because the PD
+    gains of the server give a time constant of about 0.5 s):
+      ~12% at every amplitude                    -> no dead zone
+      ~0% below some amplitude, ~12% above it    -> dead zone of that size, whatever the history
+      'awake' answers but 'rest' does not        -> the arm falls asleep (physics engine sleep threshold)
+    """
+    j = args.probe_joint
+
+    def advance(obs, delta):
+        q = np.asarray(obs["observation/joint_position"], dtype=np.float64)
+        target = q.copy()
+        target[j] += delta
+        client.step(env_id, np.concatenate([target, [GRIPPER_CLOSED]]).astype(np.float32))
+        return client.get_observation(env_id)
+
+    def angle(obs):
+        return float(np.asarray(obs["observation/joint_position"], dtype=np.float64)[j])
+
+    print(f"\nprobe on joint {j} (0-based); gripper closed; reset seed {args.seed}")
+    print("amplitude   mode     answer, steps 1-4   answer, steps 5-12   = % of command")
+    print("(mrad)               (mrad per step)     (mrad per step)")
+    for amp in PROBE_AMPLITUDES_MRAD:
+        for mode in ("rest", "awake"):
+            obs, _ = client.reset(env_id, args.seed)
+            for _ in range(10):                       # hold the pose
+                obs = advance(obs, 0.0)
+            if mode == "awake":
+                for _ in range(3):
+                    obs = advance(obs, PROBE_KICK)
+            moves = []
+            for _ in range(12):
+                before = angle(obs)
+                obs = advance(obs, amp * 1e-3)
+                moves.append((angle(obs) - before) * 1e3)
+            early, late = np.mean(moves[:4]), np.mean(moves[4:])
+            print(f"{amp:8.2f}   {mode:5s}   {early:14.3f}   {late:17.3f}   {100 * late / amp:10.0f} %")
+    print("\n~12% everywhere: no dead zone | ~0% for small amplitudes only: dead zone | "
+          "'awake' answers, 'rest' does not: the arm falls asleep")
+
+
+# ---- Main -------------------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True, help="Task YAML (host, port, prompt, episode length).")
-    p.add_argument("--out", default="data/forge_waypoints")
+    p.add_argument("--out", default="demos/isaaclab/ForgePegInsert")
     p.add_argument("--num-episodes", type=int, default=20, help="Successful demos to keep.")
     p.add_argument("--max-attempts", type=int, default=None, help="Default: 2 x num-episodes.")
     p.add_argument("--seed", type=int, default=0, help="Attempt i uses reset seed (seed + i): reproducible.")
     p.add_argument("--max-steps", type=int, default=None, help="Default: max_steps_per_episode of the YAML.")
     p.add_argument("--noise-mm", type=float, default=0.0, help="Gaussian xy jitter (mm) on lift/align moves.")
     p.add_argument("--save-failures", action="store_true", help="Also save failed attempts (as fail_*.npz).")
+    p.add_argument("--align-tol-mm", type=float, default=ALIGN_TOL_MM,
+                   help="xy error (mm) below which `align` is done and `insert` starts.")
+    p.add_argument("--video-dir", default=None, help="If set, write one mp4 per attempt (OK_ / FAIL_) here.")
+    p.add_argument("--video-fps", type=int, default=10)
+    p.add_argument("--probe", action="store_true", help="Run the arm-response probe instead of collecting.")
+    p.add_argument("--probe-joint", type=int, default=3, help="Joint (0-6) used by --probe.")
     args = p.parse_args()
 
     with open(args.config) as f:
@@ -192,14 +296,23 @@ def main():
     args.max_steps = args.max_steps or cfg.get("max_steps_per_episode", 150)
     max_attempts = args.max_attempts or 2 * args.num_episodes
     out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
 
     client = EnvClient(host=cfg.get("server_host", "localhost"), port=cfg.get("server_port", 8102))
     env_id, prompt = client.create_env({})
-    geom = client._call_operation("debug", {"env_id": env_id, "kind": "task_geometry"})["result"]
+
+    if args.probe:
+        run_probe(client, env_id, args)
+        return
+
+    out.mkdir(parents=True, exist_ok=True)
+    video_dir = Path(args.video_dir) if args.video_dir else None
+    if video_dir:
+        video_dir.mkdir(parents=True, exist_ok=True)
+    geom = make_debug(client, env_id)("task_geometry")
     print(f"connected: env_id={env_id!r}  hole depth={geom['hole_depth'] * 1000:.0f} mm  "
-          f"success: xy<{geom['success_xy'] * 1000:.1f} mm, z<{geom['success_z'] * 1000:.1f} mm")
+          f"success: xy<{geom['success_xy'] * 1000:.1f} mm, z<{geom['success_z'] * 1000:.1f} mm  "
+          f"align tolerance {args.align_tol_mm:g} mm")
 
     saved = 0
     attempts = 0
@@ -208,7 +321,7 @@ def main():
             seed = args.seed + attempts
             attempts += 1
             t0 = time.time()
-            arrays, info = run_episode(client, env_id, seed, geom, args, rng)
+            arrays, info, video = run_episode(client, env_id, seed, geom, args, rng)
             tag = "OK  " if info["success"] else "FAIL"
             print(f"[{tag}] seed {seed:4d}  {info['steps']:3d} steps  final offset (mm) {info['final_offset_mm']}"
                   f"  max|F| {info['max_force_N']:.1f} N  gripper drift {info['gripper_drift_mm']:.2f} mm"
@@ -223,6 +336,8 @@ def main():
                 fname = None
             if fname:
                 np.savez(out / fname, **arrays, prompt=np.array(prompt), seed=np.array(seed))
+            if video_dir:
+                write_video(video_dir / f"{tag.strip()}_seed{seed}.mp4", video, args.video_fps)
             index.write(json.dumps({**info, "file": fname}) + "\n")
             index.flush()
 

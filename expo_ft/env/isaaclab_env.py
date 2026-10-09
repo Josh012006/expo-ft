@@ -144,6 +144,11 @@ class IsaacLabEnvWrapper:
         once per step with video_dir set would get extra frames — none of
         the current callers do.)"""
         obs = self._client.get_observation()
+        if self._done:
+            # The step that ended the episode has already auto-reset the simulation (Isaac Lab
+            # resets inside env.step()): this observation belongs to the NEXT episode. Recording it
+            # would put a random start state at the end of the metrics and the video.
+            return obs
         self._record_metrics(obs)
         if self._video_dir is not None:
             # sim server emits "observation/..." keys, the real-robot server plain keys
