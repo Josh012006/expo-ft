@@ -57,7 +57,7 @@ def debug(kind):
 def hold_action(obs):
     """Command the measured pose: absolute joint targets = current joints, gripper = current."""
     q = np.asarray(obs["observation/joint_position"], dtype=np.float32).reshape(-1)
-    width = float(np.asarray(obs["observation/gripper_position"]).reshape(-1)[0])
+    width = float(debug("finger_width"))        # raw metres (the observation itself follows `gripper_obs`)
     cmd = float(np.clip(1.0 - width / GRIPPER_OPEN_WIDTH, 0.0, 1.0))
     return np.concatenate([q, [cmd]]).astype(np.float32)
 
@@ -126,7 +126,7 @@ if getattr(cfg, "gripper_can_open", True):
         a[7] = value
         for _ in range(10):
             o = step(a)
-        widths[name] = float(np.asarray(o["observation/gripper_position"]).reshape(-1)[0])
+        widths[name] = float(debug("finger_width"))
     print(f"\ngripper {widths}")
     print("GRIPPER:", "PASS" if abs(widths["open(0.0)"] - widths["close(1.0)"]) > 0.002 else "FAIL (stuck)")
 else:

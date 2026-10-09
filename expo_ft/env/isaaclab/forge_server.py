@@ -77,6 +77,7 @@ def _handle_shutdown_signal(signum, frame):
 
 
 # Everything Isaac-Sim-dependent is imported only after AppLauncher exists.
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import isaaclab.sim as sim_utils  # noqa: E402
 import isaaclab_tasks  # noqa: E402,F401  (registers Isaac-Forge-*-Direct-v0)
@@ -84,6 +85,27 @@ from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 
 from expo_ft.env.isaaclab.forge_env_patched import ForgeEnvJointPosPi05, GRIPPER_OPEN_WIDTH  # noqa: E402
 from expo_ft.env.isaaclab.ws_env_server import WsEnvServer  # noqa: E402
+
+
+GRIPPER_OBS_MODES = ("raw", "normalized", "closed")
+
+
+def gripper_obs_value(width, mode):
+    """Gripper observation sent to the policy, from the finger joint position `width` (m).
+
+    FORGE: 0.0 = fingers closed, GRIPPER_OPEN_WIDTH (0.04 m, Franka finger travel) = fully open.
+    pi05_droid_jointpos expects the DROID convention: 0 = open, 1 = closed.
+      raw        : the width in metres, unchanged (legacy behaviour, not the model's convention)
+      normalized : 1 - width / GRIPPER_OPEN_WIDTH, in [0, 1] -- the exact inverse of the mapping
+                   ForgeEnvJointPosPi05 applies to the gripper ACTION. With the peg held the
+                   fingers rest on it, so this reads ~0.9 (peg half-width 4 mm), not 1.0.
+      closed     : constant 1.0 (use only when the gripper is held closed for the whole episode)
+    """
+    if mode == "raw":
+        return width
+    if mode == "normalized":
+        return np.clip(1.0 - width / GRIPPER_OPEN_WIDTH, 0.0, 1.0)
+    return np.ones_like(width)
 
 
 def build_env(cfg_yaml: dict):
@@ -147,6 +169,9 @@ class ForgeBackend:
         self.cfg_yaml = cfg_yaml
         self.env, self.task_name = build_env(cfg_yaml)
         self.prompt = cfg_yaml.get("language_instruction", "")
+        self.gripper_obs = cfg_yaml.get("gripper_obs", "raw")
+        if self.gripper_obs not in GRIPPER_OBS_MODES:
+            raise ValueError(f"gripper_obs must be one of {GRIPPER_OBS_MODES}, got {self.gripper_obs!r}")
         self._env_id = "isaaclab_forge_0"
         self._last_done = False
         self._last_success = False
@@ -180,7 +205,61 @@ class ForgeBackend:
             pos = self.env.fingertip_midpoint_pos[0].detach().cpu().numpy().tolist()
             quat = self.env.fingertip_midpoint_quat[0].detach().cpu().numpy().tolist()
             return {"pos": pos, "quat": quat}
+        # -- Used by scripts/isaaclab/collect_waypoint_demos.py (scripted demos) --------------
+        # Simulation-only helpers: a real robot has no such op. They only READ the state of the
+        # env and return numbers; nothing here moves the arm (the client does that via "step").
+        if kind == "finger_width":      # raw finger joint position (m), whatever `gripper_obs` is
+            return float(self.env.joint_pos[0, 7])
+        if kind == "task_geometry":
+            return self._task_geometry()
+        if kind == "ik_joint_target":
+            return self._ik_joint_target(request["delta_pos"], request["target_quat"])
         return {"error": f"unknown debug kind: {kind}"}
+
+    def _task_geometry(self):
+        """Task constants the waypoint script needs, read from FORGE's own task config so the
+        client never duplicates them."""
+        task = self.env.cfg_task
+        hole_depth = float(task.fixed_asset_cfg.height)   # 0.025 m for the 8 mm PegInsert
+        return {
+            "hole_depth": hole_depth,
+            # xy tolerance is hard-coded in FactoryEnv._get_curr_successes (0.0025 m).
+            "success_xy": 0.0025,
+            # Same formula as _get_curr_successes for peg_insert: fraction of the hole depth.
+            "success_z": hole_depth * float(task.success_threshold),
+        }
+
+    def _ik_joint_target(self, delta_pos, target_quat):
+        """ONE inverse-kinematics step: the 7 ABSOLUTE joint targets that move the fingertip by
+        `delta_pos` (m, env frame) while turning it towards `target_quat` (w, x, y, z).
+
+        Uses FORGE's own IK helpers (factory_control.get_pose_error / get_delta_dof_pos, damped
+        least squares), the same ones its set_pos_inverse_kinematics() uses at reset, applied to
+        the Jacobian and joint state the env has already computed after the last step. Returns
+        q_now + dq, i.e. exactly what we would send as the arm part of a "step" action.
+        """
+        from isaaclab_tasks.direct.factory import factory_control
+
+        env = self.env
+        delta = torch.tensor(delta_pos, dtype=torch.float32, device=env.device).reshape(1, 3)
+        quat = torch.tensor(target_quat, dtype=torch.float32, device=env.device).reshape(1, 4)
+
+        pos_error, rot_error = factory_control.get_pose_error(
+            fingertip_midpoint_pos=env.fingertip_midpoint_pos,
+            fingertip_midpoint_quat=env.fingertip_midpoint_quat,
+            ctrl_target_fingertip_midpoint_pos=env.fingertip_midpoint_pos + delta,
+            ctrl_target_fingertip_midpoint_quat=quat,
+            jacobian_type="geometric",
+            rot_error_type="axis_angle",
+        )
+        dq = factory_control.get_delta_dof_pos(
+            delta_pose=torch.cat((pos_error, rot_error), dim=-1),
+            ik_method="dls",
+            jacobian=env.fingertip_midpoint_jacobian,
+            device=env.device,
+        )
+        q_target = env.joint_pos[:, 0:7] + dq[:, 0:7]
+        return q_target[0].detach().cpu().numpy().tolist()
 
     def _hold_action(self):
         """Action that keeps the arm and the gripper where they are. Actions are ABSOLUTE joint
@@ -259,7 +338,7 @@ class ForgeBackend:
         ext = env._exterior_cam.data.output["rgb"][0].cpu().numpy()
         wrist = env._wrist_cam.data.output["rgb"][0].cpu().numpy()
         joint_pos = env.joint_pos[0, 0:7].detach().cpu().numpy()
-        gripper_pos = env.joint_pos[0, 7:8].detach().cpu().numpy()
+        gripper_pos = gripper_obs_value(env.joint_pos[0, 7:8].detach().cpu().numpy(), self.gripper_obs)
         return {
             "observation/exterior_image_1_left": ext.astype("uint8"),
             "observation/wrist_image_left": wrist.astype("uint8"),

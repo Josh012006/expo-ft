@@ -3,7 +3,8 @@
 # Read by THREE different processes:
 #   - forge_server.py (in .venv-isaaclab)      reads: task_name, realtime_throttle,
 #                                                       server_host, server_port,
-#                                                       max_steps_per_episode, gripper_can_open
+#                                                       max_steps_per_episode, gripper_can_open,
+#                                                       gripper_obs
 #   - IsaacLabEnvWrapper (.venv)                reads: server_host, server_port
 #   - eval_policy.py / make_env_wrapper (.venv) reads: everything else below,
 #                                                       including max_steps_per_episode too
@@ -29,6 +30,13 @@ realtime_throttle: false
 # exists (pi05_droid_jointpos's zero-shot gripper output tends to open and
 # drop the held peg early in an episode).
 gripper_can_open: false
+
+# What the server sends as observation/gripper_position (the policy expects 0 = open, 1 = closed):
+#   normalized : 1 - finger_width / 0.04 m, in [0, 1]. Holding the peg reads ~0.9.   (recommended)
+#   closed     : constant 1.0 (only sensible together with gripper_can_open: false)
+#   raw        : finger width in metres, as before -- NOT the model's convention.
+# The server must be restarted after changing this.
+gripper_obs: closed
 
 # -- Shared (client + server) -------------------------------------------------
 server_host: "localhost"   # override to the env-server node's hostname if
