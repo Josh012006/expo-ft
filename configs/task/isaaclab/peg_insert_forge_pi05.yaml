@@ -36,7 +36,7 @@ gripper_can_open: false
 #   closed     : constant 1.0 (only sensible together with gripper_can_open: false)
 #   raw        : finger width in metres, as before -- NOT the model's convention.
 # The server must be restarted after changing this.
-gripper_obs: closed
+gripper_obs: normalized
 
 # -- Shared (client + server) -------------------------------------------------
 server_host: "localhost"   # override to the env-server node's hostname if
