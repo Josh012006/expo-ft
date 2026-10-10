@@ -39,11 +39,18 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", required=True, help="Path to the task YAML (see configs/task/isaaclab/).")
+parser.add_argument("--arm-stiffness", type=float, default=None,
+                    help="PD stiffness of the arm joints (N.m/rad). Overrides arm_stiffness of the YAML (default 80).")
+parser.add_argument("--arm-damping", type=float, default=None,
+                    help="PD damping of the arm joints (N.m.s/rad). Overrides arm_damping of the YAML (default 40).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
 with open(args.config) as f:
     cfg_yaml = yaml.safe_load(f)
+for _key in ("arm_stiffness", "arm_damping"):       # command line > YAML > default
+    if getattr(args, _key) is not None:
+        cfg_yaml[_key] = getattr(args, _key)
 
 args.headless = True
 args.enable_cameras = True
@@ -122,8 +129,14 @@ def build_env(cfg_yaml: dict):
     # ForgeEnvJointPosPi05._apply_action, the zeroed gains would otherwise
     # leave the arm with nothing to track a position target with. Values are
     # Isaac Lab's own defaults for this robot (isaaclab_assets FRANKA_PANDA_CFG).
+    # Gains: arm_stiffness / arm_damping of the YAML (or --arm-stiffness / --arm-damping), default 80 / 40.
+    # A stiffer arm follows its targets faster (time constant ~ damping / stiffness) and reacts to smaller
+    # target errors; this changes the dynamics seen by every client of this server, the policy included.
+    arm_stiffness = float(cfg_yaml.get("arm_stiffness", 80.0))
+    arm_damping = float(cfg_yaml.get("arm_damping", 40.0))
+    print(f"[forge_server] arm PD gains: stiffness={arm_stiffness:g}  damping={arm_damping:g}", flush=True)
     for group in ("panda_arm1", "panda_arm2"):
-        env_cfg.robot.actuators[group].stiffness = 80.0
+        env_cfg.robot.actuators[group].stiffness = arm_stiffness
         # damping=4 is Isaac Lab's own FRANKA_PANDA_CFG default; too soft to
         # track a deliberate joint move precisely (round-trip test
         # error ~0.09 rad at this value). Bumped to 40 for tracking accuracy
@@ -133,7 +146,20 @@ def build_env(cfg_yaml: dict):
         # fixed in _apply_action below), confirmed fixed independently of
         # this gain. This value is purely a tracking-quality choice now, no
         # longer tangled with that bug.
-        env_cfg.robot.actuators[group].damping = 40.0
+        env_cfg.robot.actuators[group].damping = arm_damping
+
+    # Optional: never let PhysX put the arm to sleep. The --probe of collect_waypoint_demos.py found that
+    # joint-target changes below ~1.5 mrad produced no motion at all (a "dead zone"); a sleeping
+    # articulation is one suspect. sleep_threshold = 0 disables sleeping. Which of the two schemas
+    # below carries the field depends on the Isaac Lab version, hence the hasattr().
+    if cfg_yaml.get("disable_sleep", False):
+        disabled = []
+        for name in ("articulation_props", "rigid_props"):
+            props = getattr(env_cfg.robot.spawn, name, None)
+            if props is not None and hasattr(props, "sleep_threshold"):
+                props.sleep_threshold = 0.0
+                disabled.append(name)
+        print(f"[forge_server] disable_sleep: sleep_threshold = 0 on {disabled}", flush=True)
 
     # One render per env step (env step = decimation physics steps).
     env_cfg.sim.render_interval = env_cfg.decimation

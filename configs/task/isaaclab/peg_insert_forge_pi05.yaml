@@ -4,7 +4,8 @@
 #   - forge_server.py (in .venv-isaaclab)      reads: task_name, realtime_throttle,
 #                                                       server_host, server_port,
 #                                                       max_steps_per_episode, gripper_can_open,
-#                                                       gripper_obs
+#                                                       gripper_obs, disable_sleep,
+#                                                       arm_stiffness, arm_damping
 #   - IsaacLabEnvWrapper (.venv)                reads: server_host, server_port
 #   - eval_policy.py / make_env_wrapper (.venv) reads: everything else below,
 #                                                       including max_steps_per_episode too
@@ -37,6 +38,18 @@ gripper_can_open: false
 #   raw        : finger width in metres, as before -- NOT the model's convention.
 # The server must be restarted after changing this.
 gripper_obs: normalized
+
+# When true, PhysX is not allowed to put the arm to sleep (sleep_threshold = 0). Tested with
+# `collect_waypoint_demos.py --probe`: it changed nothing, the dead zone is not caused by sleeping.
+disable_sleep: false
+
+# PD gains of the arm joints (code defaults: 80 / 40). 400 / 60 chosen after the comparison of the
+# scripted demos: with 80 / 40 the arm follows only ~12% of a target change per control step and ignores
+# changes below ~1.5 mrad (a minimal joint torque); with 400 / 60 it follows ~36% and the threshold falls
+# to ~0.3 mrad. This changes the dynamics every client of the server sees, the policy included.
+# Can be overridden on the command line: forge_server.py --arm-stiffness 80 --arm-damping 40
+arm_stiffness: 400
+arm_damping: 60
 
 # -- Shared (client + server) -------------------------------------------------
 server_host: "localhost"   # override to the env-server node's hostname if

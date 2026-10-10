@@ -44,6 +44,10 @@ Diagnosis tools (added after the first runs, where `align` never finished)
 --------------------------------------------------------------------------
   --video-dir DIR     write one mp4 per attempt (exterior | wrist, with step / waypoint / offset
                       printed under the images) for successes AND failures
+  --noise-mm, --hover-jitter-mm, --speed-jitter
+                      variety between demos (all 0 = every demo from the same start follows the same path);
+                      the values drawn are written to index.jsonl. The start states already differ from
+                      one seed to the next. How many demos: --num-episodes (kept) / --max-attempts.
   --align-tol-mm X    xy error (mm) under which `align` is considered done (default 0.2). Raising it
                       lets the descent start, to see what the peg does at the hole
   --probe             collect nothing: measure how the arm answers to tiny joint commands, to find
@@ -73,6 +77,7 @@ MAX_JOINT_STEP = 0.05     # safety: never command a joint more than this (rad) f
 GRIPPER_CLOSED = 1.0      # 0 = open, 1 = closed (DROID convention); the peg stays held all episode
 GRIPPER_TOL = 0.001       # finger position may drift at most 1 mm from its value at reset
 HOLD_AFTER_SUCCESS = 5    # keep recording this many steps once inserted, then stop the episode
+MIN_HOVER_MARGIN = 0.004  # smallest hover height above the hole's top edge, whatever the jitter
 BANNER_H = 32             # height (px) of the text strip under the video frames (224 + 32 = 256: no resize)
 
 
@@ -84,12 +89,13 @@ class Waypoint(NamedTuple):
     reached: Callable         # offset -> True when we can move on to the next waypoint
 
 
-def make_waypoints(hole_depth, align_tol):
-    hover_z = hole_depth + HOVER_MARGIN                  # offset z of the "above the hole" point
+def make_waypoints(hole_depth, align_tol, hover_margin=HOVER_MARGIN, speed=1.0):
+    """speed scales the per-step caps of `lift` and `align` only; `insert` keeps its slow, fixed caps."""
+    hover_z = hole_depth + hover_margin                  # offset z of the "above the hole" point
     return [
-        Waypoint("lift",   lambda o: (o[0], o[1], hover_z),  0.0,    0.005,  # keep x, y: straight up
+        Waypoint("lift",   lambda o: (o[0], o[1], hover_z),  0.0,    0.005 * speed,  # keep x, y: straight up
                  lambda o: o[2] >= hover_z - 0.002),
-        Waypoint("align",  lambda o: (0.0, 0.0, hover_z),    0.005,  0.003,
+        Waypoint("align",  lambda o: (0.0, 0.0, hover_z),    0.005 * speed,  0.003 * speed,
                  lambda o: np.linalg.norm(o[:2]) < align_tol and abs(o[2] - hover_z) < 0.002),
         Waypoint("insert", lambda o: (0.0, 0.0, -INSERT_PUSH), 0.0005, 0.0015,  # slow, x, y kept tight
                  lambda o: False),                                              # last one: never "done"
@@ -143,7 +149,11 @@ def run_episode(client, env_id, seed, geom, args, rng):
     width0 = finger_width()                      # grasp width at reset: must not change
     gripper_moved, max_drift = False, 0.0
     quat0 = debug("fingertip_pose")["quat"]      # fingertip orientation to hold for the whole episode
-    waypoints = make_waypoints(geom["hole_depth"], args.align_tol_mm * 1e-3)
+    # Per-attempt variety (all off by default): a different hover height and a different speed of the
+    # approach. The hover margin never goes below MIN_HOVER_MARGIN so the peg cannot touch the rim.
+    hover_margin = max(MIN_HOVER_MARGIN, (args.hover_margin_mm + rng.uniform(-1, 1) * args.hover_jitter_mm) * 1e-3)
+    speed = 1.0 + rng.uniform(-1, 1) * args.speed_jitter
+    waypoints = make_waypoints(geom["hole_depth"], args.align_tol_mm * 1e-3, hover_margin, speed)
     wp = 0
     entered = {waypoints[0].name: 0}             # step at which each waypoint was entered (for the log)
 
@@ -171,7 +181,9 @@ def run_episode(client, env_id, seed, geom, args, rng):
         # The server returns the 7 absolute joint targets that do it (FORGE's own DLS IK).
         q_meas = np.asarray(obs["observation/joint_position"], dtype=np.float64)
         q_ik = np.asarray(debug("ik_joint_target", delta_pos=peg_delta.tolist(), target_quat=quat0))
-        q_target = q_meas + np.clip(q_ik - q_meas, -MAX_JOINT_STEP, MAX_JOINT_STEP)
+        # --cmd-gain > 1 compensates a sluggish arm: it follows only a fraction of each (relative) target
+        # change, so asking for G times more makes the peg move at about the intended speed.
+        q_target = q_meas + np.clip(args.cmd_gain * (q_ik - q_meas), -MAX_JOINT_STEP, MAX_JOINT_STEP)
         action = np.concatenate([q_target, [GRIPPER_CLOSED]]).astype(np.float32)
         if not np.isfinite(action).all():
             raise RuntimeError(f"non-finite action at step {t} (seed {seed}): {action}")
@@ -210,6 +222,8 @@ def run_episode(client, env_id, seed, geom, args, rng):
         "final_offset_mm": (final * 1000).round(2).tolist(),
         "max_force_N": float(np.linalg.norm(arrays["ft_force"], axis=1).max()),
         "waypoint_entered_at_step": entered,
+        "hover_margin_mm": round(hover_margin * 1000, 2),
+        "approach_speed_factor": round(speed, 3),
     }
     return arrays, info, video
 
@@ -229,11 +243,11 @@ def run_probe(client, env_id, args):
       rest  : the arm has just been standing still
       awake : same, but 3 steps of +20 mrad are sent right before, so the arm is moving
 
-    Reading the table (reference: a normal answer is ~12% of the command per step, because the PD
-    gains of the server give a time constant of about 0.5 s):
-      ~12% at every amplitude                    -> no dead zone
-      ~0% below some amplitude, ~12% above it    -> dead zone of that size, whatever the history
-      'awake' answers but 'rest' does not        -> the arm falls asleep (physics engine sleep threshold)
+    Reading the table (the normal answer is a fixed share of the command per step, set by the PD gains of
+    the server: ~12% with stiffness 80 / damping 40, because the time constant is about 0.5 s):
+      the same % at every amplitude              -> no dead zone
+      ~0% below some amplitude, normal above it  -> dead zone of that size, whatever the history
+      'awake' answers but 'rest' does not        -> the arm falls asleep (tested: it does not)
     """
     j = args.probe_joint
 
@@ -265,8 +279,7 @@ def run_probe(client, env_id, args):
                 moves.append((angle(obs) - before) * 1e3)
             early, late = np.mean(moves[:4]), np.mean(moves[4:])
             print(f"{amp:8.2f}   {mode:5s}   {early:14.3f}   {late:17.3f}   {100 * late / amp:10.0f} %")
-    print("\n~12% everywhere: no dead zone | ~0% for small amplitudes only: dead zone | "
-          "'awake' answers, 'rest' does not: the arm falls asleep")
+    print("\nsame % at every amplitude: no dead zone | ~0% for small amplitudes only: dead zone")
 
 
 # ---- Main -------------------------------------------------------------------------------------
@@ -279,9 +292,17 @@ def main():
     p.add_argument("--seed", type=int, default=0, help="Attempt i uses reset seed (seed + i): reproducible.")
     p.add_argument("--max-steps", type=int, default=None, help="Default: max_steps_per_episode of the YAML.")
     p.add_argument("--noise-mm", type=float, default=0.0, help="Gaussian xy jitter (mm) on lift/align moves.")
+    p.add_argument("--hover-margin-mm", type=float, default=HOVER_MARGIN * 1000,
+                   help="Height of the peg base above the hole's top edge before the descent (mm).")
+    p.add_argument("--hover-jitter-mm", type=float, default=0.0,
+                   help="Each attempt draws its hover height uniformly in [margin - j, margin + j] (min 4 mm).")
+    p.add_argument("--speed-jitter", type=float, default=0.0,
+                   help="Each attempt scales the lift/align speed by a factor drawn in [1 - j, 1 + j] (e.g. 0.3).")
     p.add_argument("--save-failures", action="store_true", help="Also save failed attempts (as fail_*.npz).")
     p.add_argument("--align-tol-mm", type=float, default=ALIGN_TOL_MM,
                    help="xy error (mm) below which `align` is done and `insert` starts.")
+    p.add_argument("--cmd-gain", type=float, default=1.0,
+                   help="Multiplies every joint-target change sent to the arm (default 1 = unchanged).")
     p.add_argument("--video-dir", default=None, help="If set, write one mp4 per attempt (OK_ / FAIL_) here.")
     p.add_argument("--video-fps", type=int, default=10)
     p.add_argument("--probe", action="store_true", help="Run the arm-response probe instead of collecting.")
@@ -312,10 +333,11 @@ def main():
     geom = make_debug(client, env_id)("task_geometry")
     print(f"connected: env_id={env_id!r}  hole depth={geom['hole_depth'] * 1000:.0f} mm  "
           f"success: xy<{geom['success_xy'] * 1000:.1f} mm, z<{geom['success_z'] * 1000:.1f} mm  "
-          f"align tolerance {args.align_tol_mm:g} mm")
+          f"align tolerance {args.align_tol_mm:g} mm  command gain {args.cmd_gain:g}")
 
     saved = 0
     attempts = 0
+    step_counts = []                                  # length of the successful attempts
     with open(out / "index.jsonl", "a") as index:
         while saved < args.num_episodes and attempts < max_attempts:
             seed = args.seed + attempts
@@ -330,6 +352,7 @@ def main():
             if info["success"]:
                 fname = f"ep_{saved:04d}_seed{seed}.npz"
                 saved += 1
+                step_counts.append(info["steps"])
             elif args.save_failures:
                 fname = f"fail_seed{seed}.npz"
             else:
@@ -342,6 +365,9 @@ def main():
             index.flush()
 
     print(f"\nkept {saved}/{attempts} attempts as demos  ->  {out}")
+    if step_counts:
+        print(f"successful attempts: {len(step_counts)}, mean length {np.mean(step_counts):.0f} steps "
+              f"(max allowed {args.max_steps})")
 
 
 if __name__ == "__main__":
