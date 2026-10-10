@@ -1,11 +1,16 @@
 #!/bin/bash
-#SBATCH --job-name=forge-eval-test
+# Usage:
+#   sbatch jobs/run_forge_eval_job.sh                                   # zero-shot pi05_droid_jointpos, 5 episodes
+#   sbatch jobs/run_forge_eval_job.sh <sft_checkpoint_step_dir> [N]      # SFT checkpoint, N episodes (default 5)
+#     e.g. sbatch jobs/run_forge_eval_job.sh logs/forge_sft/expo_pi05_droid_lora_finetune_sft_joint_state_delta/forge_A/4000 20
+#
+#SBATCH --job-name=forge-eval
 #SBATCH --ntasks=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --time=00:40:00
+#SBATCH --time=01:30:00
 #SBATCH --signal=B:TERM@300
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=josue.mongan@mila.quebec
@@ -14,8 +19,9 @@
 #SBATCH --no-requeue
 
 # Server + client, same node, same GPU, one allocation — the sbatch version
-# of the two-tmux-window workflow. First test: short --time, 5 episodes, so
+# of the two-tmux-window workflow. Defaults to a short test (5 episodes) so
 # a mistake costs a few minutes, not an abandoned long-running job.
+# An episode takes about 35 s: 20 episodes ~ 12 min, 50 episodes ~ 30 min (+ ~5 min start-up).
 #
 # Cancel-safety: `trap cleanup EXIT TERM INT` below fires on normal script
 # completion AND on scancel (SLURM sends TERM, with a grace period before
@@ -23,6 +29,9 @@
 # never left pending/orphaned on the node.
 
 set -u  # catch unset-variable typos; NOT set -e (would fight the trap/background logic)
+
+CHECKPOINT="${1:-}"        # optional: SFT checkpoint STEP directory (the folder that contains params/)
+N_EPISODES="${2:-5}"
 
 REPO_ROOT="$HOME/projects/expo-ft"
 CONFIG="configs/task/isaaclab/peg_insert_forge_pi05.yaml"
@@ -88,11 +97,20 @@ if [ "$READY" -ne 1 ]; then
 fi
 echo "[server] ready after $((i * 5))s."
 
-echo "[client] running eval..."
+echo "[client] running eval (checkpoint: ${CHECKPOINT:-none, base weights}, episodes: $N_EPISODES)..."
 source .venv/bin/activate
+CKPT_ARGS=()
+if [ -n "$CHECKPOINT" ]; then
+    if [ ! -d "$CHECKPOINT/params" ]; then
+        echo "FATAL: $CHECKPOINT/params not found (pass the checkpoint STEP directory)"
+        exit 1
+    fi
+    CKPT_ARGS=(--checkpoint "$CHECKPOINT")
+fi
 python scripts/eval_policy.py \
     --config "$CONFIG" \
-    --n-episodes 5 \
+    --n-episodes "$N_EPISODES" \
+    ${CKPT_ARGS[@]+"${CKPT_ARGS[@]}"} \
     --video-dir "logs/eval_videos/${SLURM_JOB_NAME}_${SLURM_JOB_ID}"
 CLIENT_STATUS=$?
 
