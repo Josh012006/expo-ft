@@ -88,3 +88,18 @@ def get_sft_config_name(cfg: SimpleNamespace) -> str:
             return "expo_pi05_droid_full_finetune_sft_cartesian_state"
         else:
             return "expo_pi05_droid_full_finetune_sft_joint_state"
+
+
+def get_sft_train_config_name(cfg: SimpleNamespace) -> str:
+    """
+    openpi TrainConfig used by the SFT *training* stage only.
+
+    A task YAML can force it with `sft_train_config_name` (FORGE: the "..._joint_state_delta" config, which
+    turns the demos' absolute joint targets into chunk offsets at training time). Without that key this is
+    get_sft_config_name(cfg), i.e. unchanged for the ManiSkill tasks.
+
+    Everything else (eval, norm_stats, RL) keeps calling get_sft_config_name(), so a checkpoint trained with the
+    delta config is still loaded with the plain "..._joint_state" config: same model, the offsets are
+    handled by the client (chunk_action_reference: chunk_start_state).
+    """
+    return getattr(cfg, "sft_train_config_name", None) or get_sft_config_name(cfg)

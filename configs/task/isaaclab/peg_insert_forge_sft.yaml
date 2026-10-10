@@ -1,0 +1,43 @@
+# configs/task/isaaclab/peg_insert_forge_sft.yaml
+#
+# SFT (LoRA) of pi05_droid_jointpos on the FORGE PegInsert waypoint demos.
+# Read by scripts/run_pipeline.py --stage sft (launched by jobs/job_forge_sft.sh).
+# Modelled on configs/task/maniskill/*_sft.yaml: only the keys the SFT stage reads, plus the FORGE-specific ones.
+# Eval of the resulting checkpoints uses configs/task/isaaclab/peg_insert_forge_pi05.yaml (not this file).
+
+# -- Data -----------------------------------------------------------------------
+# LeRobot dataset = <lerobot_home>/<lerobot_repo_id>, written by
+#   scripts/isaaclab/convert_waypoint_demos_to_lerobot.py --output-dir <lerobot_home> --repo-name <lerobot_repo_id>
+# lerobot_home is FORGE-specific: run_pipeline.py exports it as HF_LEROBOT_HOME (default demos/lerobot for ManiSkill).
+lerobot_home: "demos/isaaclab/lerobot"
+lerobot_repo_id: "expo_ft/forge_peg_insert"
+language_instruction: "Insert the peg into the socket."   # for reference: the conversion stores the prompt of the .npz files
+
+# -- openpi config (FORGE-specific) -----------------------------------------------
+# The demos store ABSOLUTE joint targets; this config turns the 7 joints into offsets from the chunk-start state
+# at training time (DeltaActions), like the pi05_droid_jointpos weights. Normalization "A": official DROID
+# norm_stats of pi05_droid_jointpos, reloaded (not recomputed). LoRA, lr 2.5e-5 constant, batch/steps below.
+# Only the SFT training stage uses it; eval / norm_stats / RL keep the plain "..._joint_state" config
+# (get_sft_config_name) with use_cartesian_state=false, see peg_insert_forge_pi05.yaml.
+sft_train_config_name: "expo_pi05_droid_lora_finetune_sft_joint_state_delta"
+
+# -- Run / Logging ------------------------------------------------------------------
+project_name: "expo-ft"
+run_name: "forge_peg_insert_sft"
+# A timestamped subdir <run_name>_<date>-<slurm job id> is created per run, SFT checkpoints are written in
+# <that dir>/sft/<config>/<sft_exp_name>_.../<step>/. Override from the command line:
+#   sbatch jobs/job_forge_sft.sh .venv configs/task/isaaclab/peg_insert_forge_sft.yaml <output_dir>
+output_dir: "logs/forge_peg_insert"
+
+# -- SFT warmup ------------------------------------------------------------------------
+sft_exp_name: "forge_peg_insert_sft"
+sft_num_workers: 12
+# openpi runs `for step in range(num_train_steps)`: 4001 -> 4001 gradient updates, last step index 4000.
+# With save_interval 200 the checkpoints are 200, 400, ..., 4000 (4000 would stop at 3999 and name the last one 3999).
+sft_num_train_steps: 4001
+sft_batch_size: 64
+sft_save_interval: 200      # each checkpoint holds the whole model (several GB): 20 of them are kept
+sft_log_interval: 100
+sft_resume: true            # no effect on a fresh run (new run dir); continues <sft_resume_dir> if set
+sft_resume_dir: null        # e.g. "logs/forge_peg_insert/forge_peg_insert_sft_2026-10-09_12-00-00-1234567"
+num_data_sft: 50             # 0 = all episodes of the dataset (50). N > 0 -> first N episodes, exp_name gets "_demosN"

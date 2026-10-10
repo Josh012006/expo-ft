@@ -11,6 +11,9 @@ Usage:
     python scripts/run_pipeline.py --config configs/task/stack_cube.yaml --stage norm_stats
     python scripts/run_pipeline.py --config configs/task/stack_cube.yaml --stage sft
     python scripts/run_pipeline.py --config configs/task/stack_cube.yaml --stage rl
+
+    --output-dir DIR overrides the YAML's output_dir (where the timestamped run folder, and so the SFT
+    checkpoints, are written).
 """
 
 import argparse
@@ -23,10 +26,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from expo_ft.utils.config_loader import load_task_config, resolve_run_dir, get_sft_config_name
+from expo_ft.utils.config_loader import (
+    load_task_config, resolve_run_dir, get_sft_config_name, get_sft_train_config_name,
+)
 
-# LeRobot dataset home — same as in convert_maniskill_to_lerobot.py
-os.environ["HF_LEROBOT_HOME"] = str(REPO_ROOT / "demos" / "lerobot")
+# LeRobot dataset home: cfg.lerobot_home if the YAML sets it (FORGE: demos/isaaclab/lerobot), otherwise
+# demos/lerobot (ManiSkill, same as convert_maniskill_to_lerobot.py). Exported in main() once the YAML is loaded.
+DEFAULT_LEROBOT_HOME = "demos/lerobot"
 
 OPENPI_SCRIPTS = REPO_ROOT / "expo_ft" / "agents" / "vla" / "openpi" / "scripts"
 TRAIN_PI_ROBO  = REPO_ROOT / "train_pi_robo.py"
@@ -115,6 +121,11 @@ def stage_sft(cfg, args, run_dir):
     """SFT warmup — fine-tune π₀.₅ on the demo dataset."""
     sft_output = os.path.join(run_dir, "sft")
 
+    dataset_dir = Path(os.environ["HF_LEROBOT_HOME"]) / cfg.lerobot_repo_id
+    if not dataset_dir.is_dir():
+        sys.exit(f"FATAL: LeRobot dataset not found: {dataset_dir} "
+                 f"(HF_LEROBOT_HOME={os.environ['HF_LEROBOT_HOME']}, lerobot_repo_id={cfg.lerobot_repo_id})")
+
     # num_data_sft (0 = use every episode) comes straight from the task YAML now —
     # auto-namespace the exp_name so a limited-demo run never collides with (or
     # overwrites) the full-dataset run's checkpoints.
@@ -125,7 +136,7 @@ def stage_sft(cfg, args, run_dir):
     cmd = [
         "uv", "run",
         str(OPENPI_SCRIPTS / "train.py"),
-        get_sft_config_name(cfg),
+        get_sft_train_config_name(cfg),
         "--exp-name", sft_exp_name,
         "--data.repo-id", cfg.lerobot_repo_id,
         "--assets-base-dir", "./assets",
@@ -217,9 +228,24 @@ def main():
              "checkpoint, NOT SFT-finetuned — only appropriate if you deliberately "
              "want to skip SFT, e.g. for the SFT-warmup-necessity ablation).",
     )
+    parser.add_argument(
+        "--output-dir", default=None,
+        help="Overrides output_dir of the YAML: the run folder <output-dir>/<run_name>_<timestamp>-<jobid> is "
+             "created there and the SFT checkpoints go to <run folder>/sft/<config>/<exp_name>/<step>/. "
+             "SFT / all stages only.",
+    )
     args = parser.parse_args()
+    if args.output_dir and args.stage in ("demos", "norm_stats", "rl"):
+        parser.error("--output-dir only applies to the sft and all stages")
 
     cfg = load_task_config(args.config)
+    if args.output_dir:
+        cfg.output_dir = args.output_dir
+
+    lerobot_home = Path(getattr(cfg, "lerobot_home", DEFAULT_LEROBOT_HOME))
+    if not lerobot_home.is_absolute():
+        lerobot_home = REPO_ROOT / lerobot_home
+    os.environ["HF_LEROBOT_HOME"] = str(lerobot_home)
 
     # resolve_run_dir() creates the directory immediately (os.makedirs) — only
     # call it when the requested stage actually writes there. SFT writes
