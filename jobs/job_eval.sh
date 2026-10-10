@@ -1,20 +1,23 @@
 #!/bin/bash
 # Usage:
-#   sbatch job_eval.sh <venv_name> <config_path> <n_episodes> [checkpoint] [rl_checkpoint]
+#   sbatch jobs/job_eval.sh [--venv NAME] [--config PATH] [--n-episodes N] [--checkpoint DIR] [--rl-checkpoint DIR]
+#     --venv           virtualenv to activate (default .venv)
+#     --config         task YAML (default configs/task/maniskill/stack_cube.yaml)
+#     --n-episodes     number of evaluation episodes (default 200)
+#     --checkpoint     SFT/openpi-style checkpoint path — evaluates the frozen VLA only.
+#     --rl-checkpoint  RL/EXPOLearner checkpoint STEP directory (e.g.
+#                      .../checkpoints/40000) — loads the full trained agent (VLA + residual
+#                      policy + critic) and evaluates with only_base_actions=False.
+#   (sbatch's own options, e.g. --time, go BEFORE the script name; everything after it is read by this script)
 #
-# checkpoint: SFT/openpi-style checkpoint path — evaluates the frozen VLA only.
-# rl_checkpoint: RL/EXPOLearner checkpoint STEP directory (e.g.
-#   .../checkpoints/40000) — loads the full trained agent (VLA + residual
-#   policy + critic) and evaluates with only_base_actions=False.
-#
-# Pass only one of the two. If both are given, rl_checkpoint wins.
+# Pass only one of --checkpoint / --rl-checkpoint. If both are given, --rl-checkpoint wins.
 #
 # Examples:
-#   sbatch job_eval.sh .venv configs/task/maniskill/stack_cube.yaml 200
-#   sbatch job_eval.sh .venv configs/task/maniskill/stack_cube.yaml 200 \
-#       logs/stack_cube/.../sft/.../3999
-#   sbatch job_eval.sh .venv configs/task/maniskill/stack_cube.yaml 200 "" \
-#       logs/stack_cube/.../checkpoints/40000
+#   sbatch jobs/job_eval.sh --venv .venv --config configs/task/maniskill/stack_cube.yaml --n-episodes 200
+#   sbatch jobs/job_eval.sh --venv .venv --config configs/task/maniskill/stack_cube.yaml --n-episodes 200 \
+#       --checkpoint logs/stack_cube/.../sft/.../3999
+#   sbatch jobs/job_eval.sh --venv .venv --config configs/task/maniskill/stack_cube.yaml --n-episodes 200 \
+#       --rl-checkpoint logs/stack_cube/.../checkpoints/40000
 #
 #SBATCH --job-name=expo_eval
 #SBATCH --ntasks=1
@@ -29,14 +32,39 @@
 #SBATCH --output=logs/eval_%j.out
 #SBATCH --no-requeue
 
-VENV=${1:-.venv}
-CONFIG=${2:-configs/task/maniskill/stack_cube.yaml}
-N_EPISODES=${3:-200}
-CHECKPOINT=${4:-}
-RL_CHECKPOINT=${5:-}
+usage() {
+    cat <<'EOF'
+Usage: sbatch jobs/job_eval.sh [--venv NAME] [--config PATH] [--n-episodes N] [--checkpoint DIR] [--rl-checkpoint DIR]
+  --venv           virtualenv to activate (default .venv)
+  --config         task YAML (default configs/task/maniskill/stack_cube.yaml)
+  --n-episodes     number of evaluation episodes (default 200)
+  --checkpoint     SFT/openpi-style checkpoint path (frozen VLA only)
+  --rl-checkpoint  RL/EXPOLearner checkpoint STEP directory (full trained agent); wins over --checkpoint
+EOF
+}
+need_value() {   # need_value <flag> <number of remaining args> <next arg>
+    if [[ $2 -lt 2 || "$3" == --* ]]; then echo "ERROR: $1 needs a value" >&2; exit 1; fi
+}
+
+VENV=.venv
+CONFIG=configs/task/maniskill/stack_cube.yaml
+N_EPISODES=200
+CHECKPOINT=
+RL_CHECKPOINT=
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --venv) need_value "$1" "$#" "${2-}"; VENV="$2"; shift 2 ;;
+        --config) need_value "$1" "$#" "${2-}"; CONFIG="$2"; shift 2 ;;
+        --n-episodes) need_value "$1" "$#" "${2-}"; N_EPISODES="$2"; shift 2 ;;
+        --checkpoint) need_value "$1" "$#" "${2-}"; CHECKPOINT="$2"; shift 2 ;;
+        --rl-checkpoint) need_value "$1" "$#" "${2-}"; RL_CHECKPOINT="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
 
 cd ~/projects/expo-ft
-source scripts/setup_env.sh "$VENV"
+source scripts/setup_env.sh --venv "$VENV" || exit 1
 python3 scripts/eval_policy.py \
     --config "$CONFIG" \
     --n-episodes "$N_EPISODES" \

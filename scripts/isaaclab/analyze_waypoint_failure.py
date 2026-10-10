@@ -2,7 +2,7 @@
 
 Needs only numpy and the saved files (no server, no GPU):
 
-    python scripts/isaaclab/analyze_waypoint_failure.py demos/isaaclab/ForgePegInsert/fail_seed*.npz
+    python scripts/isaaclab/analyze_waypoint_failure.py --files demos/isaaclab/ForgePegInsert/fail_seed*.npz
 
 For every file it answers three questions, in this order.
 
@@ -100,7 +100,7 @@ def analyze(path, every, tail):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("files", nargs="+", help="fail_seed*.npz or ep_*.npz")
+    p.add_argument("--files", nargs="+", required=True, help="fail_seed*.npz or ep_*.npz (one or more)")
     p.add_argument("--every", type=int, default=15, help="print the offset every N steps")
     p.add_argument("--tail", type=int, default=50, help="length of the end-of-episode window of section 4")
     args = p.parse_args()

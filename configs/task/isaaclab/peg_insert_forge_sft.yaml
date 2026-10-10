@@ -26,7 +26,7 @@ project_name: "expo-ft"
 run_name: "forge_peg_insert_sft"
 # A timestamped subdir <run_name>_<date>-<slurm job id> is created per run, SFT checkpoints are written in
 # <that dir>/sft/<config>/<sft_exp_name>_.../<step>/. Override from the command line:
-#   sbatch jobs/job_forge_sft.sh .venv configs/task/isaaclab/peg_insert_forge_sft.yaml <output_dir>
+#   sbatch jobs/job_forge_sft.sh --venv .venv --config configs/task/isaaclab/peg_insert_forge_sft.yaml --output-dir <output_dir>
 output_dir: "logs/forge_peg_insert"
 
 # -- SFT warmup ------------------------------------------------------------------------

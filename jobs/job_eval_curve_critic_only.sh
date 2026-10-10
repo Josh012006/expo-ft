@@ -1,14 +1,21 @@
 #!/bin/bash
 # Usage:
-#   sbatch job_eval_curve_critic_only.sh <venv_name> <config_path> <checkpoints_dir> <n_episodes> [start_checkpoint]
+#   sbatch jobs/job_eval_curve_critic_only.sh --checkpoints-dir DIR [--venv NAME] [--config PATH]
+#                                             [--n-episodes N] [--start-checkpoint DIR]
+#     --checkpoints-dir   (required) see below
+#     --venv              virtualenv to activate (default .venv)
+#     --config            task YAML (default configs/task/maniskill/stack_cube.yaml)
+#     --n-episodes        episodes per checkpoint (default 200)
+#     --start-checkpoint  see below
+#   (sbatch's own options, e.g. --time, go BEFORE the script name; everything after it is read by this script)
 #
-# checkpoints_dir: an RL run's own checkpoints/ directory (numeric step
+# --checkpoints-dir: an RL run's own checkpoints/ directory (numeric step
 # subfolders) -- e.g. logs/stack_cube/<run>_rl/checkpoints. SFT-only
 # checkpoints don't have a trained critic, so this job only makes sense for
 # RL/EXPOLearner checkpoints (same requirement as job_eval_curve.sh's
-# rl_curve mode).
+# --rl-curve mode).
 #
-# start_checkpoint: the SFT checkpoint the RL run actually started from --
+# --start-checkpoint: the SFT checkpoint the RL run actually started from --
 # evaluated once as the step=0 reference point on the "full" curve (see
 # eval_curve_critic_only.py's --start-checkpoint help). Optional.
 #
@@ -18,10 +25,10 @@
 # both, per checkpoint.
 #
 # Example:
-#   sbatch job_eval_curve_critic_only.sh .venv configs/task/maniskill/stack_cube.yaml \
-#       logs/stack_cube/stack_cube_expo_ft_2026-07-05_21-40-48_rl/checkpoints \
-#       200 \
-#       logs/stack_cube/stack_cube_expo_ft_2026-07-05_01-06-12/sft/expo_pi05_droid_lora_finetune_sft_joint_state/stack_cube_sft_demos50/3999
+#   sbatch jobs/job_eval_curve_critic_only.sh --venv .venv --config configs/task/maniskill/stack_cube.yaml \
+#       --checkpoints-dir logs/stack_cube/stack_cube_expo_ft_2026-07-05_21-40-48_rl/checkpoints \
+#       --n-episodes 200 \
+#       --start-checkpoint logs/stack_cube/stack_cube_expo_ft_2026-07-05_01-06-12/sft/expo_pi05_droid_lora_finetune_sft_joint_state/stack_cube_sft_demos50/3999
 #
 # Safe to re-run/resubmit: already-evaluated checkpoints are skipped (see
 # --force in eval_curve_critic_only.py if you actually want to redo them).
@@ -38,13 +45,41 @@
 #SBATCH --mail-user=josue.mongan@mila.quebec
 #SBATCH --output=logs/eval_curve_critic_only_%j.out
 #SBATCH --no-requeue
-VENV=${1:-.venv}
-CONFIG=${2:-configs/task/maniskill/stack_cube.yaml}
-CHECKPOINTS_DIR=${3}
-N_EPISODES=${4:-200}
-START_CHECKPOINT=${5:-}
+usage() {
+    cat <<'EOF'
+Usage: sbatch jobs/job_eval_curve_critic_only.sh --checkpoints-dir DIR [--venv NAME] [--config PATH]
+                                                 [--n-episodes N] [--start-checkpoint DIR]
+  --checkpoints-dir   (required) an RL run's checkpoints/ directory (numeric step sub-folders)
+  --venv              virtualenv to activate (default .venv)
+  --config            task YAML (default configs/task/maniskill/stack_cube.yaml)
+  --n-episodes        episodes per checkpoint (default 200)
+  --start-checkpoint  SFT checkpoint the RL run started from (step 0 reference point, optional)
+EOF
+}
+need_value() {   # need_value <flag> <number of remaining args> <next arg>
+    if [[ $2 -lt 2 || "$3" == --* ]]; then echo "ERROR: $1 needs a value" >&2; exit 1; fi
+}
+
+VENV=.venv
+CONFIG=configs/task/maniskill/stack_cube.yaml
+CHECKPOINTS_DIR=
+N_EPISODES=200
+START_CHECKPOINT=
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --venv) need_value "$1" "$#" "${2-}"; VENV="$2"; shift 2 ;;
+        --config) need_value "$1" "$#" "${2-}"; CONFIG="$2"; shift 2 ;;
+        --checkpoints-dir) need_value "$1" "$#" "${2-}"; CHECKPOINTS_DIR="$2"; shift 2 ;;
+        --n-episodes) need_value "$1" "$#" "${2-}"; N_EPISODES="$2"; shift 2 ;;
+        --start-checkpoint) need_value "$1" "$#" "${2-}"; START_CHECKPOINT="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
+if [[ -z "$CHECKPOINTS_DIR" ]]; then echo "ERROR: --checkpoints-dir is required" >&2; usage >&2; exit 1; fi
+
 cd ~/projects/expo-ft
-source scripts/setup_env.sh "$VENV"
+source scripts/setup_env.sh --venv "$VENV" || exit 1
 python3 scripts/eval_curve_critic_only.py \
     --config "$CONFIG" \
     --checkpoints-dir "$CHECKPOINTS_DIR" \

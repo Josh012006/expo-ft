@@ -1,8 +1,12 @@
 #!/bin/bash
 # Usage:
-#   sbatch jobs/run_forge_eval_job.sh                                   # zero-shot pi05_droid_jointpos, 5 episodes
-#   sbatch jobs/run_forge_eval_job.sh <sft_checkpoint_step_dir> [N]      # SFT checkpoint, N episodes (default 5)
-#     e.g. sbatch jobs/run_forge_eval_job.sh logs/forge_sft/expo_pi05_droid_lora_finetune_sft_joint_state_delta/forge_A/4000 20
+#   sbatch jobs/run_forge_eval_job.sh [--checkpoint DIR] [--n-episodes N]
+#     --checkpoint   SFT checkpoint STEP directory (the folder that contains params/). Omit: zero-shot pi05_droid_jointpos.
+#     --n-episodes   number of episodes (default 5)
+#   (sbatch's own options, e.g. --time, go BEFORE the script name; everything after it is read by this script)
+#   sbatch jobs/run_forge_eval_job.sh                                        # zero-shot pi05_droid_jointpos, 5 episodes
+#   sbatch jobs/run_forge_eval_job.sh --checkpoint <sft_checkpoint_step_dir> --n-episodes 20
+#     e.g. sbatch jobs/run_forge_eval_job.sh --checkpoint logs/forge_sft/expo_pi05_droid_lora_finetune_sft_joint_state_delta/forge_A/4000 --n-episodes 20
 #
 #SBATCH --job-name=forge-eval
 #SBATCH --ntasks=1
@@ -30,8 +34,27 @@
 
 set -u  # catch unset-variable typos; NOT set -e (would fight the trap/background logic)
 
-CHECKPOINT="${1:-}"        # optional: SFT checkpoint STEP directory (the folder that contains params/)
-N_EPISODES="${2:-5}"
+usage() {
+    cat <<'EOF'
+Usage: sbatch jobs/run_forge_eval_job.sh [--checkpoint DIR] [--n-episodes N]
+  --checkpoint   SFT checkpoint STEP directory (the folder that contains params/); omit for zero-shot
+  --n-episodes   number of episodes (default 5)
+EOF
+}
+need_value() {   # need_value <flag> <number of remaining args> <next arg>
+    if [[ $2 -lt 2 || "$3" == --* ]]; then echo "ERROR: $1 needs a value" >&2; exit 1; fi
+}
+
+CHECKPOINT=""              # optional: SFT checkpoint STEP directory (the folder that contains params/)
+N_EPISODES=5
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --checkpoint) need_value "$1" "$#" "${2-}"; CHECKPOINT="$2"; shift 2 ;;
+        --n-episodes) need_value "$1" "$#" "${2-}"; N_EPISODES="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
 
 REPO_ROOT="$HOME/projects/expo-ft"
 CONFIG="configs/task/isaaclab/peg_insert_forge_pi05.yaml"

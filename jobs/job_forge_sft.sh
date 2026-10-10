@@ -3,12 +3,13 @@
 # everything (steps, batch size, save interval, dataset, openpi config...) is read from the SFT YAML.
 #
 # Usage:
-#   sbatch jobs/job_forge_sft.sh [venv] [config] [output_dir]
-#     venv        default .venv
-#     config      default configs/task/isaaclab/peg_insert_forge_sft.yaml
-#     output_dir  where the run folder is created (default: output_dir of the YAML, logs/forge_peg_insert).
-#                 Checkpoints: <output_dir>/<run_name>_<date>-<jobid>/sft/<openpi config>/<exp_name>/<step>/
-#   e.g. sbatch jobs/job_forge_sft.sh .venv configs/task/isaaclab/peg_insert_forge_sft.yaml logs/forge_peg_insert
+#   sbatch jobs/job_forge_sft.sh [--venv NAME] [--config PATH] [--output-dir DIR]
+#     --venv        virtualenv to activate (default .venv)
+#     --config      SFT YAML (default configs/task/isaaclab/peg_insert_forge_sft.yaml)
+#     --output-dir  where the run folder is created (default: output_dir of the YAML, logs/forge_peg_insert).
+#                   Checkpoints: <output-dir>/<run_name>_<date>-<jobid>/sft/<openpi config>/<exp_name>/<step>/
+#   (sbatch's own options, e.g. --time, go BEFORE the script name; everything after it is read by this script)
+#   e.g. sbatch jobs/job_forge_sft.sh --venv .venv --config configs/task/isaaclab/peg_insert_forge_sft.yaml --output-dir logs/forge_peg_insert
 #
 # Prerequisite: the LeRobot dataset <lerobot_home>/<lerobot_repo_id> of the YAML exists (conversion script).
 #
@@ -24,11 +25,33 @@
 #SBATCH --mail-user=josue.mongan@mila.quebec
 #SBATCH --output=logs/forge_sft_%j.out
 #SBATCH --no-requeue
-VENV=${1:-.venv}
-CONFIG=${2:-configs/task/isaaclab/peg_insert_forge_sft.yaml}
-OUTPUT_DIR=${3:-}
+usage() {
+    cat <<'EOF'
+Usage: sbatch jobs/job_forge_sft.sh [--venv NAME] [--config PATH] [--output-dir DIR]
+  --venv        virtualenv to activate (default .venv)
+  --config      SFT YAML (default configs/task/isaaclab/peg_insert_forge_sft.yaml)
+  --output-dir  where the run folder is created (default: output_dir of the YAML)
+EOF
+}
+need_value() {   # need_value <flag> <number of remaining args> <next arg>
+    if [[ $2 -lt 2 || "$3" == --* ]]; then echo "ERROR: $1 needs a value" >&2; exit 1; fi
+}
+
+VENV=.venv
+CONFIG=configs/task/isaaclab/peg_insert_forge_sft.yaml
+OUTPUT_DIR=
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --venv) need_value "$1" "$#" "${2-}"; VENV="$2"; shift 2 ;;
+        --config) need_value "$1" "$#" "${2-}"; CONFIG="$2"; shift 2 ;;
+        --output-dir) need_value "$1" "$#" "${2-}"; OUTPUT_DIR="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
 cd ~/projects/expo-ft || exit 1
-source scripts/setup_env.sh "$VENV"
+source scripts/setup_env.sh --venv "$VENV" || exit 1
 mkdir -p logs
 
 ARGS=(--config "$CONFIG" --stage sft)

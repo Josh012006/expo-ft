@@ -9,7 +9,7 @@ Run it in the main env (.venv: it needs `lerobot`). Both folders are given expli
     --demos-dir   folder with the ep_*.npz files (input)
     --output-dir  LeRobot home: the dataset is written to <output-dir>/<repo-name>
                   (the script sets HF_LEROBOT_HOME to it). The SFT job must use the SAME folder as HF_LEROBOT_HOME
-                  (jobs/job_forge_sft.sh: LEROBOT_HOME, default demos/isaaclab/lerobot).
+                  (lerobot_home in configs/task/isaaclab/peg_insert_forge_sft.yaml, default demos/isaaclab/lerobot).
 
 Layout (same keys as convert_maniskill_to_lerobot.py, so the openpi config LeRobotDROIDDataConfig reads it as is):
     exterior_image_1_left  (224, 224, 3) uint8   exterior camera
@@ -211,7 +211,7 @@ def main():
         dataset.save_episode()
 
     print(f"\ndone: {output_path}")
-    print(f"train with HF_LEROBOT_HOME={output_dir}  (jobs/job_forge_sft.sh: LEROBOT_HOME={args.output_dir})")
+    print(f"train with HF_LEROBOT_HOME={output_dir}  (lerobot_home: {args.output_dir!r} in configs/task/isaaclab/peg_insert_forge_sft.yaml)")
     print(f"episodes: {dataset.num_episodes}, frames: {dataset.num_frames}  (expected {len(episodes)} / "
           f"{sum(len(e['act']) for e in episodes)})")
     if dataset.num_episodes != len(episodes):

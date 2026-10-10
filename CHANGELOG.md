@@ -125,8 +125,8 @@ contribution. Available two ways:
   `_stderr`), logged at the same interval and on the same fixed episode seeds
   as the normal `eval_rigorous/success_rate`.
 - Post-hoc, for already-finished runs: `scripts/eval_curve_critic_only.py`
-  (`job_eval_curve_critic_only.sh <venv> <config> <checkpoints_dir>
-  <n_episodes> [start_checkpoint]`) — sweeps every checkpoint, running both
+  (`job_eval_curve_critic_only.sh --checkpoints-dir <dir> [--venv <venv>]
+  [--config <config>] [--n-episodes <n>] [--start-checkpoint <dir>]`) — sweeps every checkpoint, running both
   variants on the same fixed seed list, producing `comparison.json` /
   `comparison.png` (two curves: full pipeline vs. critic-only).
 
