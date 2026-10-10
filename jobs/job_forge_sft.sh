@@ -18,8 +18,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --gpus-per-task=a100l:1
 #SBATCH --mem-per-gpu=256G
-#SBATCH --time=08:00:00
-#SBATCH --exclude=cn-g001,cn-g007,cn-g008,cn-g010,cn-g011,cn-g012,cn-g013,cn-g014,cn-g015,cn-g017,cn-g018,cn-g024,cn-g025,cn-g026,cn-d003,cn-i001
+#SBATCH --time=50:00:00
 #SBATCH --signal=B:TERM@300
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=josue.mongan@mila.quebec
