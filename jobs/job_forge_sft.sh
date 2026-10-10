@@ -5,8 +5,9 @@
 #   sbatch jobs/job_forge_sft.sh [exp_name] [num_train_steps] [venv]
 #   e.g. sbatch jobs/job_forge_sft.sh forge_A 4001
 #
-# Prerequisite: the LeRobot dataset demos/lerobot/<REPO_NAME> exists
-#   (scripts/isaaclab/convert_waypoint_demos_to_lerobot.py).
+# Prerequisite: the LeRobot dataset <LEROBOT_HOME>/<REPO_NAME> exists, i.e. the --output-dir and --repo-name given to
+#   scripts/isaaclab/convert_waypoint_demos_to_lerobot.py (defaults here: demos/isaaclab/lerobot, expo_ft/forge_peg_insert).
+#   Another folder: LEROBOT_HOME=path sbatch jobs/job_forge_sft.sh ...
 #
 # Normalization "A": the config below reloads the official DROID norm_stats of pi05_droid_jointpos (baked in
 # the openpi config, like the ManiSkill joint-state SFT). Nothing is recomputed.
@@ -35,10 +36,13 @@ EXP_NAME=${1:-forge_A}
 STEPS=${2:-4001}
 VENV=${3:-.venv}
 REPO_NAME=${REPO_NAME:-expo_ft/forge_peg_insert}
+LEROBOT_HOME=${LEROBOT_HOME:-demos/isaaclab/lerobot}
 CONFIG_NAME=expo_pi05_droid_lora_finetune_sft_joint_state_delta
 
 cd ~/projects/expo-ft || exit 1
-source scripts/setup_env.sh "$VENV"     # activates the venv, sets HF_LEROBOT_HOME=demos/lerobot
+source scripts/setup_env.sh "$VENV"     # activates the venv (it also sets HF_LEROBOT_HOME=demos/lerobot: overridden below)
+case "$LEROBOT_HOME" in /*) ;; *) LEROBOT_HOME="$PWD/$LEROBOT_HOME" ;; esac
+export HF_LEROBOT_HOME="$LEROBOT_HOME"
 mkdir -p logs
 
 if [ ! -d "$HF_LEROBOT_HOME/$REPO_NAME" ]; then

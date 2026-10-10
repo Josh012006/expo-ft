@@ -2,10 +2,14 @@
 
     python scripts/isaaclab/convert_waypoint_demos_to_lerobot.py \
         --demos-dir demos/isaaclab/ForgePegInsert \
+        --output-dir demos/isaaclab/lerobot \
         --repo-name expo_ft/forge_peg_insert
 
-Run it in the main env (.venv: it needs `lerobot`). The dataset is written to
-demos/lerobot/<repo-name> (same HF_LEROBOT_HOME as the ManiSkill pipeline).
+Run it in the main env (.venv: it needs `lerobot`). Both folders are given explicitly:
+    --demos-dir   folder with the ep_*.npz files (input)
+    --output-dir  LeRobot home: the dataset is written to <output-dir>/<repo-name>
+                  (the script sets HF_LEROBOT_HOME to it). The SFT job must use the SAME folder as HF_LEROBOT_HOME
+                  (jobs/job_forge_sft.sh: LEROBOT_HOME, default demos/isaaclab/lerobot).
 
 Layout (same keys as convert_maniskill_to_lerobot.py, so the openpi config LeRobotDROIDDataConfig reads it as is):
     exterior_image_1_left  (224, 224, 3) uint8   exterior camera
@@ -33,8 +37,6 @@ from pathlib import Path
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-# Same LeRobot home as run_pipeline.py / setup_env.sh / convert_maniskill_to_lerobot.py: the openpi trainer reads it.
-os.environ["HF_LEROBOT_HOME"] = str(REPO_ROOT / "demos" / "lerobot")
 
 IMAGE_SIZE = (224, 224)
 ACTION_HORIZON = 16     # pi05 action chunk, as in the openpi config
@@ -124,9 +126,13 @@ def report(episodes, norm_stats_path):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--demos-dir", default="demos/isaaclab/ForgePegInsert",
-                   help="Folder with ep_*.npz (fail_*.npz and index.jsonl are ignored).")
-    p.add_argument("--repo-name", default="expo_ft/forge_peg_insert", help="LeRobot repo id (folder under demos/lerobot).")
+    p.add_argument("--demos-dir", required=True,
+                   help="Input: folder with ep_*.npz (fail_*.npz and index.jsonl are ignored).")
+    p.add_argument("--output-dir", required=True,
+                   help="Output: LeRobot home. The dataset is written to <output-dir>/<repo-name>. "
+                        "Relative paths are relative to the repo root.")
+    p.add_argument("--repo-name", default="expo_ft/forge_peg_insert",
+                   help="LeRobot repo id: sub-folder of --output-dir.")
     p.add_argument("--task", default=None, help="Language instruction. Default: the one stored in the .npz files.")
     p.add_argument("--fps", type=int, default=15, help="Control frequency (FORGE: 15 Hz, as pi05_droid).")
     p.add_argument("--max-episodes", type=int, default=None)
@@ -157,10 +163,19 @@ def main():
         print("\ndry run: nothing written.")
         return
 
+    # lerobot reads HF_LEROBOT_HOME when it is imported: set it first.
+    output_dir = Path(args.output_dir)
+    if not output_dir.is_absolute():
+        output_dir = REPO_ROOT / output_dir
+    os.environ["HF_LEROBOT_HOME"] = str(output_dir)
+
     from tqdm import tqdm
     from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
 
     output_path = HF_LEROBOT_HOME / args.repo_name
+    if Path(HF_LEROBOT_HOME).resolve() != output_dir.resolve():
+        raise SystemExit(f"lerobot uses {HF_LEROBOT_HOME} instead of {output_dir}: HF_LEROBOT_HOME was already "
+                         "imported with another value (unset it in your shell and retry).")
     if output_path.exists():
         if not args.overwrite:
             raise SystemExit(f"{output_path} already exists: pass --overwrite to replace it.")
@@ -196,6 +211,7 @@ def main():
         dataset.save_episode()
 
     print(f"\ndone: {output_path}")
+    print(f"train with HF_LEROBOT_HOME={output_dir}  (jobs/job_forge_sft.sh: LEROBOT_HOME={args.output_dir})")
     print(f"episodes: {dataset.num_episodes}, frames: {dataset.num_frames}  (expected {len(episodes)} / "
           f"{sum(len(e['act']) for e in episodes)})")
     if dataset.num_episodes != len(episodes):
