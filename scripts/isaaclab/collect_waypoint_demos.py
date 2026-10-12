@@ -17,13 +17,24 @@ and push it down. We reason about the PEG, not the fingertip, using FORGE's own 
 (`extra/peg_socket_offset` in the observation). offset = (0, 0, 0) means "inserted". The hole is
 `hole_depth` (25 mm) deep, so offset z = 0.025 means "peg base at the top edge of the hole".
 
-Three waypoints, expressed as target offsets, visited in order:
+Four waypoints, expressed as target offsets, visited in order:
 
-    1. lift   : go straight up until the peg base is `HOVER_MARGIN` above the hole top
-                (no sideways motion, so the peg cannot catch on the rim)
-    2. align  : at that height, move sideways until x, y offsets are ~0 (peg exactly above the hole)
-    3. insert : go straight down, still correcting x, y every step, pressing slightly past the
-                final depth so the peg bottoms out
+    1. lift    : go straight up until the peg base is `HOVER_MARGIN` above the hole top
+                 (no sideways motion, so the peg cannot catch on the rim)
+    2. align   : at that height, move sideways until x, y offsets are ~0 (peg exactly above the hole)
+    3. descend : go straight down FAST to DESCEND_STOP above the hole's top edge, x, y kept tight; it hands
+                 over to `insert` only once the xy error is below DESCEND_HANDOFF_XY (otherwise it waits
+                 there and corrects), so the peg never reaches the rim off-centre
+    4. insert  : go down SLOWLY inside the hole, still correcting x, y every step, pressing slightly past the
+                 final depth so the peg bottoms out
+
+Speed of the phases. Each waypoint caps the peg move per control step. The arm only follows a fraction of
+each commanded change (~36% with the 400 / 60 PD gains of the YAML), so the real speed is about cap x 0.36 and,
+more importantly for SFT, the joint-target offsets the policy must learn (target - measured angle) scale with
+the cap. The first version had lift z 5 mm, align xy 5 / z 3 mm, no `descend` phase (`insert`, 1.5 mm in z,
+covered the whole descent): ~70% of the frames were slow, tiny offsets. Defaults are now faster (see the
+--*-max-* flags). Reproduce the first version approximately with:
+    --lift-max-z-mm 5 --align-max-xy-mm 5 --align-max-z-mm 3 --descend-max-z-mm 1.5 --descend-max-xy-mm 0.5
 
 Gripper: closed on the peg for the WHOLE episode, in every demo. Three layers keep it that way:
   - the YAML must say `gripper_can_open: false` (checked at start-up): the server then ignores
@@ -44,6 +55,11 @@ Diagnosis tools (added after the first runs, where `align` never finished)
 --------------------------------------------------------------------------
   --video-dir DIR     write one mp4 per attempt (exterior | wrist, with step / waypoint / offset
                       printed under the images) for successes AND failures
+  --lift-max-z-mm, --align-max-xy-mm, --align-max-z-mm, --descend-max-xy-mm, --descend-max-z-mm,
+  --insert-max-xy-mm, --insert-max-z-mm
+                      per-step caps (mm) of each phase, see "Speed of the phases"; the number of steps where a
+                      joint target had to be clipped to MAX_JOINT_STEP is printed / stored as `clipped_steps`
+                      (if it is not ~0 the caps are too high: the direction of the move gets distorted)
   --noise-mm, --hover-jitter-mm, --speed-jitter
                       variety between demos (all 0 = every demo from the same start follows the same path);
                       the values drawn are written to index.jsonl. The start states already differ from
@@ -73,6 +89,8 @@ from expo_ft.env.env_client import EnvClient
 HOVER_MARGIN = 0.010      # peg base is kept this far above the hole's top edge before going in
 INSERT_PUSH = 0.002       # aim this far BELOW the final depth: presses the peg to the bottom
 ALIGN_TOL_MM = 0.2        # default of --align-tol-mm: "centred over the hole" = xy error below 0.2 mm
+DESCEND_STOP = 0.002      # the fast descent ends this far above the hole's top edge
+DESCEND_HANDOFF_XY = 0.001  # ... and only if the peg is within 1 mm (xy) of the hole axis
 MAX_JOINT_STEP = 0.05     # safety: never command a joint more than this (rad) from its measured angle
 GRIPPER_CLOSED = 1.0      # 0 = open, 1 = closed (DROID convention); the peg stays held all episode
 GRIPPER_TOL = 0.001       # finger position may drift at most 1 mm from its value at reset
@@ -89,16 +107,30 @@ class Waypoint(NamedTuple):
     reached: Callable         # offset -> True when we can move on to the next waypoint
 
 
-def make_waypoints(hole_depth, align_tol, hover_margin=HOVER_MARGIN, speed=1.0):
-    """speed scales the per-step caps of `lift` and `align` only; `insert` keeps its slow, fixed caps."""
+class Caps(NamedTuple):
+    """Largest peg move per control step (m) of each phase. The defaults are the fast version."""
+    lift_z: float = 0.015
+    align_xy: float = 0.010
+    align_z: float = 0.008
+    descend_xy: float = 0.001
+    descend_z: float = 0.008
+    insert_xy: float = 0.0005
+    insert_z: float = 0.0015
+
+
+def make_waypoints(hole_depth, align_tol, hover_margin=HOVER_MARGIN, speed=1.0, caps=Caps()):
+    """speed scales the per-step caps of `lift`, `align` and `descend`; `insert` keeps its slow caps."""
     hover_z = hole_depth + hover_margin                  # offset z of the "above the hole" point
+    stop_z = hole_depth + DESCEND_STOP                   # where the fast descent ends
     return [
-        Waypoint("lift",   lambda o: (o[0], o[1], hover_z),  0.0,    0.005 * speed,  # keep x, y: straight up
+        Waypoint("lift",    lambda o: (o[0], o[1], hover_z),  0.0,  caps.lift_z * speed,  # keep x, y: straight up
                  lambda o: o[2] >= hover_z - 0.002),
-        Waypoint("align",  lambda o: (0.0, 0.0, hover_z),    0.005 * speed,  0.003 * speed,
+        Waypoint("align",   lambda o: (0.0, 0.0, hover_z),    caps.align_xy * speed,  caps.align_z * speed,
                  lambda o: np.linalg.norm(o[:2]) < align_tol and abs(o[2] - hover_z) < 0.002),
-        Waypoint("insert", lambda o: (0.0, 0.0, -INSERT_PUSH), 0.0005, 0.0015,  # slow, x, y kept tight
-                 lambda o: False),                                              # last one: never "done"
+        Waypoint("descend", lambda o: (0.0, 0.0, stop_z),     caps.descend_xy * speed,  caps.descend_z * speed,
+                 lambda o: o[2] <= stop_z + 0.002 and np.linalg.norm(o[:2]) < DESCEND_HANDOFF_XY),
+        Waypoint("insert",  lambda o: (0.0, 0.0, -INSERT_PUSH), caps.insert_xy, caps.insert_z,  # slow, x, y tight
+                 lambda o: False),                                                # last one: never "done"
     ]
 
 
@@ -153,7 +185,11 @@ def run_episode(client, env_id, seed, geom, args, rng):
     # approach. The hover margin never goes below MIN_HOVER_MARGIN so the peg cannot touch the rim.
     hover_margin = max(MIN_HOVER_MARGIN, (args.hover_margin_mm + rng.uniform(-1, 1) * args.hover_jitter_mm) * 1e-3)
     speed = 1.0 + rng.uniform(-1, 1) * args.speed_jitter
-    waypoints = make_waypoints(geom["hole_depth"], args.align_tol_mm * 1e-3, hover_margin, speed)
+    caps = Caps(
+        lift_z=args.lift_max_z_mm * 1e-3, align_xy=args.align_max_xy_mm * 1e-3, align_z=args.align_max_z_mm * 1e-3,
+        descend_xy=args.descend_max_xy_mm * 1e-3, descend_z=args.descend_max_z_mm * 1e-3,
+        insert_xy=args.insert_max_xy_mm * 1e-3, insert_z=args.insert_max_z_mm * 1e-3)
+    waypoints = make_waypoints(geom["hole_depth"], args.align_tol_mm * 1e-3, hover_margin, speed, caps)
     wp = 0
     entered = {waypoints[0].name: 0}             # step at which each waypoint was entered (for the log)
 
@@ -161,6 +197,7 @@ def run_episode(client, env_id, seed, geom, args, rng):
     actions = []
     video = []
     in_a_row = 0                                 # consecutive steps for which FORGE says "inserted"
+    clipped_steps = 0                            # steps where a joint target hit MAX_JOINT_STEP
     done = False
     for t in range(args.max_steps):
         offset = np.asarray(obs["extra/peg_socket_offset"], dtype=np.float64)
@@ -174,7 +211,7 @@ def run_episode(client, env_id, seed, geom, args, rng):
         # Desired peg translation this step: towards the waypoint, capped per axis.
         limit = np.array([w.max_xy, w.max_xy, w.max_z])
         peg_delta = np.clip(np.asarray(w.goal(offset)) - offset, -limit, limit)
-        if args.noise_mm > 0 and w.name != "insert":      # optional variety, never while inserting
+        if args.noise_mm > 0 and w.name in ("lift", "align"):   # optional variety, never near / in the hole
             peg_delta[:2] += rng.normal(0.0, args.noise_mm * 1e-3, 2)
 
         # The peg is rigidly held, so moving the peg by peg_delta = moving the fingertip by peg_delta.
@@ -183,7 +220,9 @@ def run_episode(client, env_id, seed, geom, args, rng):
         q_ik = np.asarray(debug("ik_joint_target", delta_pos=peg_delta.tolist(), target_quat=quat0))
         # --cmd-gain > 1 compensates a sluggish arm: it follows only a fraction of each (relative) target
         # change, so asking for G times more makes the peg move at about the intended speed.
-        q_target = q_meas + np.clip(args.cmd_gain * (q_ik - q_meas), -MAX_JOINT_STEP, MAX_JOINT_STEP)
+        dq = args.cmd_gain * (q_ik - q_meas)
+        clipped_steps += int(np.abs(dq).max() > MAX_JOINT_STEP)
+        q_target = q_meas + np.clip(dq, -MAX_JOINT_STEP, MAX_JOINT_STEP)
         action = np.concatenate([q_target, [GRIPPER_CLOSED]]).astype(np.float32)
         if not np.isfinite(action).all():
             raise RuntimeError(f"non-finite action at step {t} (seed {seed}): {action}")
@@ -222,6 +261,7 @@ def run_episode(client, env_id, seed, geom, args, rng):
         "final_offset_mm": (final * 1000).round(2).tolist(),
         "max_force_N": float(np.linalg.norm(arrays["ft_force"], axis=1).max()),
         "waypoint_entered_at_step": entered,
+        "clipped_steps": clipped_steps,
         "hover_margin_mm": round(hover_margin * 1000, 2),
         "approach_speed_factor": round(speed, 3),
     }
@@ -297,7 +337,20 @@ def main():
     p.add_argument("--hover-jitter-mm", type=float, default=0.0,
                    help="Each attempt draws its hover height uniformly in [margin - j, margin + j] (min 4 mm).")
     p.add_argument("--speed-jitter", type=float, default=0.0,
-                   help="Each attempt scales the lift/align speed by a factor drawn in [1 - j, 1 + j] (e.g. 0.3).")
+                   help="Each attempt scales the lift/align/descend speed by a factor drawn in [1 - j, 1 + j] (e.g. 0.3).")
+    c = Caps()
+    p.add_argument("--lift-max-z-mm", type=float, default=c.lift_z * 1e3, help="Largest z move per step in `lift` (mm).")
+    p.add_argument("--align-max-xy-mm", type=float, default=c.align_xy * 1e3, help="Largest xy move per step in `align` (mm).")
+    p.add_argument("--align-max-z-mm", type=float, default=c.align_z * 1e3, help="Largest z move per step in `align` (mm).")
+    p.add_argument("--descend-max-xy-mm", type=float, default=c.descend_xy * 1e3,
+                   help="Largest xy move per step in the fast `descend` (mm).")
+    p.add_argument("--descend-max-z-mm", type=float, default=c.descend_z * 1e3,
+                   help="Largest z move per step in the fast `descend` (mm).")
+    p.add_argument("--insert-max-xy-mm", type=float, default=c.insert_xy * 1e3,
+                   help="Largest xy move per step in `insert`, inside the hole (mm).")
+    p.add_argument("--insert-max-z-mm", type=float, default=c.insert_z * 1e3,
+                   help="Largest z move per step in `insert`, inside the hole (mm). Raise it (e.g. 3) to shorten "
+                        "the slow part, if the peg does not jam.")
     p.add_argument("--save-failures", action="store_true", help="Also save failed attempts (as fail_*.npz).")
     p.add_argument("--align-tol-mm", type=float, default=ALIGN_TOL_MM,
                    help="xy error (mm) below which `align` is done and `insert` starts.")
@@ -334,6 +387,9 @@ def main():
     print(f"connected: env_id={env_id!r}  hole depth={geom['hole_depth'] * 1000:.0f} mm  "
           f"success: xy<{geom['success_xy'] * 1000:.1f} mm, z<{geom['success_z'] * 1000:.1f} mm  "
           f"align tolerance {args.align_tol_mm:g} mm  command gain {args.cmd_gain:g}")
+    print(f"per-step caps (mm): lift z {args.lift_max_z_mm:g} | align xy {args.align_max_xy_mm:g} z {args.align_max_z_mm:g}"
+          f" | descend xy {args.descend_max_xy_mm:g} z {args.descend_max_z_mm:g}"
+          f" | insert xy {args.insert_max_xy_mm:g} z {args.insert_max_z_mm:g}   hover margin {args.hover_margin_mm:g} mm")
 
     saved = 0
     attempts = 0
@@ -347,7 +403,7 @@ def main():
             tag = "OK  " if info["success"] else "FAIL"
             print(f"[{tag}] seed {seed:4d}  {info['steps']:3d} steps  final offset (mm) {info['final_offset_mm']}"
                   f"  max|F| {info['max_force_N']:.1f} N  gripper drift {info['gripper_drift_mm']:.2f} mm"
-                  f"  waypoints {info['waypoint_entered_at_step']}"
+                  f"  waypoints {info['waypoint_entered_at_step']}  clipped {info['clipped_steps']}"
                   f"  ({time.time() - t0:.0f}s)")
             if info["success"]:
                 fname = f"ep_{saved:04d}_seed{seed}.npz"
