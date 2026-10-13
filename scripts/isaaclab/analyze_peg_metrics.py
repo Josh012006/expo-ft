@@ -119,7 +119,7 @@ def main():
              ["real", "inserted", "in_hole", "rim", "high", "lost", "other", "med.final xy", "med.closest xy", "closest<1mm"]
     table = []
     for label, _, s in rows:
-        table.append([label[:34], s["n"]] + [f"{s[c]}/{s['n']}" for c in z_cols] +
+        table.append([label, s["n"]] + [f"{s[c]}/{s['n']}" for c in z_cols] +
                      ["-" if s["real_success"] is None else f"{s['real_success']}/{s['n']}",
                       s["inserted"], s["in_hole"], s["rim"], s["high"], s["lost"], s["other"],
                       f"{s['median_final_xy']:.1f}", f"{s['median_closest_xy']:.1f}", s["closest_below_1mm"]])

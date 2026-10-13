@@ -91,11 +91,13 @@ max_steps_per_episode: 150
 
 # Success rule of the client (IsaacLabEnvWrapper): an episode is a SUCCESS once FORGE reports "inserted"
 # (xy < 2.5 mm and z below its threshold) for this many steps in a row, and it ends at that moment.
-# Same rule as the demo collector (HOLD_AFTER_SUCCESS = 5). Needed because FORGE never ends an episode on
-# success and the step that times out has already reset the simulation, so the success flag read at the
-# end of an episode is always False: every earlier evaluation of this task reported 0 % whatever the
-# policy did. 0 = old behaviour (flag of the last step), kept only to reproduce old numbers.
-success_hold_steps: 5
+# 1 = the episode stops and counts as a success the first time FORGE says "inserted" (chosen: no need to
+# wait for the peg to stay in). The demo collector waits for 5 steps (HOLD_AFTER_SUCCESS) before it stops.
+# Needed because FORGE never ends an episode on success and the step that times out has already reset the
+# simulation, so the success flag read at the end of an episode is always False: every evaluation made
+# before this key existed reported 0 % whatever the policy did. 0 = old behaviour (flag of the last step),
+# kept only to reproduce old numbers.
+success_hold_steps: 1
 # Matches ManiSkill's replan_steps:action_horizon ratio (8:16) at pi05's
 # action_horizon=15 for DROID. Not a correctness requirement like
 # max_steps_per_episode — a reactivity/compute tradeoff, worth revisiting
