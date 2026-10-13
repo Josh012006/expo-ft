@@ -4,11 +4,15 @@
 # (Isaac Lab server + client on one L40S) but the client is scripts/eval_curve.py instead of eval_policy.py.
 #
 # Usage:
-#   sbatch jobs/run_forge_eval_curve_job.sh --checkpoints-dir DIR [--n-episodes N] [--save-videos] [--skip-base] [--output-dir DIR]
+#   sbatch jobs/run_forge_eval_curve_job.sh --checkpoints-dir DIR [--n-episodes N] [--save-videos] [--video-dir NAME|PATH] [--skip-base] [--output-dir DIR]
 #     --checkpoints-dir  (required) folder that contains the numeric step folders, e.g.
 #                        logs/forge_peg_insert/<run>/sft/expo_pi05_droid_lora_finetune_sft_joint_state_delta/<exp_name>
 #     --n-episodes       episodes per checkpoint, same seeds for all (default 200)
 #     --save-videos      switch: also record the rollout videos of every checkpoint (off: only the curve is produced)
+#     --video-dir        where the videos go (implies --save-videos): <video-dir>/<step>/ for each checkpoint, with its
+#                        peg_socket_metrics.jsonl. A bare name goes under logs/eval_videos/ (--video-dir my_run ->
+#                        logs/eval_videos/my_run/200/ ...); a path is used as is. Default: one timestamped folder per
+#                        checkpoint in logs/eval_videos/
 #     --skip-base        switch: do not evaluate the zero-shot base model
 #     --output-dir       where results/, logs/, episode_seeds.json, curve.json and curve.png/.pdf go (default: --checkpoints-dir)
 #   (sbatch's own options, e.g. --time, go BEFORE the script name; everything after it is read by this script)
@@ -44,10 +48,12 @@ set -u  # catch unset-variable typos; NOT set -e (would fight the trap/backgroun
 
 usage() {
     cat <<'EOF'
-Usage: sbatch jobs/run_forge_eval_curve_job.sh --checkpoints-dir DIR [--n-episodes N] [--save-videos] [--skip-base] [--output-dir DIR]
+Usage: sbatch jobs/run_forge_eval_curve_job.sh --checkpoints-dir DIR [--n-episodes N] [--save-videos] [--video-dir NAME|PATH] [--skip-base] [--output-dir DIR]
   --checkpoints-dir  (required) folder with the numeric step sub-folders of an SFT run
   --n-episodes       episodes per checkpoint, same seeds for all (default 200)
   --save-videos      switch: also record the rollout videos of every checkpoint
+  --video-dir        where the videos go (implies --save-videos): <video-dir>/<step>/ per checkpoint; a bare
+                     name goes under logs/eval_videos/ (default: one timestamped folder per checkpoint)
   --skip-base        switch: do not evaluate the zero-shot base model
   --output-dir       where results/, logs/, curve.* go (default: --checkpoints-dir)
 EOF
@@ -60,6 +66,7 @@ CHECKPOINTS_DIR=""
 N_EPISODES=200
 OUTPUT_DIR=""
 SAVE_VIDEOS=0
+VIDEO_DIR=""
 SKIP_BASE=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -67,12 +74,14 @@ while [[ $# -gt 0 ]]; do
         --n-episodes) need_value "$1" "$#" "${2-}"; N_EPISODES="$2"; shift 2 ;;
         --output-dir) need_value "$1" "$#" "${2-}"; OUTPUT_DIR="$2"; shift 2 ;;
         --save-videos) SAVE_VIDEOS=1; shift ;;
+        --video-dir) need_value "$1" "$#" "${2-}"; VIDEO_DIR="$2"; shift 2 ;;
         --skip-base) SKIP_BASE=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
 done
 if [[ -z "$CHECKPOINTS_DIR" ]]; then echo "ERROR: --checkpoints-dir is required" >&2; usage >&2; exit 1; fi
+if [[ -n "$VIDEO_DIR" ]]; then SAVE_VIDEOS=1; fi    # a video folder means videos
 
 REPO_ROOT="$HOME/projects/expo-ft"
 CONFIG="configs/task/isaaclab/peg_insert_forge_pi05.yaml"
@@ -149,10 +158,11 @@ if [ "$READY" -ne 1 ]; then
 fi
 echo "[server] ready after $((i * 5))s."
 
-echo "[client] eval curve: $N_CKPT checkpoints in $CHECKPOINTS_DIR, $N_EPISODES episodes each, videos: $SAVE_VIDEOS, skip base: $SKIP_BASE"
+echo "[client] eval curve: $N_CKPT checkpoints in $CHECKPOINTS_DIR, $N_EPISODES episodes each, videos: $SAVE_VIDEOS (dir: ${VIDEO_DIR:-default}), skip base: $SKIP_BASE"
 source .venv/bin/activate
 CURVE_ARGS=()
 if [ "$SAVE_VIDEOS" -eq 1 ]; then CURVE_ARGS+=(--save-videos); fi
+if [ -n "$VIDEO_DIR" ]; then CURVE_ARGS+=(--video-dir "$VIDEO_DIR"); fi
 if [ "$SKIP_BASE" -eq 1 ]; then CURVE_ARGS+=(--skip-base); fi
 if [ -n "$OUTPUT_DIR" ]; then CURVE_ARGS+=(--output-dir "$OUTPUT_DIR"); fi
 python scripts/eval_curve.py \

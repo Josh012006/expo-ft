@@ -246,6 +246,15 @@ def main():
              "default: a sweep over many checkpoints would otherwise write "
              "hundreds of videos.",
     )
+    parser.add_argument(
+        "--video-dir", default=None,
+        help="Parent folder of the rollout videos; implies --save-videos. Each checkpoint writes into "
+             "<video-dir>/<label>/ (base, 200, 400, ...), together with its peg_socket_metrics.jsonl. "
+             "A bare name (no slash) goes under logs/eval_videos/, e.g. --video-dir my_run -> "
+             "logs/eval_videos/my_run/200/. Without it each checkpoint gets its own timestamped folder "
+             "in logs/eval_videos/. A label folder left by an earlier or interrupted run is renamed "
+             "<label>.prev1 (never overwritten or mixed).",
+    )
     args = parser.parse_args()
 
     checkpoints_dir = Path(args.checkpoints_dir).resolve()
@@ -261,19 +270,38 @@ def main():
     episode_seeds = get_or_create_episode_seeds(output_dir, args.n_episodes, args.seed)
     seeds_path = output_dir / "episode_seeds.json"
 
+    video_parent = None
+    if args.video_dir:
+        video_parent = Path(args.video_dir)
+        if len(video_parent.parts) == 1:                       # bare name: tidy default location
+            video_parent = REPO_ROOT / "logs" / "eval_videos" / video_parent
+        video_parent = video_parent.resolve()
+    save_videos = args.save_videos or video_parent is not None
+
     def maybe_run(label, checkpoint_path, is_rl_checkpoint, deterministic):
         output_json = results_dir / f"{label}.json"
         if output_json.exists() and not args.force:
             print(f"Skipping {label} (already evaluated; use --force to re-run)")
             return
+        video_dir = None
+        if video_parent is not None:
+            video_dir = video_parent / label
+            if video_dir.exists() and any(video_dir.iterdir()):
+                n = 1
+                while (video_parent / f"{label}.prev{n}").exists():
+                    n += 1
+                video_dir.rename(video_parent / f"{label}.prev{n}")
+                print(f"  {video_dir} already had files: moved to {label}.prev{n}")
+            print(f"  videos and peg_socket_metrics.jsonl -> {video_dir}")
         ok = run_one_eval(
             config_path=args.config,
             checkpoint_path=checkpoint_path,
             seeds_path=seeds_path,
             output_json=output_json,
             log_path=logs_dir / f"{label}.log",
-            save_videos=args.save_videos,
+            save_videos=save_videos,
             is_rl_checkpoint=is_rl_checkpoint,
+            video_dir=video_dir,
             deterministic=deterministic,
         )
         # Rebuilt after EVERY checkpoint, not just once at the end, per this
