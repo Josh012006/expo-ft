@@ -42,6 +42,18 @@ class IsaacLabEnvWrapper:
         self._success = False
         self._reward = 0.0
 
+        # Success rule (see step()). FORGE never ends an episode on success, it only times out, and the
+        # step that times out has ALREADY auto-reset the simulation: the server's success flag read at
+        # that step describes the next episode's start state, so it is always False. Reading the flag
+        # at the end of the episode, as eval_policy.py does, therefore gave 0 % whatever the policy did.
+        # Here an episode counts as a success once the server says "inserted" for `success_hold_steps`
+        # steps in a row (same rule and default as the demo collector, HOLD_AFTER_SUCCESS = 5), and
+        # it ends at that moment. 0 = legacy behaviour (flag of the last step; always False).
+        self._hold_steps = int(getattr(cfg, "success_hold_steps", 5))
+        self._server_done = False     # the server really ended the episode (timeout): sim already reset
+        self._streak = 0              # consecutive steps with the server's success flag on
+        self._max_streak = 0          # longest streak of the episode
+
         # Video recording — mirrors ManiSkillEnvWrapper's own pattern (manual
         # frame accumulation + imageio write at episode boundaries), added
         # here because eval_policy.py passes video_dir through
@@ -89,12 +101,17 @@ class IsaacLabEnvWrapper:
         mm = lambda v: 1000.0 * float(v)
         if not self._metrics_header_printed:
             print("[peg-socket] offset = held peg base - target pose in the socket (env frame). FORGE "
-                  "success needs xy < 2.5 mm AND z below its height threshold.", flush=True)
+                  "success needs xy < 2.5 mm AND z below its height threshold. "
+                  + (f"An episode counts as a success after {self._hold_steps} such steps in a row."
+                     if self._hold_steps > 0 else "success_hold_steps = 0: legacy success flag (always False)."),
+                  flush=True)
             self._metrics_header_printed = True
+        verdict = ("SUCCESS" if self._success else "fail") if self._hold_steps > 0 else "n/a"
         print(
             f"[peg-socket] episode {self._metrics_episode}: start xy={mm(xy[0]):.1f} mm z={mm(o[0, 2]):+.1f} mm"
             f" | closest xy={mm(xy[k]):.1f} mm (z={mm(o[k, 2]):+.1f} mm) at step {k}"
-            f" | final x={mm(o[-1, 0]):+.1f} y={mm(o[-1, 1]):+.1f} mm (xy={mm(xy[-1]):.1f}) z={mm(o[-1, 2]):+.1f} mm",
+            f" | final x={mm(o[-1, 0]):+.1f} y={mm(o[-1, 1]):+.1f} mm (xy={mm(xy[-1]):.1f}) z={mm(o[-1, 2]):+.1f} mm"
+            f" | {verdict} (longest success streak {self._max_streak}, {len(o)} steps)",
             flush=True,
         )
         if self._video_dir is not None:
@@ -103,6 +120,8 @@ class IsaacLabEnvWrapper:
                 "start_xy_mm": mm(xy[0]), "closest_xy_mm": mm(xy[k]), "closest_step": k,
                 "closest_z_mm": mm(o[k, 2]), "final_offset_mm": [mm(v) for v in o[-1]],
                 "final_xy_mm": mm(xy[-1]),
+                "success": bool(self._success) if self._hold_steps > 0 else None,
+                "max_success_streak": int(self._max_streak), "success_hold_steps": self._hold_steps,
             }
             with open(os.path.join(self._video_dir, "peg_socket_metrics.jsonl"), "a") as f:
                 f.write(json.dumps(record) + "\n")
@@ -117,8 +136,11 @@ class IsaacLabEnvWrapper:
         obs = self._client.reset(seed=reset_kwargs.get("seed"))
         self._record_metrics(obs)
         self._done = False
+        self._server_done = False
         self._success = False
         self._reward = 0.0
+        self._streak = 0
+        self._max_streak = 0
         return obs
 
     def step(self, action):
@@ -132,6 +154,17 @@ class IsaacLabEnvWrapper:
         action = np.array(action, dtype=np.float32)
         real_action, action_type = self._client.step(action)
         done, success, reward, _mask = self._client.get_info_for_step()
+        self._server_done = bool(done)
+        if self._hold_steps > 0:
+            if done:
+                # Timeout: the simulation was reset inside this step, so the flag and the reward belong
+                # to the next episode's start state. Not a measurement of this episode.
+                success, reward = False, 0.0
+            else:
+                self._streak = self._streak + 1 if success else 0
+                self._max_streak = max(self._max_streak, self._streak)
+                held = self._streak >= self._hold_steps
+                success, done = held, held        # inserted and held long enough: success, end the episode
         self._done, self._success, self._reward = done, success, reward
         return real_action, action_type
 
@@ -144,10 +177,11 @@ class IsaacLabEnvWrapper:
         once per step with video_dir set would get extra frames — none of
         the current callers do.)"""
         obs = self._client.get_observation()
-        if self._done:
+        if self._server_done:
             # The step that ended the episode has already auto-reset the simulation (Isaac Lab
             # resets inside env.step()): this observation belongs to the NEXT episode. Recording it
-            # would put a random start state at the end of the metrics and the video.
+            # would put a random start state at the end of the metrics and the video. (An episode
+            # ended early by the success rule is NOT in this case: the simulation was not reset.)
             return obs
         self._record_metrics(obs)
         if self._video_dir is not None:
