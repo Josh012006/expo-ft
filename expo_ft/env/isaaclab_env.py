@@ -28,6 +28,9 @@ class IsaacLabEnvWrapper:
     """Drop-in replacement for EnvClientWrapper/ManiSkillEnvWrapper, backed
     by an Isaac Lab / FORGE environment server."""
 
+    BANNER_H = 32      # height (px) of the metrics banner under the eval video frames (224 + 32 = 256: a multiple of 16,
+                       # otherwise the video encoder rescales the frames)
+
     def __init__(self, env_creation_request: dict, cfg=None):
         self.cfg = cfg
         self._client = EnvClientWrapper(
@@ -51,6 +54,7 @@ class IsaacLabEnvWrapper:
         # it ends at that moment. 0 = legacy behaviour (flag of the last step; always False).
         self._hold_steps = int(getattr(cfg, "success_hold_steps", 5))
         self._server_done = False     # the server really ended the episode (timeout): sim already reset
+        self._flag = False            # the server's own "inserted" flag at the last step (shown in the video banner)
         self._streak = 0              # consecutive steps with the server's success flag on
         self._max_streak = 0          # longest streak of the episode
 
@@ -63,32 +67,70 @@ class IsaacLabEnvWrapper:
         if self._video_dir is not None:
             os.makedirs(self._video_dir, exist_ok=True)
         self._frames = []
+        self._frame_infos = []        # one dict per frame: what the banner under the video frame shows
         self._episode_count = 0
 
         # Peg-to-socket diagnostics (FORGE server only): per-episode summary of how close the
         # held peg got to its target. A binary success rate hides everything short of an
         # insertion, which is the whole picture for a zero-shot run.
         self._peg_offsets = []
+        self._closest = (float("inf"), 0)   # (xy in m, step) of the closest approach so far this episode
         self._metrics_episode = 0
         self._metrics_header_printed = False
 
         logging.info(f"IsaacLabEnvWrapper: connected, task={self.task_description!r}")
 
+    def _banner(self, info, verdict, width):
+        """Two text lines under a video frame, like the demo collector's videos: step, peg offset
+        (xy distance, z, x, y), closest approach so far, the server's "inserted" flag and the verdict
+        of the whole episode. Returns a (BANNER_H, width, 3) uint8 array, or None if PIL is missing."""
+        try:
+            from PIL import Image, ImageDraw
+        except ImportError:
+            return None
+        mm = info["offset_mm"]
+        xy = float(np.hypot(mm[0], mm[1]))
+        line1 = (f"t={info['step']:3d}  xy={xy:6.2f} mm  z={mm[2]:+6.1f} mm   "
+                 f"x={mm[0]:+6.2f} y={mm[1]:+6.2f}")
+        line2 = (f"closest xy {info['closest_xy_mm']:5.2f} mm @t={info['closest_step']:<3d} | "
+                 f"{'INSERTED' if info['flag'] else '-':8s} | episode: {verdict}")
+        banner = Image.new("RGB", (width, self.BANNER_H), (0, 0, 0))
+        draw = ImageDraw.Draw(banner)
+        draw.text((4, 5), line1, fill=(255, 255, 255))
+        draw.text((4, 18), line2, fill=(90, 220, 120) if (info["flag"] or verdict == "SUCCESS") else (200, 200, 200))
+        return np.asarray(banner)
+
     def _flush_video(self):
         """Write the accumulated frames of the episode just finished. Called
         from reset() (previous episode) and close() (the last one, which
-        never gets a following reset() to trigger it)."""
+        never gets a following reset() to trigger it). Each frame carries a banner with the live
+        peg-to-socket metrics; the verdict of the episode is only known now, so it is drawn here."""
         if self._video_dir is not None and len(self._frames) > 0:
             path = os.path.join(self._video_dir, f"episode_{self._episode_count}.mp4")
             import imageio.v3 as iio
-            iio.imwrite(path, self._frames, fps=10, codec="libx264")
+            verdict = ("SUCCESS" if self._success else "fail") if self._hold_steps > 0 else "n/a"
+            frames = self._frames
+            if len(self._frame_infos) == len(frames):
+                with_banner = []
+                for frame, info in zip(frames, self._frame_infos):
+                    banner = self._banner(info, verdict, frame.shape[1])
+                    with_banner.append(frame if banner is None else np.concatenate([frame, banner], axis=0))
+                frames = with_banner
+            iio.imwrite(path, frames, fps=10, codec="libx264")
             self._frames = []
+            self._frame_infos = []
             self._episode_count += 1
 
     def _record_metrics(self, obs):
         off = obs.get("extra/peg_socket_offset")
         if off is not None:
-            self._peg_offsets.append(np.asarray(off, dtype=np.float64).reshape(-1)[:3])
+            if not self._peg_offsets:                       # first observation of an episode
+                self._closest = (float("inf"), 0)
+            off = np.asarray(off, dtype=np.float64).reshape(-1)[:3]
+            self._peg_offsets.append(off)
+            xy = float(np.hypot(off[0], off[1]))
+            if xy < self._closest[0]:
+                self._closest = (xy, len(self._peg_offsets) - 1)
 
     def _flush_metrics(self):
         """Print (and append to <video_dir>/peg_socket_metrics.jsonl) the summary of the episode
@@ -155,6 +197,7 @@ class IsaacLabEnvWrapper:
         real_action, action_type = self._client.step(action)
         done, success, reward, _mask = self._client.get_info_for_step()
         self._server_done = bool(done)
+        self._flag = bool(success) and not self._server_done     # not the post-reset flag of a timeout step
         if self._hold_steps > 0:
             if done:
                 # Timeout: the simulation was reset inside this step, so the flag and the reward belong
@@ -193,6 +236,14 @@ class IsaacLabEnvWrapper:
                     [np.asarray(ext, dtype=np.uint8), np.asarray(wrist, dtype=np.uint8)], axis=1
                 )  # side by side, same height
                 self._frames.append(tiled)
+                off = self._peg_offsets[-1] if self._peg_offsets else np.zeros(3)
+                self._frame_infos.append({
+                    "step": max(len(self._peg_offsets) - 1, 0),          # control steps done (0 = reset state)
+                    "offset_mm": (1000.0 * off).tolist(),
+                    "closest_xy_mm": 1000.0 * self._closest[0] if np.isfinite(self._closest[0]) else 0.0,
+                    "closest_step": self._closest[1],
+                    "flag": self._flag,
+                })
         return obs
 
     def get_info_for_step(self):
