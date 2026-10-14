@@ -103,7 +103,8 @@ def run_one_eval(config_path, checkpoint_path, seeds_path, output_json, log_path
     return True
 
 
-def rebuild_curve(results_dir: Path, curve_json_path: Path, curve_png_path: Path, task_label: str):
+def rebuild_curve(results_dir: Path, curve_json_path: Path, curve_png_path: Path, task_label: str, rl_curve: bool = False):
+    """rl_curve only picks the x-axis label: RL checkpoints (--rl-curve) or SFT checkpoints (default)."""
     entries = []
     for result_path in results_dir.glob("*.json"):
         with open(result_path) as f:
@@ -163,7 +164,6 @@ def rebuild_curve(results_dir: Path, curve_json_path: Path, curve_png_path: Path
     )
     
     has_base = any(e["label"] == "base" for e in entries)
-    rl_curve = any(e["label"] not in ("base",) and e["step"] > 0 for e in entries)
     if rl_curve:
         ax.set_xlabel("RL training step (0 = SFT start checkpoint)", labelpad=10)
     else:
@@ -255,6 +255,11 @@ def main():
              "in logs/eval_videos/. A label folder left by an earlier or interrupted run is renamed "
              "<label>.prev1 (never overwritten or mixed).",
     )
+    parser.add_argument(
+        "--plot-only", action="store_true",
+        help="Do not evaluate anything: only rebuild curve.json / curve.png / curve.pdf from the existing "
+             "results/*.json (e.g. after changing the plot). Needs no server and no GPU.",
+    )
     args = parser.parse_args()
 
     checkpoints_dir = Path(args.checkpoints_dir).resolve()
@@ -266,6 +271,11 @@ def main():
     curve_json_path = output_dir / "curve.json"
     curve_png_path = output_dir / "curve.png"
     task_label = Path(args.config).stem
+
+    if args.plot_only:
+        entries = rebuild_curve(results_dir, curve_json_path, curve_png_path, task_label, rl_curve=args.rl_curve)
+        print(f"Plot only: {len(entries)} points on the curve. See {curve_png_path}")
+        return
 
     episode_seeds = get_or_create_episode_seeds(output_dir, args.n_episodes, args.seed)
     seeds_path = output_dir / "episode_seeds.json"
@@ -308,7 +318,7 @@ def main():
         # file's own docstring: "a sweep that gets killed partway still
         # leaves an up-to-date plot on disk."
         if ok:
-            rebuild_curve(results_dir, curve_json_path, curve_png_path, task_label)
+            rebuild_curve(results_dir, curve_json_path, curve_png_path, task_label, rl_curve=args.rl_curve)
 
     if args.rl_curve:
         if args.start_checkpoint is not None and not args.skip_base:
@@ -321,7 +331,7 @@ def main():
         for step in discover_checkpoints(checkpoints_dir):
             maybe_run(str(step), checkpoints_dir / str(step), is_rl_checkpoint=False, deterministic=False)
 
-    entries = rebuild_curve(results_dir, curve_json_path, curve_png_path, task_label)
+    entries = rebuild_curve(results_dir, curve_json_path, curve_png_path, task_label, rl_curve=args.rl_curve)
     print(f"\nDone: {len(entries)} points on the curve. See {curve_png_path}")
 
 

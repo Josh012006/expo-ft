@@ -15,7 +15,8 @@ Why it exists: until IsaacLabEnvWrapper got `success_hold_steps`, the evaluation
     approx. success = final xy < --success-xy-mm  and  final z < --success-z-mm
 (an insertion that was held and then lost is missed; a peg that only passes through is not counted). Give
 several --success-z-mm values to see how sensitive the number is to the z threshold. New files carry the real
-`success` field and it is shown in its own column.
+`success` field: it is shown in its own column (`real`, with the mean length of the successful episodes in
+`steps|ok`) and it decides the `inserted` class.
 
 Outcome of each episode (from the final state, mm; z = peg base height above its target pose, the rim of the
 hole is at z = hole depth):
@@ -28,6 +29,7 @@ hole is at z = hole depth):
 """
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -47,7 +49,8 @@ def find_files(paths):
             sys.exit(f"not found: {p}")
     if not files:
         sys.exit(f"no {FILE_NAME} found under: {' '.join(map(str, paths))}")
-    return files
+    # natural order: .../200 before .../1000
+    return sorted(files, key=lambda f: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", str(f))])
 
 
 def load(path):
@@ -84,11 +87,20 @@ def summarise(records, args):
     for z_tol in args.success_z_mm:
         out[f"approx_success_z<{z_tol:g}"] = int(((xy < args.success_xy_mm) & (z < z_tol)).sum())
     z_tol = args.success_z_mm[0]
-    classes = [classify(a, b, args, z_tol) for a, b in zip(xy, z)]
+    classes = []
+    for r, a, b in zip(records, xy, z):
+        real = r.get("success")                       # new files: the real success decides "inserted"
+        if real is True:
+            classes.append("inserted")
+            continue
+        c = classify(a, b, args, z_tol)
+        classes.append("in_hole" if (real is False and c == "inserted") else c)
     for name in ("inserted", "in_hole", "rim", "high", "lost", "other"):
         out[name] = classes.count(name)
     real = [r.get("success") for r in records]
     out["real_success"] = int(sum(bool(v) for v in real)) if all(v is not None for v in real) else None
+    won = [r["steps"] for r in records if r.get("success")]
+    out["steps_success"] = float(np.mean(won)) if won else None      # mean length of the successful episodes
     return out
 
 
@@ -116,11 +128,12 @@ def main():
 
     z_cols = [f"approx_success_z<{z:g}" for z in args.success_z_mm]
     header = ["label", "n"] + [f"ok z<{z:g}" for z in args.success_z_mm] + \
-             ["real", "inserted", "in_hole", "rim", "high", "lost", "other", "med.final xy", "med.closest xy", "closest<1mm"]
+             ["real", "steps|ok", "inserted", "in_hole", "rim", "high", "lost", "other", "med.final xy", "med.closest xy", "closest<1mm"]
     table = []
     for label, _, s in rows:
         table.append([label, s["n"]] + [f"{s[c]}/{s['n']}" for c in z_cols] +
                      ["-" if s["real_success"] is None else f"{s['real_success']}/{s['n']}",
+                      "-" if s["steps_success"] is None else f"{s['steps_success']:.0f}",
                       s["inserted"], s["in_hole"], s["rim"], s["high"], s["lost"], s["other"],
                       f"{s['median_final_xy']:.1f}", f"{s['median_closest_xy']:.1f}", s["closest_below_1mm"]])
     widths = [max(len(str(r[i])) for r in [header] + table) for i in range(len(header))]
