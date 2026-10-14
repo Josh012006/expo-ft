@@ -55,6 +55,16 @@ def discover_checkpoints(checkpoints_dir: Path):
     return sorted(steps)
 
 
+def select_steps(found, wanted):
+    """All the checkpoints found, or only --steps (an unknown step is an error, not a silent skip)."""
+    if not wanted:
+        return found
+    missing = [w for w in wanted if w not in found]
+    if missing:
+        sys.exit(f"--steps {missing} not found among the checkpoints: {found}")
+    return sorted(set(wanted))
+
+
 def get_or_create_episode_seeds(output_dir: Path, n_episodes: int, master_seed: int):
     seeds_path = output_dir / "episode_seeds.json"
     if seeds_path.exists():
@@ -218,6 +228,11 @@ def main():
         help="Skip baseline evaluation.",
     )
     parser.add_argument(
+        "--steps", type=int, nargs="+", default=None,
+        help="Only evaluate these checkpoint steps (e.g. --steps 1000 or --steps 1000 1600) instead of every "
+             "numeric sub-folder. Implies --skip-base. The curve then has only these points.",
+    )
+    parser.add_argument(
         "--rl-curve", action="store_true",
         help="Evaluate RL/EXPOLearner checkpoints (via eval_policy.py's "
              "--rl-checkpoint) instead of SFT/openpi-style ones. "
@@ -261,6 +276,8 @@ def main():
              "results/*.json (e.g. after changing the plot). Needs no server and no GPU.",
     )
     args = parser.parse_args()
+    if args.steps:
+        args.skip_base = True
 
     checkpoints_dir = Path(args.checkpoints_dir).resolve()
     output_dir = Path(args.output_dir).resolve() if args.output_dir else checkpoints_dir
@@ -323,12 +340,12 @@ def main():
     if args.rl_curve:
         if args.start_checkpoint is not None and not args.skip_base:
             maybe_run("base", args.start_checkpoint, is_rl_checkpoint=False, deterministic=False)
-        for step in discover_checkpoints(checkpoints_dir):
+        for step in select_steps(discover_checkpoints(checkpoints_dir), args.steps):
             maybe_run(str(step), checkpoints_dir / str(step), is_rl_checkpoint=True, deterministic=args.deterministic)
     else:
         if not args.skip_base:
             maybe_run("base", None, is_rl_checkpoint=False, deterministic=False)
-        for step in discover_checkpoints(checkpoints_dir):
+        for step in select_steps(discover_checkpoints(checkpoints_dir), args.steps):
             maybe_run(str(step), checkpoints_dir / str(step), is_rl_checkpoint=False, deterministic=False)
 
     entries = rebuild_curve(results_dir, curve_json_path, curve_png_path, task_label, rl_curve=args.rl_curve)

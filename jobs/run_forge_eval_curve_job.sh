@@ -4,7 +4,8 @@
 # (Isaac Lab server + client on one L40S) but the client is scripts/eval_curve.py instead of eval_policy.py.
 #
 # Usage:
-#   sbatch jobs/run_forge_eval_curve_job.sh --checkpoints-dir DIR [--n-episodes N] [--save-videos] [--video-dir NAME|PATH] [--skip-base] [--output-dir DIR]
+#   sbatch jobs/run_forge_eval_curve_job.sh --checkpoints-dir DIR [--n-episodes N] [--steps "S1 S2"] [--seed N]
+#        [--max-steps N] [--server-port P] [--save-videos] [--video-dir NAME|PATH] [--skip-base] [--output-dir DIR]
 #     --checkpoints-dir  (required) folder that contains the numeric step folders, e.g.
 #                        logs/forge_peg_insert/<run>/sft/expo_pi05_droid_lora_finetune_sft_joint_state_delta/<exp_name>
 #     --n-episodes       episodes per checkpoint, same seeds for all (default 200)
@@ -14,7 +15,16 @@
 #                        logs/eval_videos/my_run/200/ ...); a path is used as is. Default: one timestamped folder per
 #                        checkpoint in logs/eval_videos/
 #     --skip-base        switch: do not evaluate the zero-shot base model
-#     --output-dir       where results/, logs/, episode_seeds.json, curve.json and curve.png/.pdf go (default: --checkpoints-dir)
+#     --steps            only these checkpoints, e.g. --steps 1000 or --steps "1000 1600" (quoted); implies --skip-base
+#     --seed             master seed of the fixed episode list (default 42). The seeds of a run are written to
+#                        <output-dir>/episode_seeds.json: the same --seed and --n-episodes give the same seeds
+#     --max-steps        episode length in steps (default: the YAML's max_steps_per_episode, 150). Server AND client
+#                        use it: the script writes a copy of the YAML with this value into <output-dir>/config/
+#     --server-port      port of the Isaac Lab server (default: the YAML's server_port, 8102). Needed when two of
+#                        these jobs can land on the SAME node (the server listens on localhost of the node)
+#     --output-dir       where results/, logs/, episode_seeds.json, curve.json and curve.png/.pdf go (default: --checkpoints-dir).
+#                        Give a folder of its own whenever --seed, --max-steps or --steps differ from an earlier run,
+#                        otherwise its episode_seeds.json / results/ would be reused or mixed up
 #   (sbatch's own options, e.g. --time, go BEFORE the script name; everything after it is read by this script)
 #
 # Duration: an episode takes ~35 s on the L40S, so 200 episodes ~ 2 h per checkpoint (+ ~5 min start-up).
@@ -48,14 +58,20 @@ set -u  # catch unset-variable typos; NOT set -e (would fight the trap/backgroun
 
 usage() {
     cat <<'EOF'
-Usage: sbatch jobs/run_forge_eval_curve_job.sh --checkpoints-dir DIR [--n-episodes N] [--save-videos] [--video-dir NAME|PATH] [--skip-base] [--output-dir DIR]
+Usage: sbatch jobs/run_forge_eval_curve_job.sh --checkpoints-dir DIR [--n-episodes N] [--steps "S1 S2"] [--seed N]
+         [--max-steps N] [--server-port P] [--save-videos] [--video-dir NAME|PATH] [--skip-base] [--output-dir DIR]
   --checkpoints-dir  (required) folder with the numeric step sub-folders of an SFT run
   --n-episodes       episodes per checkpoint, same seeds for all (default 200)
   --save-videos      switch: also record the rollout videos of every checkpoint
   --video-dir        where the videos go (implies --save-videos): <video-dir>/<step>/ per checkpoint; a bare
                      name goes under logs/eval_videos/ (default: one timestamped folder per checkpoint)
   --skip-base        switch: do not evaluate the zero-shot base model
-  --output-dir       where results/, logs/, curve.* go (default: --checkpoints-dir)
+  --steps            only these checkpoints, e.g. --steps 1000 or --steps "1000 1600" (implies --skip-base)
+  --seed             master seed of the fixed episode list (default 42)
+  --max-steps        episode length in steps (default: the YAML's, 150)
+  --server-port      port of the Isaac Lab server (default: the YAML's, 8102)
+  --output-dir       where results/, logs/, episode_seeds.json, curve.* go (default: --checkpoints-dir;
+                     give a folder of its own when --seed / --max-steps / --steps differ from an earlier run)
 EOF
 }
 need_value() {   # need_value <flag> <number of remaining args> <next arg>
@@ -68,6 +84,10 @@ OUTPUT_DIR=""
 SAVE_VIDEOS=0
 VIDEO_DIR=""
 SKIP_BASE=0
+STEPS=""
+MASTER_SEED=""
+MAX_STEPS=""
+PORT_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --checkpoints-dir) need_value "$1" "$#" "${2-}"; CHECKPOINTS_DIR="$2"; shift 2 ;;
@@ -76,6 +96,10 @@ while [[ $# -gt 0 ]]; do
         --save-videos) SAVE_VIDEOS=1; shift ;;
         --video-dir) need_value "$1" "$#" "${2-}"; VIDEO_DIR="$2"; shift 2 ;;
         --skip-base) SKIP_BASE=1; shift ;;
+        --steps) need_value "$1" "$#" "${2-}"; STEPS="$2"; shift 2 ;;
+        --seed) need_value "$1" "$#" "${2-}"; MASTER_SEED="$2"; shift 2 ;;
+        --max-steps) need_value "$1" "$#" "${2-}"; MAX_STEPS="$2"; shift 2 ;;
+        --server-port) need_value "$1" "$#" "${2-}"; PORT_OVERRIDE="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -85,7 +109,6 @@ if [[ -n "$VIDEO_DIR" ]]; then SAVE_VIDEOS=1; fi    # a video folder means video
 
 REPO_ROOT="$HOME/projects/expo-ft"
 CONFIG="configs/task/isaaclab/peg_insert_forge_pi05.yaml"
-SERVER_PORT=8102
 SERVER_LOG="logs/slurm/${SLURM_JOB_NAME}_${SLURM_JOB_ID}_server.log"
 
 cd "$REPO_ROOT" || { echo "FATAL: cannot cd to $REPO_ROOT"; exit 1; }
@@ -101,6 +124,28 @@ if [ "$N_CKPT" -eq 0 ]; then
     echo "FATAL: no numeric checkpoint folder (200, 400, ...) in $CHECKPOINTS_DIR"
     exit 1
 fi
+
+# --max-steps / --server-port: a copy of the YAML (same file name) in <output-dir>/config/ is used by the server AND the
+# client, so both always agree and the run keeps the exact config it used. Without them the repo's YAML is used as is.
+if [ -n "$MAX_STEPS" ] || [ -n "$PORT_OVERRIDE" ]; then
+    DERIVED_DIR="${OUTPUT_DIR:-$CHECKPOINTS_DIR}/config"
+    mkdir -p "$DERIVED_DIR" || { echo "FATAL: cannot create $DERIVED_DIR"; exit 1; }
+    DERIVED="$DERIVED_DIR/$(basename "$CONFIG")"
+    cp "$CONFIG" "$DERIVED"
+    if [ -n "$MAX_STEPS" ]; then
+        sed -i -E "s/^(max_steps_per_episode:)[[:space:]]*[0-9]+/\1 $MAX_STEPS/" "$DERIVED"
+        grep -q -E "^max_steps_per_episode: $MAX_STEPS( |$)" "$DERIVED" || { echo "FATAL: could not set max_steps_per_episode in $DERIVED"; exit 1; }
+    fi
+    if [ -n "$PORT_OVERRIDE" ]; then
+        sed -i -E "s/^(server_port:)[[:space:]]*[0-9]+/\1 $PORT_OVERRIDE/" "$DERIVED"
+        grep -q -E "^server_port: $PORT_OVERRIDE( |$)" "$DERIVED" || { echo "FATAL: could not set server_port in $DERIVED"; exit 1; }
+    fi
+    CONFIG="$DERIVED"
+    echo "[config] derived config: $CONFIG"
+fi
+SERVER_PORT=$(grep -E "^server_port:" "$CONFIG" | head -1 | sed -E 's/^server_port:[[:space:]]*([0-9]+).*/\1/')
+[ -n "$SERVER_PORT" ] || { echo "FATAL: no server_port in $CONFIG"; exit 1; }
+echo "[config] $CONFIG: max_steps_per_episode=$(grep -E '^max_steps_per_episode:' "$CONFIG" | head -1 | sed -E 's/[^0-9]*([0-9]+).*/\1/'), server_port=$SERVER_PORT"
 
 SERVER_PID=""
 
@@ -158,13 +203,15 @@ if [ "$READY" -ne 1 ]; then
 fi
 echo "[server] ready after $((i * 5))s."
 
-echo "[client] eval curve: $N_CKPT checkpoints in $CHECKPOINTS_DIR, $N_EPISODES episodes each, videos: $SAVE_VIDEOS (dir: ${VIDEO_DIR:-default}), skip base: $SKIP_BASE"
+echo "[client] eval curve: $N_CKPT checkpoints in $CHECKPOINTS_DIR (steps: ${STEPS:-all}), $N_EPISODES episodes each, seed ${MASTER_SEED:-42 (default)}, videos: $SAVE_VIDEOS (dir: ${VIDEO_DIR:-default}), skip base: $SKIP_BASE"
 source .venv/bin/activate
 CURVE_ARGS=()
 if [ "$SAVE_VIDEOS" -eq 1 ]; then CURVE_ARGS+=(--save-videos); fi
 if [ -n "$VIDEO_DIR" ]; then CURVE_ARGS+=(--video-dir "$VIDEO_DIR"); fi
 if [ "$SKIP_BASE" -eq 1 ]; then CURVE_ARGS+=(--skip-base); fi
 if [ -n "$OUTPUT_DIR" ]; then CURVE_ARGS+=(--output-dir "$OUTPUT_DIR"); fi
+if [ -n "$MASTER_SEED" ]; then CURVE_ARGS+=(--seed "$MASTER_SEED"); fi
+if [ -n "$STEPS" ]; then CURVE_ARGS+=(--steps $STEPS); fi    # unquoted on purpose: "1000 1600" -> two values
 python scripts/eval_curve.py \
     --config "$CONFIG" \
     --checkpoints-dir "$CHECKPOINTS_DIR" \

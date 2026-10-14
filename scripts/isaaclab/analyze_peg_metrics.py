@@ -122,9 +122,14 @@ def main():
     for path in find_files(args.paths):
         records = load(path)
         if records:
-            rows.append((f"{path.parent.name}", str(path), summarise(records, args)))
+            rows.append((path.parent.name, path, summarise(records, args)))
     if not rows:
         sys.exit("the files are empty")
+
+    # two runs with the same checkpoint folder name (both "1000"): prefix with the run folder to tell them apart
+    names = [label for label, _, _ in rows]
+    rows = [((f"{path.parent.parent.name}/{label}" if names.count(label) > 1 else label), str(path), s)
+            for label, path, s in rows]
 
     z_cols = [f"approx_success_z<{z:g}" for z in args.success_z_mm]
     header = ["label", "n"] + [f"ok z<{z:g}" for z in args.success_z_mm] + \
