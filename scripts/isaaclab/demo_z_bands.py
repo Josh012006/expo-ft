@@ -7,6 +7,8 @@ For each z band (rim of the hole at z = 25 mm) it prints, averaged over the demo
   target-state gap (mrad)  largest |commanded absolute joint target - measured joint position| over the 7 joints:
                            how far the command leads the arm, i.e. how hard the demo pushes in that band
   |F| (N)                  norm of the contact force (first 3 components of extra/ft_force)
+  xy median / p90 (mm)     horizontal distance of the peg to the hole axis, over all the frames of the band (pooled
+                           over the demos): how well aligned the demos are when they pass each height
 Used to compare with where the SFT policy stalls (z ~ 14-18 mm, xy < 1 mm).
 """
 import argparse
@@ -30,27 +32,33 @@ def main():
     if not files:
         sys.exit(f"no {args.pattern} in {args.demos_dir}  (try: ls -d demos/isaaclab/*/)")
 
-    rows = {name: {"steps": [], "err": [], "force": []} for name, _, _ in BANDS}
+    rows = {name: {"steps": [], "err": [], "force": [], "xy": []} for name, _, _ in BANDS}
     for f in files:
         d = np.load(f)
         z = d["peg_socket_offset"][:, 2] * 1000
         err = np.abs(d["actions"][:, :7] - d["joint_position"]).max(1) * 1000
         force = np.linalg.norm(d["ft_force"][:, :3], axis=1)
+        xy = np.hypot(d["peg_socket_offset"][:, 0], d["peg_socket_offset"][:, 1]) * 1000
         for name, lo, hi in BANDS:
             m = (z >= lo) & (z < hi)
             rows[name]["steps"].append(int(m.sum()))
             if m.any():
                 rows[name]["err"].append(err[m].mean())
                 rows[name]["force"].append(force[m].mean())
+                rows[name]["xy"].extend(xy[m].tolist())
 
     def avg(v):
         return float(np.mean(v)) if v else float("nan")
 
     print(f"{len(files)} demos from {args.demos_dir}")
-    print(f"{'z band (mm)':18s} {'steps/demo':>10s} {'target-state gap (mrad)':>24s} {'|F| (N)':>9s}")
+    print(f"{'z band (mm)':18s} {'steps/demo':>10s} {'target-state gap (mrad)':>24s} {'|F| (N)':>9s} "
+          f"{'xy median (mm)':>15s} {'xy p90 (mm)':>12s}")
     for name, _, _ in BANDS:
         r = rows[name]
-        print(f"{name:18s} {avg(r['steps']):10.1f} {avg(r['err']):24.2f} {avg(r['force']):9.2f}")
+        xy_med = float(np.median(r["xy"])) if r["xy"] else float("nan")
+        xy_p90 = float(np.percentile(r["xy"], 90)) if r["xy"] else float("nan")
+        print(f"{name:18s} {avg(r['steps']):10.1f} {avg(r['err']):24.2f} {avg(r['force']):9.2f} "
+              f"{xy_med:15.2f} {xy_p90:12.2f}")
 
 
 if __name__ == "__main__":

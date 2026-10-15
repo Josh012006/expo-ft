@@ -103,6 +103,19 @@ def summarise(records, args):
         classes.append("in_hole" if (real is False and c == "inserted") else c)
     for name in ("inserted", "in_hole", "rim", "high", "lost", "other"):
         out[name] = classes.count(name)
+    out["by_class"] = {}
+    for name in ("inserted", "in_hole", "rim", "high", "lost", "other"):
+        idx = [i for i, c in enumerate(classes) if c == name]
+        if not idx:
+            continue
+        def med(field, get=lambda r, f: r.get(f)):
+            vals = [get(records[i], field) for i in idx]
+            return float(np.median(vals)) if all(v is not None for v in vals) else None
+        out["by_class"][name] = {
+            "n": len(idx), "final_xy": float(np.median(xy[idx])), "final_z": float(np.median(z[idx])),
+            "force20": med("force_last20_N"), "force_max": med("force_max_N"),
+            "gap20": med("gap_last20_mrad"), "dz20": med("z_change_last20_mm"),
+        }
     real = [r.get("success") for r in records]
     out["real_success"] = int(sum(bool(v) for v in real)) if all(v is not None for v in real) else None
     won = [r["steps"] for r in records if r.get("success")]
@@ -126,6 +139,10 @@ def main():
     p.add_argument("--hole-depth-mm", type=float, default=25.0, help="Depth of the hole (rim height, mm).")
     p.add_argument("--lost-xy-mm", type=float, default=20.0, help="Final xy distance from which a peg counts as lost.")
     p.add_argument("--csv", default=None, help="Also write the table to this CSV file.")
+    p.add_argument("--by-class", action="store_true",
+                   help="Also print, for every file, the medians of final xy / z and (when logged) F20, F max, gap20 and "
+                        "dz20 per outcome class (inserted / in_hole / rim / ...): what the policy does when it fails "
+                        "in the hole vs on the rim vs when it succeeds.")
     args = p.parse_args()
 
     rows = []
@@ -158,6 +175,16 @@ def main():
         print("  ".join(str(c).ljust(w) for c, w in zip(r, widths)))
     print(f"\napprox. success = final xy < {args.success_xy_mm:g} mm and final z < the z threshold (end state only). "
           f"Classes use z < {args.success_z_mm[0]:g} mm for 'inserted', rim at z = {args.hole_depth_mm:g} mm.")
+
+    if args.by_class:
+        fmt = lambda v, f: "-" if v is None else f.format(v)
+        for label, _, s_ in rows:
+            print(f"\n[{label}] per outcome class (medians over the episodes of the class)")
+            print(f"  {'class':9s} {'n':>3s} {'final xy mm':>12s} {'final z mm':>11s} {'F20 N':>7s} {'Fmax N':>7s} "
+                  f"{'gap20 mrad':>11s} {'dz20 mm':>8s}")
+            for name, c in s_["by_class"].items():
+                print(f"  {name:9s} {c['n']:3d} {c['final_xy']:12.2f} {c['final_z']:11.1f} {fmt(c['force20'], '{:7.2f}'):>7s} "
+                      f"{fmt(c['force_max'], '{:7.2f}'):>7s} {fmt(c['gap20'], '{:11.2f}'):>11s} {fmt(c['dz20'], '{:8.2f}'):>8s}")
 
     if args.csv:
         import csv
