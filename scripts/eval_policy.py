@@ -145,6 +145,10 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
     # En laissant ces deux champs vides ici, build_pi05_config() retombe sur l'AssetsConfig
     # bakée, ce qui garde l'eval cohérente avec l'entraînement, que checkpoint_path soit
     # fourni (SFT) ou non (baseline pi05_droid_jointpos pur).
+    # EXCEPTION (ajoutée avec sft_norm_stats_dir): un SFT entraîné avec d'autres stats (calculées sur les démos)
+    # les sauvegarde dans <checkpoint>/assets/<asset_id>/ ; plus bas, si ce dossier contient un seul
+    # norm_stats.json, il est utilisé à la place (même fichier que le défaut pour les checkpoints DROID).
+    # Les checkpoints RL (--rl-checkpoint) ne sont pas couverts: model_config.pi05_assets_dir / pi05_asset_id.
 
     # Load SFT checkpoint if provided. NOTE: when rl_checkpoint_path is set, we
     # deliberately ignore checkpoint_path here and load base weights as a
@@ -154,6 +158,18 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
     if checkpoint_path is not None and rl_checkpoint_path is None:
         model_config.pi05_weight_loader_path = str(Path(checkpoint_path) / "params")
         print(f"Loaded checkpoint from: {checkpoint_path}")
+        # Normalization statistics: openpi saves the ones used by the training run next to the weights
+        # (<checkpoint>/assets/<asset_id>/norm_stats.json). Use THEM, so that a checkpoint trained with other
+        # statistics than the DROID ones (e.g. computed on the demos, sft_norm_stats_dir) is evaluated with its own.
+        # For the DROID-trained checkpoints this is the same file as the config's default.
+        assets = Path(checkpoint_path) / "assets"
+        ids = sorted(d.name for d in assets.iterdir() if (d / "norm_stats.json").is_file()) if assets.is_dir() else []
+        if len(ids) == 1:
+            model_config.pi05_assets_dir = str(assets)
+            model_config.pi05_asset_id = ids[0]
+            print(f"Normalization statistics: {assets / ids[0] / 'norm_stats.json'} (saved with the checkpoint)")
+        else:
+            print(f"Normalization statistics: config default (no single norm_stats.json under {assets}, found {ids})")
     else:
         model_config.pi05_weight_loader_path = None
         if rl_checkpoint_path is None:

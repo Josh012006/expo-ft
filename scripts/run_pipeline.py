@@ -152,6 +152,25 @@ def stage_sft(cfg, args, run_dir):
     if cfg.num_data_sft > 0:
         cmd.append(f"--data.num-demos={cfg.num_data_sft}")
 
+    # Optional normalization statistics other than the config's baked-in DROID ones (e.g. computed on the demos by
+    # scripts/isaaclab/compute_demo_norm_stats.py): <sft_norm_stats_dir>/<sft_norm_stats_asset_id>/norm_stats.json.
+    # openpi copies them into every checkpoint (<step>/assets/<asset_id>/), and scripts/eval_policy.py reads them
+    # from there, so training and evaluation always use the same statistics.
+    norm_dir = getattr(cfg, "sft_norm_stats_dir", None)
+    if norm_dir:
+        asset_id = getattr(cfg, "sft_norm_stats_asset_id", None)
+        if not asset_id:
+            sys.exit("FATAL: sft_norm_stats_dir is set but sft_norm_stats_asset_id is not")
+        norm_dir = Path(norm_dir)
+        if not norm_dir.is_absolute():
+            norm_dir = REPO_ROOT / norm_dir
+        norm_file = norm_dir / asset_id / "norm_stats.json"
+        if not norm_file.is_file():
+            sys.exit(f"FATAL: normalization statistics not found: {norm_file} "
+                     "(compute them first: scripts/isaaclab/compute_demo_norm_stats.py)")
+        print(f"SFT normalization statistics: {norm_file}")
+        cmd += [f"--data.assets.assets-dir={norm_dir}", f"--data.assets.asset-id={asset_id}"]
+
     if cfg.sft_resume:
         cmd.append("--resume")
 

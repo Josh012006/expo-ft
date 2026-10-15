@@ -28,8 +28,9 @@ class IsaacLabEnvWrapper:
     """Drop-in replacement for EnvClientWrapper/ManiSkillEnvWrapper, backed
     by an Isaac Lab / FORGE environment server."""
 
-    BANNER_H = 32      # height (px) of the metrics banner under the eval video frames (224 + 32 = 256: a multiple of 16,
+    BANNER_H = 48      # height (px) of the metrics banner under the eval video frames (224 + 48 = 272: a multiple of 16,
                        # otherwise the video encoder rescales the frames)
+    LAST_N = 20        # "last 20 steps" window of the contact-force / command-gap statistics of an episode
 
     def __init__(self, env_creation_request: dict, cfg=None):
         self.cfg = cfg
@@ -78,6 +79,16 @@ class IsaacLabEnvWrapper:
         self._metrics_episode = 0
         self._metrics_header_printed = False
 
+        # Contact force and command gap (to tell a physical jam from a policy that stops commanding motion):
+        #   force   norm of the first 3 components of extra/ft_force at every observation (N)
+        #   gap     largest |commanded absolute joint target - joint position the command was computed from| over
+        #           the 7 joints, in mrad, at every step. Same definition as scripts/isaaclab/demo_z_bands.py,
+        #           so the numbers can be compared with the demos' (about 6 mrad inside the hole).
+        self._forces = []
+        self._gaps = []
+        self._last_q = None           # joint positions of the last observation
+        self._last_gap = None         # gap of the last command (video banner)
+
         logging.info(f"IsaacLabEnvWrapper: connected, task={self.task_description!r}")
 
     def _banner(self, info, verdict, width):
@@ -90,14 +101,18 @@ class IsaacLabEnvWrapper:
             return None
         mm = info["offset_mm"]
         xy = float(np.hypot(mm[0], mm[1]))
+        force, gap = info.get("force_n"), info.get("gap_mrad")
         line1 = (f"t={info['step']:3d}  xy={xy:6.2f} mm  z={mm[2]:+6.1f} mm   "
                  f"x={mm[0]:+6.2f} y={mm[1]:+6.2f}")
         line2 = (f"closest xy {info['closest_xy_mm']:5.2f} mm @t={info['closest_step']:<3d} | "
                  f"{'INSERTED' if info['flag'] else '-':8s} | episode: {verdict}")
+        line3 = (f"contact force {'-' if force is None else f'{force:5.2f} N'}  |  "
+                 f"command gap {'-' if gap is None else f'{gap:5.1f} mrad'}")
         banner = Image.new("RGB", (width, self.BANNER_H), (0, 0, 0))
         draw = ImageDraw.Draw(banner)
         draw.text((4, 5), line1, fill=(255, 255, 255))
         draw.text((4, 18), line2, fill=(90, 220, 120) if (info["flag"] or verdict == "SUCCESS") else (200, 200, 200))
+        draw.text((4, 31), line3, fill=(120, 180, 255))
         return np.asarray(banner)
 
     def _flush_video(self):
@@ -128,6 +143,11 @@ class IsaacLabEnvWrapper:
                 self._closest = (float("inf"), 0)
             off = np.asarray(off, dtype=np.float64).reshape(-1)[:3]
             self._peg_offsets.append(off)
+            q = obs.get("observation/joint_position")
+            self._last_q = None if q is None else np.asarray(q, dtype=np.float64).reshape(-1)[:7]
+            force = obs.get("extra/ft_force")
+            if force is not None:
+                self._forces.append(float(np.linalg.norm(np.asarray(force, dtype=np.float64).reshape(-1)[:3])))
             xy = float(np.hypot(off[0], off[1]))
             if xy < self._closest[0]:
                 self._closest = (xy, len(self._peg_offsets) - 1)
@@ -149,11 +169,26 @@ class IsaacLabEnvWrapper:
                   flush=True)
             self._metrics_header_printed = True
         verdict = ("SUCCESS" if self._success else "fail") if self._hold_steps > 0 else "n/a"
+        n_last = self.LAST_N
+        extra = {"z_change_last20_mm": mm(o[-1, 2] - o[-min(n_last, len(o)), 2])}
+        if self._forces:
+            f = np.asarray(self._forces)
+            extra["force_last20_N"] = float(f[-n_last:].mean())
+            extra["force_max_N"] = float(f.max())
+        if self._gaps:
+            g = np.asarray(self._gaps)
+            extra["gap_last20_mrad"] = float(g[-n_last:].mean())
+            extra["gap_mean_mrad"] = float(g.mean())
+        extra_txt = ""
+        if "force_last20_N" in extra:
+            extra_txt += f" | force last {n_last} steps {extra['force_last20_N']:.2f} N (max {extra['force_max_N']:.2f})"
+        if "gap_last20_mrad" in extra:
+            extra_txt += f" | command gap last {n_last} steps {extra['gap_last20_mrad']:.1f} mrad"
         print(
             f"[peg-socket] episode {self._metrics_episode}: start xy={mm(xy[0]):.1f} mm z={mm(o[0, 2]):+.1f} mm"
             f" | closest xy={mm(xy[k]):.1f} mm (z={mm(o[k, 2]):+.1f} mm) at step {k}"
             f" | final x={mm(o[-1, 0]):+.1f} y={mm(o[-1, 1]):+.1f} mm (xy={mm(xy[-1]):.1f}) z={mm(o[-1, 2]):+.1f} mm"
-            f" | {verdict} (longest success streak {self._max_streak}, {len(o)} steps)",
+            f" | {verdict} (longest success streak {self._max_streak}, {len(o)} steps)" + extra_txt,
             flush=True,
         )
         if self._video_dir is not None:
@@ -164,10 +199,13 @@ class IsaacLabEnvWrapper:
                 "final_xy_mm": mm(xy[-1]),
                 "success": bool(self._success) if self._hold_steps > 0 else None,
                 "max_success_streak": int(self._max_streak), "success_hold_steps": self._hold_steps,
+                **extra,
             }
             with open(os.path.join(self._video_dir, "peg_socket_metrics.jsonl"), "a") as f:
                 f.write(json.dumps(record) + "\n")
         self._peg_offsets = []
+        self._forces = []
+        self._gaps = []
         self._metrics_episode += 1
 
     def reset(self, **reset_kwargs):
@@ -183,6 +221,7 @@ class IsaacLabEnvWrapper:
         self._reward = 0.0
         self._streak = 0
         self._max_streak = 0
+        self._last_gap = None
         return obs
 
     def step(self, action):
@@ -194,6 +233,9 @@ class IsaacLabEnvWrapper:
         `chunk_action_reference`) — nothing is added to the live state here
         or on the server."""
         action = np.array(action, dtype=np.float32)
+        if self._last_q is not None:                      # how far the command leads the arm (see __init__)
+            self._last_gap = 1000.0 * float(np.max(np.abs(action[:7].astype(np.float64) - self._last_q)))
+            self._gaps.append(self._last_gap)
         real_action, action_type = self._client.step(action)
         done, success, reward, _mask = self._client.get_info_for_step()
         self._server_done = bool(done)
@@ -243,6 +285,8 @@ class IsaacLabEnvWrapper:
                     "closest_xy_mm": 1000.0 * self._closest[0] if np.isfinite(self._closest[0]) else 0.0,
                     "closest_step": self._closest[1],
                     "flag": self._flag,
+                    "force_n": self._forces[-1] if self._forces else None,
+                    "gap_mrad": self._last_gap,
                 })
         return obs
 

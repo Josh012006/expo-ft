@@ -18,6 +18,12 @@ several --success-z-mm values to see how sensitive the number is to the z thresh
 `success` field: it is shown in its own column (`real`, with the mean length of the successful episodes in
 `steps|ok`) and it decides the `inserted` class.
 
+Files written by the wrapper since it logs the contact force and the command gap also give, as medians over the
+episodes of the last 20 steps of each: `F20` the contact force (N), `gap20` how far the commanded joint targets
+lead the measured joints (mrad, the demos have about 6 inside the hole, see demo_z_bands.py) and `dz20` the z
+change of the peg (mm; about 0 = stalled). Reading: F20 high = jammed; F20 and gap20 both ~0 and dz20 ~0 = the
+policy stopped commanding motion.
+
 Outcome of each episode (from the final state, mm; z = peg base height above its target pose, the rim of the
 hole is at z = hole depth):
     inserted   approx. success
@@ -101,6 +107,10 @@ def summarise(records, args):
     out["real_success"] = int(sum(bool(v) for v in real)) if all(v is not None for v in real) else None
     won = [r["steps"] for r in records if r.get("success")]
     out["steps_success"] = float(np.mean(won)) if won else None      # mean length of the successful episodes
+    # contact force / command gap / z motion over the last 20 steps (files written after those fields were added)
+    for key, field in (("force20", "force_last20_N"), ("gap20", "gap_last20_mrad"), ("dz20", "z_change_last20_mm")):
+        vals = [r.get(field) for r in records]
+        out[key] = float(np.median(vals)) if all(v is not None for v in vals) else None
     return out
 
 
@@ -133,14 +143,16 @@ def main():
 
     z_cols = [f"approx_success_z<{z:g}" for z in args.success_z_mm]
     header = ["label", "n"] + [f"ok z<{z:g}" for z in args.success_z_mm] + \
-             ["real", "steps|ok", "inserted", "in_hole", "rim", "high", "lost", "other", "med.final xy", "med.closest xy", "closest<1mm"]
+             ["real", "steps|ok", "inserted", "in_hole", "rim", "high", "lost", "other", "med.final xy", "med.closest xy", "closest<1mm",
+              "med F20 (N)", "med gap20 (mrad)", "med dz20 (mm)"]
     table = []
     for label, _, s in rows:
         table.append([label, s["n"]] + [f"{s[c]}/{s['n']}" for c in z_cols] +
                      ["-" if s["real_success"] is None else f"{s['real_success']}/{s['n']}",
                       "-" if s["steps_success"] is None else f"{s['steps_success']:.0f}",
                       s["inserted"], s["in_hole"], s["rim"], s["high"], s["lost"], s["other"],
-                      f"{s['median_final_xy']:.1f}", f"{s['median_closest_xy']:.1f}", s["closest_below_1mm"]])
+                      f"{s['median_final_xy']:.1f}", f"{s['median_closest_xy']:.1f}", s["closest_below_1mm"]] +
+                     ["-" if s[k] is None else f"{s[k]:.2f}" for k in ("force20", "gap20", "dz20")])
     widths = [max(len(str(r[i])) for r in [header] + table) for i in range(len(header))]
     for r in [header] + table:
         print("  ".join(str(c).ljust(w) for c, w in zip(r, widths)))
