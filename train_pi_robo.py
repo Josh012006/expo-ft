@@ -352,6 +352,11 @@ def main(_):
     # Mark the run directory as an RL run (e.g. stack_cube_expo_ft_2026-07-05_01-06-12_rl)
     # so it's visually distinguishable from an SFT run directory at a glance.
     run_dir, resuming = resolve_run_dir(cfg, resume_dir=cfg.rl_resume_dir, suffix="rl")
+    # Normalization statistics of the SFT checkpoint (<checkpoint>/assets/<id>/norm_stats.json, e.g. the ones computed
+    # on the demos): used by the actor, the replay buffers and the evaluation of this run alike, and copied to
+    # <run_dir>/assets/ so that the eval of its checkpoints and a resume find them. No-op for a DROID-stats SFT.
+    from expo_ft.utils.train_utils import setup_rl_norm_stats
+    setup_rl_norm_stats(FLAGS.config, run_dir)
 
     # getattr with a default here since offline_ratio no longer exists at all
     # in the PPO/GRPO task YAMLs (removed — it was dead for them regardless,

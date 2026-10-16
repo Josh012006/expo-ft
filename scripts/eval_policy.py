@@ -81,6 +81,7 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
     import numpy as np
     import openpi.training.sharding as openpi_sharding
     from expo_ft.agents.vla.pi05 import build_pi05
+    from expo_ft.utils.train_utils import list_saved_norm_stats
     from expo_ft.data.replay_buffer import create_replay_buffer
     from expo_ft.env.droid_utils import make_dummy_transition
     # Dispatch on cfg.model_cls rather than hardcoding the MSE
@@ -148,7 +149,8 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
     # EXCEPTION (ajoutée avec sft_norm_stats_dir): un SFT entraîné avec d'autres stats (calculées sur les démos)
     # les sauvegarde dans <checkpoint>/assets/<asset_id>/ ; plus bas, si ce dossier contient un seul
     # norm_stats.json, il est utilisé à la place (même fichier que le défaut pour les checkpoints DROID).
-    # Les checkpoints RL (--rl-checkpoint) ne sont pas couverts: model_config.pi05_assets_dir / pi05_asset_id.
+    # Un checkpoint RL (--rl-checkpoint <run>/checkpoints/<step>) lit celles que train_pi_robo.py a copiées dans
+    # <run>/assets/<asset_id>/ au démarrage du run (setup_rl_norm_stats); un run sans ce dossier garde le défaut DROID.
 
     # Load SFT checkpoint if provided. NOTE: when rl_checkpoint_path is set, we
     # deliberately ignore checkpoint_path here and load base weights as a
@@ -162,8 +164,7 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
         # (<checkpoint>/assets/<asset_id>/norm_stats.json). Use THEM, so that a checkpoint trained with other
         # statistics than the DROID ones (e.g. computed on the demos, sft_norm_stats_dir) is evaluated with its own.
         # For the DROID-trained checkpoints this is the same file as the config's default.
-        assets = Path(checkpoint_path) / "assets"
-        ids = sorted(d.name for d in assets.iterdir() if (d / "norm_stats.json").is_file()) if assets.is_dir() else []
+        assets, ids = list_saved_norm_stats(checkpoint_path)
         if len(ids) == 1:
             model_config.pi05_assets_dir = str(assets)
             model_config.pi05_asset_id = ids[0]
@@ -174,6 +175,15 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
         model_config.pi05_weight_loader_path = None
         if rl_checkpoint_path is None:
             print("Using base π₀.₅ weights (no checkpoint) — pi05_droid_jointpos + DROID norm_stats")
+        else:
+            # <run>/checkpoints/<step> -> <run>/assets/<asset_id>/norm_stats.json (copied by train_pi_robo.py)
+            assets, ids = list_saved_norm_stats(Path(rl_checkpoint_path).resolve().parent.parent)
+            if len(ids) == 1:
+                model_config.pi05_assets_dir = str(assets)
+                model_config.pi05_asset_id = ids[0]
+                print(f"Normalization statistics: {assets / ids[0] / 'norm_stats.json'} (saved with the RL run)")
+            else:
+                print(f"Normalization statistics: config default (no single norm_stats.json under {assets}, found {ids})")
 
     # Build π₀.₅ (unnormalize est à True par défaut ici, ce qui est correct pour le SFT)
     actor, actor_train_state, target_actor_params, agent_kwargs, vla_metadata = build_pi05(
