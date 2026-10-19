@@ -240,7 +240,36 @@ class ForgeBackend:
             return self._task_geometry()
         if kind == "ik_joint_target":
             return self._ik_joint_target(request["delta_pos"], request["target_quat"])
+        if kind == "teleop_step":
+            return self._teleop_step(request)
         return {"error": f"unknown debug kind: {kind}"}
+
+    def _teleop_step(self, request):
+        """ONE teleoperation control step in ONE round trip (scripts/isaaclab/teleop_client.py).
+
+        Does what collect_waypoint_demos.py does with four separate calls (ik_joint_target, step,
+        get_observation, get_info_for_step), so that the human-in-the-loop pays the network latency once:
+            delta_pos (m, env frame)  -> 7 absolute joint targets (FORGE's damped least squares IK),
+            target = measured angles + clip(cmd_gain * (IK target - measured angles), +-max_joint_step),
+            gripper closed (1.0; ignored by the env anyway when gripper_can_open is false),
+            env step, then the new observation and the done / success flags.
+        The action sent is returned too: it is the label of the frame the observation BEFORE this call
+        belongs to, exactly like in the scripted demos. `clipped` says that max_joint_step was hit.
+        `done` True means the episode ended (timeout or termination): the env has already reset itself,
+        so `obs` is then the first observation of a NEW episode.
+        """
+        q_meas = self.env.joint_pos[0, 0:7].detach().cpu().numpy().astype(np.float64)
+        q_ik = np.asarray(self._ik_joint_target(request["delta_pos"], request["target_quat"]), dtype=np.float64)
+        dq = float(request.get("cmd_gain", 1.0)) * (q_ik - q_meas)
+        max_step = float(request.get("max_joint_step", 0.05))
+        clipped = bool(np.abs(dq).max() > max_step)
+        action = np.concatenate([q_meas + np.clip(dq, -max_step, max_step), [1.0]]).astype(np.float32)
+        if not np.isfinite(action).all():
+            raise RuntimeError(f"non-finite teleop action: {action}")
+        self.step(request["env_id"], action)
+        obs = self.get_observation(request["env_id"])
+        done, success, _, _ = self.get_info_for_step(request["env_id"])
+        return {"obs": obs, "action": action, "done": bool(done), "success": bool(success), "clipped": clipped}
 
     def _task_geometry(self):
         """Task constants the waypoint script needs, read from FORGE's own task config so the
