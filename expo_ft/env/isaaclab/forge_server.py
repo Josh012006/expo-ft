@@ -29,10 +29,14 @@ a formality here (there is only ever one instance to hand out), not a
 task switch.
 """
 import argparse
+import json
 import logging
 import os
+import re
 import signal
 import sys
+import time
+from pathlib import Path
 
 import yaml
 from isaaclab.app import AppLauncher
@@ -242,6 +246,8 @@ class ForgeBackend:
             return self._ik_joint_target(request["delta_pos"], request["target_quat"])
         if kind == "teleop_step":
             return self._teleop_step(request)
+        if kind == "save_teleop_demo":
+            return self._save_teleop_demo(request)
         return {"error": f"unknown debug kind: {kind}"}
 
     def _teleop_step(self, request):
@@ -270,6 +276,37 @@ class ForgeBackend:
         obs = self.get_observation(request["env_id"])
         done, success, _, _ = self.get_info_for_step(request["env_id"])
         return {"obs": obs, "action": action, "done": bool(done), "success": bool(success), "clipped": clipped}
+
+    def _save_teleop_demo(self, request):
+        """Writes one teleoperated episode sent by scripts/isaaclab/teleop_client.py (step 3) to disk, HERE (the cluster).
+
+        The client runs on the operator's PC and only holds the episode in memory; it sends it once, when it is over.
+        Same format as collect_waypoint_demos.py: ep_NNNN_seed<seed>.npz (arrays exterior_image, wrist_image,
+        joint_position, gripper_position, ft_force, peg_socket_offset, actions + prompt + seed) and one line per
+        episode appended to <out_dir>/index.jsonl. A failed episode (request["success"] false) is written as
+        fail_seed<seed>_<time>.npz and does not take an ep_ number.
+        out_dir is relative to the project root (the folder that holds expo_ft/) and must stay inside it.
+        """
+        root = Path(__file__).resolve().parents[3]
+        out = (root / str(request["out_dir"])).resolve()
+        if root != out and root not in out.parents:
+            return {"error": f"out_dir must be inside the project ({root}), got {request['out_dir']!r}"}
+        out.mkdir(parents=True, exist_ok=True)
+        seed = int(request["seed"])
+        if bool(request["success"]):
+            numbers = [int(m.group(1)) for f in out.glob("ep_*.npz") if (m := re.match(r"ep_(\d+)_", f.name))]
+            fname = f"ep_{(max(numbers) + 1) if numbers else 0:04d}_seed{seed}.npz"
+        else:
+            fname = f"fail_seed{seed}_{time.strftime('%H%M%S')}.npz"
+        arrays = {k: np.asarray(v) for k, v in request["arrays"].items()}
+        tmp = out / f".tmp_{os.getpid()}.npz"                 # written fully, then renamed: no half-written demo
+        np.savez(tmp, **arrays, prompt=np.array(request["prompt"]), seed=np.array(seed))
+        os.replace(tmp, out / fname)
+        with open(out / "index.jsonl", "a") as index:
+            index.write(json.dumps({**request["info"], "file": fname}) + "\n")
+        count = len(list(out.glob("ep_*.npz")))
+        logging.info("teleop demo saved: %s (%d steps, %d ep_ files in %s)", out / fname, len(arrays["actions"]), count, out)
+        return {"file": fname, "path": str(out / fname), "count": count}
 
     def _task_geometry(self):
         """Task constants the waypoint script needs, read from FORGE's own task config so the
