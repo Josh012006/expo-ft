@@ -1,3 +1,4 @@
+
 """Teleoperation client for the FORGE PegInsert simulation -- STEP 3/3: you drive the arm and record demos.
 
 Runs on YOUR PC (Windows / WSL is fine), not on the cluster. The simulation keeps running in forge_server.py on an
@@ -143,9 +144,12 @@ class RemoteEnv:
     def _connect(self):
         # ping_interval=None: no keepalive. Saving a demo sends ~10-30 MB through the tunnel in one message, which can
         # take longer than the default 20 s pong deadline and then closes the connection (seen on the cluster).
+        kw = dict(compression=None, max_size=None, open_timeout=15, close_timeout=100)
         try:
-            self.conn = websockets.sync.client.connect(
-                self.uri, compression=None, max_size=None, open_timeout=15, close_timeout=100, ping_interval=None)
+            try:
+                self.conn = websockets.sync.client.connect(self.uri, ping_interval=None, **kw)
+            except TypeError:          # old websockets (< 15): no keepalive at all, nothing to disable
+                self.conn = websockets.sync.client.connect(self.uri, **kw)
         except Exception as e:     # noqa: BLE001 -- any failure here means "no server behind the tunnel"
             raise SystemExit(
                 f"cannot connect to {self.uri}: {type(e).__name__}: {e}\n"
