@@ -33,13 +33,13 @@ Run:
     python teleop_client.py --host localhost --port 8102 --seed 100
 
 Controls (Tab first: the mouse must be captured, otherwise nothing moves):
-    mouse        move the peg in the horizontal plane, in the directions of the EXTERIOR camera image:
-                 mouse right = to the right of the left image, mouse forward (up) = away from the camera.
+    mouse        move the peg in the horizontal plane, as seen in the WRIST camera (right image): mouse up = towards
+                 the top of that image, mouse right = towards its right (the hand goes where you point; the scene
+                 then slides the other way in the image). --view exterior uses the left image instead.
                  No button to hold: once captured, every movement counts. The pixels travelled since the previous
                  step are added up and sent as ONE move (a swipe = one step, capped at --max-xy-mm).
-    arrow keys   the same horizontal directions: Up = away from the camera, Down = towards it, Left / Right =
-                 left / right of the image. --key-xy-mm per step, repeated while the key is down; they add up with
-                 the mouse.
+    arrow keys   the same directions: Up / Down / Left / Right = towards the top / bottom / left / right of the wrist
+                 image. --key-xy-mm per step, repeated while the key is down; they add up with the mouse.
     W / S        peg up / down
     Shift        fine mode   (x 0.25: for the last millimetres)
     Ctrl         fast mode   (x 2.5)
@@ -47,7 +47,7 @@ Controls (Tab first: the mouse must be captured, otherwise nothing moves):
     R            new episode (next seed)      Tab  capture / release the mouse      Esc  quit
 The caps per step (--max-xy-mm, --max-z-mm) are the same order as the scripted demos; the size of a move is
 --xy-gain-mm per mouse pixel and --z-rate-mm per step with W / S. If a direction is wrong for your window, use
---flip-x / --flip-y / --rotate-deg (printed at start-up).
+--flip-x / --flip-y / --rotate-deg (the directions are printed at every reset).
 """
 import argparse
 import collections
@@ -91,6 +91,9 @@ _unpackb = functools.partial(msgpack.unpackb, object_hook=_unpack_array)
 # only used to turn "mouse right / forward" into directions of the table plane as seen in the left image.
 EXTERIOR_EYE = (1.05, 0.35, 0.35)
 EXTERIOR_TARGET = (0.57, 0.02, 0.08)
+# Wrist camera pose on panda_hand (forge_env_patched.py WRIST_ROT, quaternion w x y z, ROS convention:
+# image right = camera x, image down = camera y, optical axis = camera z).
+WRIST_ROT = (0.6916, -0.1471, -0.1471, 0.6916)
 HOLD_AFTER_SUCCESS = 5      # same as the scripted demos: the episode ends this many steps after "inserted"
 
 
@@ -201,6 +204,37 @@ def screen_axes(flip_x=False, flip_y=False, rotate_deg=0.0):
     return right, forward
 
 
+def quat_to_matrix(q):
+    """3x3 rotation matrix of a quaternion (w, x, y, z)."""
+    w, x, y, z = np.asarray(q, dtype=np.float64) / np.linalg.norm(q)
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                     [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                     [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+
+
+def wrist_axes(hand_quat, flip_x=False, flip_y=False, rotate_deg=0.0):
+    """Unit vectors (x, y of the env frame) of 'towards the right' and 'towards the top' of the WRIST image.
+
+    The camera is fixed on the hand, whose orientation is held (hand_quat = fingertip quaternion of the server,
+    w x y z): image right / up are the camera's x / -y axes in the env frame, projected on the horizontal plane.
+    The hand looks down, so the camera is nearly vertical (tilted ~24 deg) and these projections are well defined.
+    """
+    rot = quat_to_matrix(hand_quat) @ quat_to_matrix(WRIST_ROT)
+    right, up = rot[:2, 0], -rot[:2, 1]
+    right, up = right / np.linalg.norm(right), up / np.linalg.norm(up)
+    a = np.deg2rad(rotate_deg)
+    r2 = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+    right, up = r2 @ right, r2 @ up
+    return (-right if flip_x else right), (-up if flip_y else up)
+
+
+def view_axes(args, hand_quat):
+    """Directions of mouse right / mouse up in the env frame, for the chosen view (wrist or exterior image)."""
+    if args.view == "exterior":
+        return screen_axes(args.flip_x, args.flip_y, args.rotate_deg)
+    return wrist_axes(hand_quat, args.flip_x, args.flip_y, args.rotate_deg)
+
+
 def build_delta(inp, axes, xy_gain_mm, z_rate_mm, max_xy_mm, max_z_mm, key_xy_mm=2.0):
     """The peg translation (m, env frame) of one control step, from the inputs. Capped per step."""
     scale = 0.25 if inp.fine else (2.5 if inp.fast else 1.0)
@@ -229,6 +263,7 @@ class Session:
         self.seed = seed
         self.obs = self.env.reset(seed)
         self.quat0 = self.env.debug("fingertip_pose")["quat"]       # orientation held for the whole episode
+        self.axes = view_axes(self.args, self.quat0)               # mouse right / up in the env frame
         self.step_count = 0
         self.success_run = 0
         self.success = False
@@ -294,8 +329,9 @@ def main():
     p.add_argument("--max-seconds", type=float, default=0.0,
                    help="Quit by itself after this time and print the latency summary (0 = no limit).")
     p.add_argument("--continuous", action="store_true",
-                   help="Step the simulation at every loop (--hz), also without input, like a real-time teleop. "
-                        "Default: step only when you give an input (slow motion).")
+                   help="Start in AUTO mode: step the simulation at every loop (--hz), also without input, like a "
+                        "real-time teleop. Default: step only when you give an input (slow motion). "
+                        "The C key switches between the two modes during the session.")
     p.add_argument("--hz", type=float, default=15.0, help="Loop rate of --continuous (the server may be slower).")
     p.add_argument("--hold", action="store_true",
                    help="Do not move the arm (step 1 behaviour): continuous zero moves, to measure the latency.")
@@ -309,7 +345,10 @@ def main():
     p.add_argument("--cmd-gain", type=float, default=1.0,
                    help="Multiplies every joint-target change (as --cmd-gain of collect_waypoint_demos.py).")
     p.add_argument("--max-joint-step", type=float, default=0.05, help="Safety: largest joint-target change (rad).")
-    # mouse directions
+    # mouse and arrow directions
+    p.add_argument("--view", choices=("wrist", "exterior"), default="wrist",
+                   help="Image the mouse and the arrows refer to: the wrist camera (right image, default) or the "
+                        "exterior camera (left image).")
     p.add_argument("--flip-x", action="store_true", help="Mouse right moves the peg to the left of the image.")
     p.add_argument("--flip-y", action="store_true", help="Mouse forward moves the peg towards the camera.")
     p.add_argument("--rotate-deg", type=float, default=0.0, help="Rotate the mouse directions in the table plane.")
@@ -336,15 +375,19 @@ def main():
     env.measure_rtt()
     print(f"network round trip (empty call): {env.mean_ms('rtt'):.1f} ms")
 
-    axes = screen_axes(args.flip_x, args.flip_y, args.rotate_deg)
-    print(f"mouse right   -> env (x, y) = ({axes[0][0]:+.2f}, {axes[0][1]:+.2f})   "
-          f"mouse forward -> ({axes[1][0]:+.2f}, {axes[1][1]:+.2f})")
     session = Session(env, args)
     session.start(args.seed)
+
+    def describe_axes():
+        right, up = session.axes
+        return (f"{args.view} image: right -> env (x, y) = ({right[0]:+.2f}, {right[1]:+.2f})   "
+                f"up -> ({up[0]:+.2f}, {up[1]:+.2f})")
+    print(describe_axes())
     print(f"observation keys: {sorted(session.obs.keys())}")
     print("episode", session.seed, "started.  Tab = capture the mouse, R = new episode, Esc = quit.")
 
     grabbed = False
+    auto = bool(args.continuous)              # C toggles: True = the simulation steps at every loop, also without input
     acc = np.zeros(2, dtype=np.int64)         # mouse motion since the previous step
     latched = set()                           # W / S / Space pressed since the previous step (short taps)
     shown = Inputs()                          # last inputs, for the HUD
@@ -361,15 +404,19 @@ def main():
                     running = False
                 elif event.key == pygame.K_r:
                     session.start(session.seed + 1)
+                    auto = bool(args.continuous)
                     acc[:] = 0
                     latched.clear()
-                    print("episode", session.seed, "started.")
+                    print("episode", session.seed, "started.   " + describe_axes())
                 elif event.key == pygame.K_TAB:
                     grabbed = not grabbed
                     pygame.event.set_grab(grabbed)
                     pygame.mouse.set_visible(not grabbed)
                     pygame.mouse.get_rel()                   # forget the jump caused by the capture
                     acc[:] = 0
+                elif event.key == pygame.K_c:
+                    auto = not auto
+                    print(f"step {session.step_count}: {'AUTO mode (steps counted continuously)' if auto else 'slow motion (steps only on input)'}")
                 elif event.key in LATCHED_KEYS:
                     latched.add(event.key)
         keys = pygame.key.get_pressed()
@@ -392,14 +439,14 @@ def main():
                      back=bool(keys[pygame.K_DOWN] or pygame.K_DOWN in latched))
         stepping = False
         if not session.over:
-            if args.hold or args.continuous:
+            if args.hold or auto:
                 stepping = grabbed or args.hold
             else:
                 stepping = grabbed and inp.any()
         if stepping:
             if args.hold:
                 inp = Inputs()
-            delta = build_delta(inp, axes, args.xy_gain_mm, args.z_rate_mm, args.max_xy_mm, args.max_z_mm,
+            delta = build_delta(inp, session.axes, args.xy_gain_mm, args.z_rate_mm, args.max_xy_mm, args.max_z_mm,
                                 args.key_xy_mm)
             session.step(delta)
             shown = inp
@@ -432,7 +479,7 @@ def main():
         elif not grabbed and not args.hold:
             status, status_colour = "mouse FREE -- press Tab to take control", WARN
         else:
-            status, status_colour = ("running" if args.continuous or args.hold else "your move"), TEXT
+            status, status_colour = ("AUTO: steps counted continuously (C = stop)" if auto or args.hold else "your move (C = auto steps)"), (WARN if auto else TEXT)
         y = draw_text(screen, font, 10, y,
                       f"seed {session.seed}   step {session.step_count}/{args.max_steps}   {status}", status_colour)
         d = session.last_delta * 1000.0 + 0.0            # "+ 0.0": no "-0.00" for a negative zero
@@ -455,15 +502,16 @@ def main():
                       f"inputs: mouse pending ({acc[0]:+4d},{acc[1]:+4d}) px   keys: {' '.join(down_keys) or '-'}   "
                       f"mode: {mode}   mouse {'CAPTURED' if grabbed else 'free'}", DIM)
         y = draw_text(screen, font, 10, y,
-                      f"mouse right -> env ({axes[0][0]:+.2f},{axes[0][1]:+.2f})  forward -> ({axes[1][0]:+.2f},"
-                      f"{axes[1][1]:+.2f})   mouse {args.xy_gain_mm:g} mm/px   arrows {args.key_xy_mm:g} mm/step   "
+                      f"{args.view} image: right -> env ({session.axes[0][0]:+.2f},{session.axes[0][1]:+.2f})  up -> "
+                      f"({session.axes[1][0]:+.2f},{session.axes[1][1]:+.2f})   mouse {args.xy_gain_mm:g} mm/px   "
+                      f"arrows {args.key_xy_mm:g} mm/step   "
                       f"W/S {args.z_rate_mm:g} mm/step", DIM)
         draw_text(screen, font, 10, y,
-                  "Tab capture  mouse/arrows xy  W/S up/down  Shift fine  Ctrl fast  Space wait  R new episode  Esc quit", DIM)
+                  "Tab capture  mouse/arrows = xy (wrist)  W/S up/down  Shift fine  Ctrl fast  Space 1 wait step  C auto steps on/off  R new  Esc quit", DIM)
         pygame.display.flip()
 
         # -- pace the loop --
-        if args.continuous or args.hold:
+        if auto or args.hold:
             clock.tick(args.hz if args.hz > 0 else 0)
         else:
             clock.tick(60)                      # idle: only redraw, the simulation is not stepped
