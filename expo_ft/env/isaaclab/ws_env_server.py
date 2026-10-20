@@ -138,6 +138,9 @@ class WsEnvServer:
             self.port,
             compression=None,
             max_size=None,
+            # no keepalive pings: a client that uploads a big message through a slow ssh tunnel (teleop demos, 10-30 MB)
+            # cannot answer a ping in time and would be dropped with "1011 keepalive ping timeout"
+            ping_interval=None,
         ) as server:
             server.serve_forever()
 

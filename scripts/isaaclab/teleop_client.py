@@ -74,9 +74,11 @@ import argparse
 import collections
 import dataclasses
 import functools
+import io
 import statistics
 import sys
 import time
+from pathlib import Path
 
 import msgpack
 import numpy as np
@@ -133,17 +135,28 @@ class RemoteEnv:
 
     def __init__(self, host, port):
         self.uri = f"ws://{host}:{port}"
+        self.packer = _Packer()
+        self.timings = collections.defaultdict(lambda: collections.deque(maxlen=200))   # name -> ms
+        self.env_id = None
+        self._connect()
+
+    def _connect(self):
+        # ping_interval=None: no keepalive. Saving a demo sends ~10-30 MB through the tunnel in one message, which can
+        # take longer than the default 20 s pong deadline and then closes the connection (seen on the cluster).
         try:
             self.conn = websockets.sync.client.connect(
-                self.uri, compression=None, max_size=None, open_timeout=15, close_timeout=100)
+                self.uri, compression=None, max_size=None, open_timeout=15, close_timeout=100, ping_interval=None)
         except Exception as e:     # noqa: BLE001 -- any failure here means "no server behind the tunnel"
             raise SystemExit(
                 f"cannot connect to {self.uri}: {type(e).__name__}: {e}\n"
                 "  - is the ssh tunnel still open?   ssh -J mila -L <port>:localhost:<port> <node>\n"
                 "  - is forge_server.py running on that node (and finished loading Isaac Sim)?") from e
-        self.packer = _Packer()
-        self.timings = collections.defaultdict(lambda: collections.deque(maxlen=200))   # name -> ms
-        self.env_id = None
+
+    def reconnect(self):
+        """New connection to the same server: the simulation (and the episode in progress) is untouched."""
+        self.close()
+        self._connect()
+        self.create_env()
 
     def _call(self, name, operation, **request):
         t0 = time.perf_counter()
@@ -175,9 +188,9 @@ class RemoteEnv:
                           target_quat=[float(v) for v in target_quat], cmd_gain=float(cmd_gain),
                           max_joint_step=float(max_joint_step))
 
-    def save_demo(self, out_dir, arrays, prompt, seed, info, success):
-        """The server writes the episode in out_dir (relative to the project root, on the cluster)."""
-        return self.debug("save_teleop_demo", timer="save", out_dir=str(out_dir), arrays=arrays, prompt=str(prompt),
+    def save_demo(self, out_dir, npz_bytes, seed, info, success):
+        """The server writes the .npz (already built, compressed) in out_dir (relative to the project root there)."""
+        return self.debug("save_teleop_demo", timer="save", out_dir=str(out_dir), npz=npz_bytes,
                           seed=int(seed), info=info, success=bool(success))
 
     def measure_rtt(self, n=20):
@@ -361,11 +374,34 @@ class Session:
         """Send the finished episode to the server, which writes it on the cluster. True when it worked."""
         if self.saved or not self.success or not self.args.out_dir:
             return False
-        try:
-            r = self.env.save_demo(self.args.out_dir, self.arrays(), self.prompt, self.seed, self.info(), True)
-        except Exception as e:     # noqa: BLE001 -- keep the episode in memory, the operator can press Enter again
-            print(f"!! NOT saved ({type(e).__name__}: {e}) -- press Enter to try again")
+        # the .npz is built here (losslessly compressed: 3-5x smaller to send) and written as is by the server
+        t0 = time.perf_counter()
+        buf = io.BytesIO()
+        np.savez_compressed(buf, **self.arrays(), prompt=np.array(self.prompt), seed=np.array(self.seed))
+        data = buf.getvalue()
+        print(f"sending the demo ({len(self.actions)} steps, {len(data) / 1e6:.1f} MB) to the cluster ...", flush=True)
+        r = None
+        for attempt in (1, 2):
+            try:
+                r = self.env.save_demo(self.args.out_dir, data, self.seed, self.info(), True)
+                break
+            except websockets.exceptions.ConnectionClosed as e:     # lost the tunnel / server: reconnect, once
+                print(f"   connection lost ({type(e).__name__}), reconnecting ...", flush=True)
+                try:
+                    self.env.reconnect()
+                except Exception as e2:     # noqa: BLE001
+                    print(f"   cannot reconnect: {e2}")
+                    break
+            except Exception as e:     # noqa: BLE001 -- refused by the server (bad out_dir, ...), nothing to retry
+                print(f"!! NOT saved: {e}")
+                break
+        if r is None:
+            # never lose a demo: keep a copy next to the client (copy it to the cluster by hand, e.g. with scp)
+            backup = Path(f"teleop_unsaved_seed{self.seed}_{time.strftime('%H%M%S')}.npz")
+            backup.write_bytes(data)
+            print(f"!! NOT saved on the cluster -- a copy is in {backup.resolve()} ; Enter tries again")
             return False
+        print(f"   ({time.perf_counter() - t0:.1f} s)")
         self.saved = True
         print(f"saved {r['file']}  ({len(self.actions)} steps)  ->  {r['path']}   [{r['count']} demos in the folder]")
         return True

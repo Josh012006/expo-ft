@@ -29,6 +29,7 @@ a formality here (there is only ever one instance to hand out), not a
 task switch.
 """
 import argparse
+import io
 import json
 import logging
 import os
@@ -280,32 +281,39 @@ class ForgeBackend:
     def _save_teleop_demo(self, request):
         """Writes one teleoperated episode sent by scripts/isaaclab/teleop_client.py (step 3) to disk, HERE (the cluster).
 
-        The client runs on the operator's PC and only holds the episode in memory; it sends it once, when it is over.
-        Same format as collect_waypoint_demos.py: ep_NNNN_seed<seed>.npz (arrays exterior_image, wrist_image,
-        joint_position, gripper_position, ft_force, peg_socket_offset, actions + prompt + seed) and one line per
-        episode appended to <out_dir>/index.jsonl. A failed episode (request["success"] false) is written as
-        fail_seed<seed>_<time>.npz and does not take an ep_ number.
-        out_dir is relative to the project root (the folder that holds expo_ft/) and must stay inside it.
+        The client runs on the operator's PC and only holds the episode in memory; when it is over it builds the
+        .npz (same keys as collect_waypoint_demos.py: exterior_image, wrist_image, joint_position, gripper_position,
+        ft_force, peg_socket_offset, actions + prompt + seed; losslessly compressed) and sends its bytes in ONE message.
+        This method checks them and writes the file as ep_NNNN_seed<seed>.npz (NNNN continues after the highest number
+        already in the folder), then appends one line to <out_dir>/index.jsonl.
+        out_dir is relative to the project root (the folder that holds expo_ft/) and must stay inside it. It is
+        checked WITHOUT following symlinks: demos/ is often a link to a scratch disk and that must keep working.
         """
         root = Path(__file__).resolve().parents[3]
-        out = (root / str(request["out_dir"])).resolve()
+        out = Path(os.path.normpath(root / str(request["out_dir"])))
         if root != out and root not in out.parents:
             return {"error": f"out_dir must be inside the project ({root}), got {request['out_dir']!r}"}
-        out.mkdir(parents=True, exist_ok=True)
         seed = int(request["seed"])
+        data = bytes(request["npz"])
+        with np.load(io.BytesIO(data)) as z:                      # refuse anything that is not a complete demo
+            missing = {"exterior_image", "wrist_image", "joint_position", "gripper_position", "ft_force",
+                       "peg_socket_offset", "actions", "prompt", "seed"} - set(z.files)
+            if missing:
+                return {"error": f"the .npz lacks {sorted(missing)}"}
+            steps = len(z["actions"])
+        out.mkdir(parents=True, exist_ok=True)
         if bool(request["success"]):
             numbers = [int(m.group(1)) for f in out.glob("ep_*.npz") if (m := re.match(r"ep_(\d+)_", f.name))]
             fname = f"ep_{(max(numbers) + 1) if numbers else 0:04d}_seed{seed}.npz"
         else:
             fname = f"fail_seed{seed}_{time.strftime('%H%M%S')}.npz"
-        arrays = {k: np.asarray(v) for k, v in request["arrays"].items()}
         tmp = out / f".tmp_{os.getpid()}.npz"                 # written fully, then renamed: no half-written demo
-        np.savez(tmp, **arrays, prompt=np.array(request["prompt"]), seed=np.array(seed))
+        tmp.write_bytes(data)
         os.replace(tmp, out / fname)
         with open(out / "index.jsonl", "a") as index:
             index.write(json.dumps({**request["info"], "file": fname}) + "\n")
         count = len(list(out.glob("ep_*.npz")))
-        logging.info("teleop demo saved: %s (%d steps, %d ep_ files in %s)", out / fname, len(arrays["actions"]), count, out)
+        logging.info("teleop demo saved: %s (%d steps, %d ep_ files in %s)", out / fname, steps, count, out)
         return {"file": fname, "path": str(out / fname), "count": count}
 
     def _task_geometry(self):
