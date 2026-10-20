@@ -34,7 +34,12 @@ Run:
 
 Controls (Tab first: the mouse must be captured, otherwise nothing moves):
     mouse        move the peg in the horizontal plane, in the directions of the EXTERIOR camera image:
-                 mouse right = to the right of the left image, mouse forward (up) = away from the camera
+                 mouse right = to the right of the left image, mouse forward (up) = away from the camera.
+                 No button to hold: once captured, every movement counts. The pixels travelled since the previous
+                 step are added up and sent as ONE move (a swipe = one step, capped at --max-xy-mm).
+    arrow keys   the same horizontal directions: Up = away from the camera, Down = towards it, Left / Right =
+                 left / right of the image. --key-xy-mm per step, repeated while the key is down; they add up with
+                 the mouse.
     W / S        peg up / down
     Shift        fine mode   (x 0.25: for the last millimetres)
     Ctrl         fast mode   (x 2.5)
@@ -167,9 +172,14 @@ class Inputs:
     fine: bool = False       # Shift
     fast: bool = False       # Ctrl
     wait: bool = False       # Space: one step without moving
+    left: bool = False       # arrow keys: horizontal moves in the directions of the exterior image
+    right: bool = False
+    forward: bool = False    # Up arrow: away from the camera
+    back: bool = False       # Down arrow: towards the camera
 
     def any(self):
-        return bool(self.dx or self.dy or self.up or self.down or self.wait)
+        return bool(self.dx or self.dy or self.up or self.down or self.wait
+                    or self.left or self.right or self.forward or self.back)
 
 
 def screen_axes(flip_x=False, flip_y=False, rotate_deg=0.0):
@@ -191,11 +201,13 @@ def screen_axes(flip_x=False, flip_y=False, rotate_deg=0.0):
     return right, forward
 
 
-def build_delta(inp, axes, xy_gain_mm, z_rate_mm, max_xy_mm, max_z_mm):
+def build_delta(inp, axes, xy_gain_mm, z_rate_mm, max_xy_mm, max_z_mm, key_xy_mm=2.0):
     """The peg translation (m, env frame) of one control step, from the inputs. Capped per step."""
     scale = 0.25 if inp.fine else (2.5 if inp.fast else 1.0)
     right, forward = axes
-    xy = xy_gain_mm * scale * (inp.dx * right + (-inp.dy) * forward)        # mm; pygame's y grows downwards
+    # mouse (pygame's y grows downwards) + arrow keys, both in the directions of the exterior image
+    xy = xy_gain_mm * scale * (inp.dx * right + (-inp.dy) * forward)
+    xy = xy + key_xy_mm * scale * ((int(inp.right) - int(inp.left)) * right + (int(inp.forward) - int(inp.back)) * forward)
     norm = float(np.linalg.norm(xy))
     if norm > max_xy_mm:
         xy = xy * (max_xy_mm / norm)
@@ -290,6 +302,8 @@ def main():
     # size of the moves
     p.add_argument("--xy-gain-mm", type=float, default=0.1, help="Peg move (mm) per mouse pixel, in the horizontal plane.")
     p.add_argument("--z-rate-mm", type=float, default=4.0, help="Peg move (mm) per step while W / S is down.")
+    p.add_argument("--key-xy-mm", type=float, default=2.0,
+                   help="Peg move (mm) per step while an arrow key is down (Shift x0.25, Ctrl x2.5).")
     p.add_argument("--max-xy-mm", type=float, default=10.0, help="Largest horizontal move per step (mm).")
     p.add_argument("--max-z-mm", type=float, default=15.0, help="Largest vertical move per step (mm).")
     p.add_argument("--cmd-gain", type=float, default=1.0,
@@ -303,6 +317,8 @@ def main():
 
     import pygame
     pygame.init()
+    # keys whose short taps (between two slow steps) must not be missed: remembered until the next step
+    LATCHED_KEYS = (pygame.K_w, pygame.K_s, pygame.K_SPACE, pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN)
     size = 224 * args.scale
     hud_height = 232
     screen = pygame.display.set_mode((max(2 * size, 1000), size + hud_height))
@@ -334,6 +350,7 @@ def main():
     shown = Inputs()                          # last inputs, for the HUD
     t_start = time.perf_counter()
     last_print = t_start
+    last_logged = None
     running = True
     while running:
         for event in pygame.event.get():
@@ -353,7 +370,7 @@ def main():
                     pygame.mouse.set_visible(not grabbed)
                     pygame.mouse.get_rel()                   # forget the jump caused by the capture
                     acc[:] = 0
-                elif event.key in (pygame.K_w, pygame.K_s, pygame.K_SPACE):
+                elif event.key in LATCHED_KEYS:
                     latched.add(event.key)
         keys = pygame.key.get_pressed()
         dx, dy = pygame.mouse.get_rel()
@@ -368,7 +385,11 @@ def main():
                      down=bool(keys[pygame.K_s] or pygame.K_s in latched),
                      fine=bool(keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]),
                      fast=bool(keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL]),
-                     wait=pygame.K_SPACE in latched)
+                     wait=pygame.K_SPACE in latched,
+                     left=bool(keys[pygame.K_LEFT] or pygame.K_LEFT in latched),
+                     right=bool(keys[pygame.K_RIGHT] or pygame.K_RIGHT in latched),
+                     forward=bool(keys[pygame.K_UP] or pygame.K_UP in latched),
+                     back=bool(keys[pygame.K_DOWN] or pygame.K_DOWN in latched))
         stepping = False
         if not session.over:
             if args.hold or args.continuous:
@@ -378,7 +399,8 @@ def main():
         if stepping:
             if args.hold:
                 inp = Inputs()
-            delta = build_delta(inp, axes, args.xy_gain_mm, args.z_rate_mm, args.max_xy_mm, args.max_z_mm)
+            delta = build_delta(inp, axes, args.xy_gain_mm, args.z_rate_mm, args.max_xy_mm, args.max_z_mm,
+                                args.key_xy_mm)
             session.step(delta)
             shown = inp
             acc[:] = 0
@@ -426,15 +448,18 @@ def main():
                       DIM)
         mode = "FINE" if shown.fine else ("FAST" if shown.fast else "normal")
         down_keys = [name for name, key in (("W", pygame.K_w), ("S", pygame.K_s), ("Space", pygame.K_SPACE),
-                                            ("Shift", pygame.K_LSHIFT), ("Ctrl", pygame.K_LCTRL)) if keys[key]]
+                                            ("Left", pygame.K_LEFT), ("Right", pygame.K_RIGHT), ("Up", pygame.K_UP),
+                                            ("Down", pygame.K_DOWN), ("Shift", pygame.K_LSHIFT),
+                                            ("Ctrl", pygame.K_LCTRL)) if keys[key]]
         y = draw_text(screen, font, 10, y,
                       f"inputs: mouse pending ({acc[0]:+4d},{acc[1]:+4d}) px   keys: {' '.join(down_keys) or '-'}   "
                       f"mode: {mode}   mouse {'CAPTURED' if grabbed else 'free'}", DIM)
         y = draw_text(screen, font, 10, y,
                       f"mouse right -> env ({axes[0][0]:+.2f},{axes[0][1]:+.2f})  forward -> ({axes[1][0]:+.2f},"
-                      f"{axes[1][1]:+.2f})   gain {args.xy_gain_mm:g} mm/px   W/S {args.z_rate_mm:g} mm/step", DIM)
+                      f"{axes[1][1]:+.2f})   mouse {args.xy_gain_mm:g} mm/px   arrows {args.key_xy_mm:g} mm/step   "
+                      f"W/S {args.z_rate_mm:g} mm/step", DIM)
         draw_text(screen, font, 10, y,
-                  "Tab capture   mouse xy   W/S up/down   Shift fine   Ctrl fast   Space wait   R new episode   Esc quit", DIM)
+                  "Tab capture  mouse/arrows xy  W/S up/down  Shift fine  Ctrl fast  Space wait  R new episode  Esc quit", DIM)
         pygame.display.flip()
 
         # -- pace the loop --
@@ -445,8 +470,10 @@ def main():
         now = time.perf_counter()
         if now - last_print > 5.0 and env.timings.get("teleop_step"):
             last_print = now
-            print(f"  teleop_step {env.mean_ms('teleop_step'):.0f} ms (p95 {env.p95_ms('teleop_step'):.0f})   "
-                  f"step {session.step_count}")
+            if (session.seed, session.step_count) != last_logged:      # nothing new while idle / after the end
+                last_logged = (session.seed, session.step_count)
+                print(f"  teleop_step {env.mean_ms('teleop_step'):.0f} ms (p95 {env.p95_ms('teleop_step'):.0f})   "
+                      f"step {session.step_count}")
         if args.max_seconds and now - t_start > args.max_seconds:
             running = False
 
