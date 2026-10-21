@@ -1,8 +1,10 @@
 #!/bin/bash
 # Usage:
-#   sbatch jobs/run_forge_eval_job.sh [--checkpoint DIR] [--n-episodes N]
+#   sbatch jobs/run_forge_eval_job.sh [--checkpoint DIR] [--n-episodes N] [--max-steps N]
 #     --checkpoint   SFT checkpoint STEP directory (the folder that contains params/). Omit: zero-shot pi05_droid_jointpos.
 #     --n-episodes   number of episodes (default 5)
+#     --max-steps    episode length in steps (default: the YAML's max_steps_per_episode, 150). Server AND client
+#                    use it: a copy of the YAML with this value is written to logs/slurm/ and used by both
 #   (sbatch's own options, e.g. --time, go BEFORE the script name; everything after it is read by this script)
 #   sbatch jobs/run_forge_eval_job.sh                                        # zero-shot pi05_droid_jointpos, 5 episodes
 #   sbatch jobs/run_forge_eval_job.sh --checkpoint <sft_checkpoint_step_dir> --n-episodes 20
@@ -36,9 +38,10 @@ set -u  # catch unset-variable typos; NOT set -e (would fight the trap/backgroun
 
 usage() {
     cat <<'EOF'
-Usage: sbatch jobs/run_forge_eval_job.sh [--checkpoint DIR] [--n-episodes N]
+Usage: sbatch jobs/run_forge_eval_job.sh [--checkpoint DIR] [--n-episodes N] [--max-steps N]
   --checkpoint   SFT checkpoint STEP directory (the folder that contains params/); omit for zero-shot
   --n-episodes   number of episodes (default 5)
+  --max-steps    episode length in steps (default: the YAML's, 150)
 EOF
 }
 need_value() {   # need_value <flag> <number of remaining args> <next arg>
@@ -47,10 +50,12 @@ need_value() {   # need_value <flag> <number of remaining args> <next arg>
 
 CHECKPOINT=""              # optional: SFT checkpoint STEP directory (the folder that contains params/)
 N_EPISODES=5
+MAX_STEPS=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --checkpoint) need_value "$1" "$#" "${2-}"; CHECKPOINT="$2"; shift 2 ;;
         --n-episodes) need_value "$1" "$#" "${2-}"; N_EPISODES="$2"; shift 2 ;;
+        --max-steps) need_value "$1" "$#" "${2-}"; MAX_STEPS="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -63,6 +68,16 @@ SERVER_LOG="logs/slurm/${SLURM_JOB_NAME}_${SLURM_JOB_ID}_server.log"
 
 cd "$REPO_ROOT" || { echo "FATAL: cannot cd to $REPO_ROOT"; exit 1; }
 mkdir -p logs/slurm || { echo "FATAL: cannot create logs/slurm"; exit 1; }
+
+# --max-steps: a copy of the YAML with the new episode length is used by the server AND the client, so both agree.
+if [ -n "$MAX_STEPS" ]; then
+    DERIVED="logs/slurm/${SLURM_JOB_NAME}_${SLURM_JOB_ID}_config.yaml"
+    cp "$CONFIG" "$DERIVED" || { echo "FATAL: cannot write $DERIVED"; exit 1; }
+    sed -i -E "s/^(max_steps_per_episode:)[[:space:]]*[0-9]+/\1 $MAX_STEPS/" "$DERIVED"
+    grep -q -E "^max_steps_per_episode: $MAX_STEPS( |$)" "$DERIVED" || { echo "FATAL: could not set max_steps_per_episode in $DERIVED"; exit 1; }
+    CONFIG="$DERIVED"
+    echo "[config] derived config: $CONFIG (max_steps_per_episode=$MAX_STEPS)"
+fi
 
 SERVER_PID=""
 
