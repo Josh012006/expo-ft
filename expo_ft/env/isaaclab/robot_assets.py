@@ -23,6 +23,8 @@ Topology of the output (default prim /World, so Isaac Lab spawns it as .../Robot
     /World/robot          NVIDIA's articulation (panda_link0..8, Gripper/Robotiq_2F_85/..) + the 4 bodies above
     /World/TactileZones   (taxel variant only) 2 x 28 zone rigid bodies, fixed-jointed to the inner fingers, 4 mm boxes
                           that REPLACE the stock fingertip pads as the contact surface (NVIDIA's builder disables them)
+NVIDIA's TSF-85 cases (visual only: body and collider both disabled) lose their leftover RigidBodyAPI in our layer
+(drop_disabled_rigid_bodies), which PhysX reports as an error when it is nested in the finger's rigid body.
 If PhysX refuses the articulation because of its number of links, rebuild with exclude_zone_joints=True
 (--exclude-zone-joints / YAML `tactile_exclude_zone_joints: true`): the zone joints then leave the articulation.
 """
@@ -42,7 +44,7 @@ from expo_ft.env.isaaclab.robots import (
     ASSETS_DIR, ROBOTIQ_SOURCE_USD, TACTILE_REPO, TSF85_USD, RobotProfile,
 )
 
-BUILDER_VERSION = 1
+BUILDER_VERSION = 2
 ROBOT = "/World/robot"
 REQUIRED_BODIES = ["panda_link%d" % i for i in range(9)] + [
     "base_link", "force_sensor", "panda_fingertip_centered", "panda_leftfinger", "panda_rightfinger"]
@@ -131,6 +133,35 @@ def _fixed_joint(stage, path, body0, body1, T0=None, T1=None):
         q = _quat(T[:3, :3])
         getattr(j, f"CreateLocalRot{suffix}Attr")().Set(Gf.Quatf(float(q[0]), Gf.Vec3f(*[float(v) for v in q[1:]])))
     return j
+
+
+def _rigid_body_enabled(prim) -> bool:
+    a = prim.GetAttribute("physics:rigidBodyEnabled")
+    return not (a and a.HasValue() and a.Get() is False)
+
+
+def drop_disabled_rigid_bodies(stage, log=print) -> int:
+    """Remove the RigidBodyAPI of the prims NVIDIA left with `rigidBodyEnabled = False` (the TSF-85 case, one per finger).
+
+    They are not bodies (disabled) and their collider is disabled too, so they only carry the visual mesh; but the API is
+    still there, nested in the enabled rigid body of the inner finger, and PhysX logs an error for it ("missing xformstack
+    reset when child of another enabled rigid body ... unpredicted results"). Removing the API in OUR layer (an override,
+    NVIDIA's file is untouched) leaves the mesh as a plain visual child of the finger and silences the error.
+    A prim is left alone, with a WARNING, if a collider below it is enabled: removing its body would then change the physics."""
+    n = 0
+    for p in list(Usd.PrimRange(stage.GetPrimAtPath(ROBOT))):
+        if not p.HasAPI(UsdPhysics.RigidBodyAPI) or _rigid_body_enabled(p):
+            continue
+        live = [c.GetPath() for c in Usd.PrimRange(p) if c.HasAPI(UsdPhysics.CollisionAPI)
+                and UsdPhysics.CollisionAPI(c).GetCollisionEnabledAttr().Get() is not False]
+        if live:
+            log(f"[robot_assets] WARNING {p.GetPath()}: disabled rigid body with enabled colliders {live}, left as it is")
+            continue
+        p.RemoveAPI(UsdPhysics.RigidBodyAPI)
+        n += 1
+    if n:
+        log(f"[robot_assets] {n} disabled rigid bodies (visual-only TSF-85 cases) turned into plain visual prims")
+    return n
 
 
 # ---- the four bodies FORGE looks for ----------------------------------------------------------------------------------
@@ -258,6 +289,7 @@ def build_robot_usd(profile: RobotProfile, out_usd: Path, exclude_zone_joints=Fa
     else:
         stage.DefinePrim(ROBOT).GetReferences().AddReference(str(ROBOTIQ_SOURCE_USD.resolve()))
 
+    drop_disabled_rigid_bodies(stage, log)
     geom = add_forge_links(stage, log)
     stage.GetRootLayer().Export(str(out_usd))
     summary = verify_robot_usd(out_usd, tactile=profile.tactile, log=log)
@@ -275,11 +307,11 @@ def verify_robot_usd(path, tactile, log=print) -> dict:
     roots = [p for p in Usd.PrimRange(robot) if p.HasAPI(UsdPhysics.ArticulationRootAPI)]
     if len(roots) != 1:
         raise RuntimeError(f"{path}: {len(roots)} articulation roots below {ROBOT}, expected 1")
-    def enabled(p):                     # NVIDIA disables the rigid body API of the visual-only TSF-85 case this way
-        a = p.GetAttribute("physics:rigidBodyEnabled")
-        return not (a and a.HasValue() and a.Get() is False)
-
+    enabled = _rigid_body_enabled
     bodies = {str(p.GetPath()): p for p in Usd.PrimRange(robot) if p.HasAPI(UsdPhysics.RigidBodyAPI) and enabled(p)}
+    disabled = sorted(str(p.GetPath()) for p in Usd.PrimRange(robot) if p.HasAPI(UsdPhysics.RigidBodyAPI) and not enabled(p))
+    if disabled:                        # PhysX would log "missing xformstack reset ..." for each of them
+        log(f"[robot_assets] WARNING {len(disabled)} disabled rigid bodies remain under {ROBOT}: {disabled}")
     names = {p.GetName() for p in bodies.values()}
     missing = [n for n in REQUIRED_BODIES if n not in names]
     if missing:
