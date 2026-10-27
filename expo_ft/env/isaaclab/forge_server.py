@@ -232,6 +232,7 @@ class ForgeBackend:
         self._last_done = False
         self._last_success = False
         self._last_reward = 0.0
+        self._grasp_points = None                       # vertices of the robot bodies, filled by the first grasp_geometry call
 
     # -- Backend protocol -------------------------------------------------
 
@@ -275,6 +276,8 @@ class ForgeBackend:
             return float(torch.linalg.norm(pos[names.index("panda_leftfinger")] - pos[names.index("panda_rightfinger")]))
         if kind == "task_geometry":
             return self._task_geometry()
+        if kind == "grasp_geometry":    # scripts/isaaclab/grasp_check.py: how far does the peg stick out below the fingers?
+            return self._grasp_geometry(float(request.get("lateral_min_mm", 5.0)), int(request.get("top", 8)))
         if kind == "ik_joint_target":
             return self._ik_joint_target(request["delta_pos"], request["target_quat"])
         if kind == "teleop_step":
@@ -364,6 +367,57 @@ class ForgeBackend:
             "success_xy": 0.0025,
             # Same formula as _get_curr_successes for peg_insert: fraction of the hole depth.
             "success_z": hole_depth * float(task.success_threshold),
+        }
+
+    def _grasp_geometry(self, lateral_min_mm, top):
+        """Heights of the lowest vertices of the robot bodies above the held peg's base, along the peg axis (mm).
+
+        The peg base is 0, positive = towards the gripper. `h_min_mm` is the lowest vertex of any body that is at least
+        `lateral_min_mm` away from the peg axis (so it cannot go into the hole): when the peg is pushed in, that body
+        reaches the socket top, `hole_depth` above the fully inserted peg base, when the peg base is still
+        `stall_z_pred_mm = hole_depth - h_min` above its final height (negative: the fingers never touch the socket).
+        Read-only, the simulation is not stepped. The vertices come from the USD (see grasp_geometry.py), the poses from
+        the simulation."""
+        from isaaclab_tasks.direct.factory import factory_utils
+        from expo_ft.env.isaaclab import grasp_geometry as gg
+        env = self.env
+        robot = env._robot
+        names = list(robot.body_names)
+        if self._grasp_points is None:
+            import omni.usd
+            root = re.sub(r"env_\.\*", "env_0", robot.cfg.prim_path)
+            self._grasp_points = gg.collect_body_points(omni.usd.get_context().get_stage(), root, names)
+            logging.info(f"grasp_geometry: {len(self._grasp_points[0])}/{len(names)} bodies with vertices under {root}")
+        points, source = self._grasp_points
+
+        origin = env.scene.env_origins[0]
+        held_pos = env._held_asset.data.root_pos_w - env.scene.env_origins
+        base_pos, base_quat = factory_utils.get_held_base_pose(
+            held_pos, env._held_asset.data.root_quat_w, env.cfg_task.name, env.cfg_task.fixed_asset_cfg,
+            env.num_envs, env.device)
+        base = base_pos[0].detach().cpu().numpy()
+        axis = gg.quat_to_matrix(base_quat[0].detach().cpu().numpy())[:, 2]          # the peg's own z axis
+        tip = env.fingertip_midpoint_pos[0].detach().cpu().numpy()
+        if float(np.dot(tip - base, axis)) < 0:                                      # make "+" point to the gripper
+            axis = -axis
+        pos = (robot.data.body_pos_w[0] - origin).detach().cpu().numpy()
+        quat = robot.data.body_quat_w[0].detach().cpu().numpy()
+        rows = gg.lowest_per_body(points, names, pos, quat, base, axis, lateral_min=lateral_min_mm * 1e-3)
+
+        hole_depth_mm = float(env.cfg_task.fixed_asset_cfg.height) * 1000.0
+        h_min_mm = rows[0][1] * 1000.0 if rows else None
+        return {
+            "robot": env._profile.name,
+            "hole_depth_mm": hole_depth_mm,
+            "peg_tilt_deg": float(np.degrees(np.arccos(np.clip(abs(axis[2]), 0.0, 1.0)))),   # peg axis vs the vertical
+            "fingertip_midpoint_height_mm": float(np.dot(tip - base, axis)) * 1000.0,        # where FORGE says the grasp is
+            "lateral_min_mm": lateral_min_mm,
+            "h_min_mm": h_min_mm,
+            "h_min_body": rows[0][0] if rows else None,
+            "stall_z_pred_mm": None if h_min_mm is None else hole_depth_mm - h_min_mm,
+            "lowest": [{"body": n, "h_mm": h * 1000.0, "lateral_mm": lat * 1000.0, "vertices": source[n]}
+                       for n, h, lat in rows[:top]],
+            "bodies_with_vertices": len(points), "bodies": len(names),
         }
 
     def _ik_joint_target(self, delta_pos, target_quat):
