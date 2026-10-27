@@ -96,7 +96,7 @@ GRIPPER_CLOSED = 1.0      # 0 = open, 1 = closed (DROID convention); the peg sta
 GRIPPER_TOL = 0.001       # finger position may drift at most 1 mm from its value at reset
 HOLD_AFTER_SUCCESS = 5    # keep recording this many steps once inserted, then stop the episode
 MIN_HOVER_MARGIN = 0.004  # smallest hover height above the hole's top edge, whatever the jitter
-BANNER_H = 32             # height (px) of the text strip under the video frames (224 + 32 = 256: no resize)
+BANNER_H = 32             # height (px) of the text strip under the video frames (448 + 32 = 480: a multiple of 16, no resize)
 
 
 class Waypoint(NamedTuple):
@@ -143,6 +143,11 @@ RECORDED = {
     "extra/ft_force": "ft_force",                  # not used by pi05 (kept for the force / tactile work)
     "extra/peg_socket_offset": "peg_socket_offset",
 }
+# Saved only when the server sends it (robot profile with taxels, `robot: robotiq_2f85_tsf`): (T, 2, 7, 4) N, [:, 0] left
+# finger, [:, 1] right finger, row 0 = fingertip. Demos of other robots simply have no "tactile" array.
+RECORDED_OPTIONAL = {
+    "extra/tactile": "tactile",
+}
 
 
 def make_debug(client, env_id):
@@ -154,14 +159,13 @@ def make_debug(client, env_id):
 
 # ---- Video ------------------------------------------------------------------------------------
 def video_frame(obs, text):
-    """Exterior and wrist images side by side, with a one-line text strip under them."""
-    from PIL import Image, ImageDraw
-    ext = np.asarray(obs["observation/exterior_image_1_left"], dtype=np.uint8)
-    wrist = np.asarray(obs["observation/wrist_image_left"], dtype=np.uint8)
-    images = np.concatenate([ext, wrist], axis=1)
-    banner = Image.new("RGB", (images.shape[1], BANNER_H), (0, 0, 0))
-    ImageDraw.Draw(banner).text((4, 11), text, fill=(255, 255, 255))
-    return np.concatenate([images, np.asarray(banner)], axis=0)
+    """Exterior | wrist side by side, the taxel panel below them (448 x 448), a one-line text strip under it all."""
+    from expo_ft.env.video_panels import compose_frame, text_banner
+    tactile = obs.get("extra/tactile")
+    frame = compose_frame(obs["observation/exterior_image_1_left"], obs["observation/wrist_image_left"],
+                          None if tactile is None else np.asarray(tactile, dtype=np.float32))
+    banner = text_banner([(text, (255, 255, 255))], frame.shape[1], BANNER_H)
+    return frame if banner is None else np.concatenate([frame, banner], axis=0)
 
 
 def write_video(path, frames, fps):
@@ -193,7 +197,8 @@ def run_episode(client, env_id, seed, geom, args, rng):
     wp = 0
     entered = {waypoints[0].name: 0}             # step at which each waypoint was entered (for the log)
 
-    frames = {name: [] for name in RECORDED.values()}
+    recorded = {**RECORDED, **{k: v for k, v in RECORDED_OPTIONAL.items() if k in obs}}
+    frames = {name: [] for name in recorded.values()}
     actions = []
     video = []
     in_a_row = 0                                 # consecutive steps for which FORGE says "inserted"
@@ -228,7 +233,7 @@ def run_episode(client, env_id, seed, geom, args, rng):
             raise RuntimeError(f"non-finite action at step {t} (seed {seed}): {action}")
 
         # Record the observation the action was computed from, then act.
-        for key, name in RECORDED.items():
+        for key, name in recorded.items():
             frames[name].append(np.asarray(obs[key]))
         actions.append(action)
         if args.video_dir:
@@ -260,6 +265,7 @@ def run_episode(client, env_id, seed, geom, args, rng):
         "steps": len(actions),
         "final_offset_mm": (final * 1000).round(2).tolist(),
         "max_force_N": float(np.linalg.norm(arrays["ft_force"], axis=1).max()),
+        **({"max_tactile_N": float(arrays["tactile"].max())} if "tactile" in arrays else {}),
         "waypoint_entered_at_step": entered,
         "clipped_steps": clipped_steps,
         "hover_margin_mm": round(hover_margin * 1000, 2),

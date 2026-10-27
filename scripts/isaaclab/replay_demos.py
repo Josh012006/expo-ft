@@ -23,8 +23,10 @@ at `drift` and at where it starts (printed: first step beyond the threshold) bef
 The report is also written to <demos-dir>/replay_report.json.
 
 Videos (to show the demos to someone): add --save-videos [--video-first 20]. One mp4 per replayed demo in
-<demos-dir>/replay_videos/ (--video-dir to change), exterior + wrist camera side by side with the same banner as the
-evaluation videos (step, peg -> hole offset, closest approach, "inserted" flag, contact force, command gap, verdict):
+<demos-dir>/replay_videos/ (--video-dir to change), 448 x 496: exterior + wrist camera side by side, the taxels of the
+two fingers below (a placeholder when the server's robot has none), and the same banner as the evaluation videos (step,
+peg -> hole offset, closest approach, "inserted" flag, contact force, command gap, taxel max, verdict). The look is
+defined once in expo_ft/env/video_panels.py:
 
     python scripts/isaaclab/replay_demos.py --config configs/task/isaaclab/peg_insert_forge_pi05.yaml \
         --demos-dir demos/isaaclab/ForgePegInsertTeleop --save-videos --video-first 20
@@ -43,44 +45,43 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from expo_ft.env.env_client import EnvClient  # noqa: E402
+from expo_ft.env.video_panels import BANNER_H, compose_frame, tactile_stats, text_banner  # noqa: E402
 
 HOLD_AFTER_SUCCESS = 5    # same as the collectors: success = "inserted" this many steps in a row
-BANNER_H = 48             # height (px) of the metrics banner under the video frames (224 + 48 = 272, a multiple of 16)
 
 
 def _frame(obs):
-    """Exterior + wrist camera side by side (uint8, H x 2W x 3), or None if the observation has no images."""
+    """Exterior | wrist on top, taxel panel below (uint8, 448 x 448 x 3 for 224 px cameras), or None without images."""
     ext = obs.get("observation/exterior_image_1_left")
     wrist = obs.get("observation/wrist_image_left")
     if ext is None or wrist is None:
         return None
-    return np.concatenate([np.asarray(ext, dtype=np.uint8), np.asarray(wrist, dtype=np.uint8)], axis=1)
+    tactile = obs.get("extra/tactile")
+    return compose_frame(ext, wrist, None if tactile is None else np.asarray(tactile, dtype=np.float32))
 
 
 def _banner(info, verdict, width):
     """Three text lines under a video frame (same content as the evaluation videos)."""
-    from PIL import Image, ImageDraw
     mm = info["offset_mm"]
     xy = float(np.hypot(mm[0], mm[1]))
-    force, gap = info["force_n"], info["gap_mrad"]
+    force, gap, tac = info["force_n"], info["gap_mrad"], info.get("tactile_max_n")
     line1 = f"t={info['step']:3d}  xy={xy:6.2f} mm  z={mm[2]:+6.1f} mm   x={mm[0]:+6.2f} y={mm[1]:+6.2f}"
     line2 = (f"closest xy {info['closest_xy_mm']:5.2f} mm @t={info['closest_step']:<3d} | "
              f"{'INSERTED' if info['flag'] else '-':8s} | replay: {verdict}")
-    line3 = (f"contact force {'-' if force is None else f'{force:5.2f} N'}  |  "
-             f"command gap {'-' if gap is None else f'{gap:5.1f} mrad'}")
-    img = Image.new("RGB", (width, BANNER_H), (0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.text((4, 5), line1, fill=(255, 255, 255))
-    draw.text((4, 18), line2, fill=(90, 220, 120) if (info["flag"] or verdict == "SUCCESS") else (200, 200, 200))
-    draw.text((4, 31), line3, fill=(120, 180, 255))
-    return np.asarray(img)
+    line3 = (f"force {'-' if force is None else f'{force:5.2f} N'}  |  "
+             f"cmd gap {'-' if gap is None else f'{gap:5.1f} mrad'}"
+             + ("" if tac is None else f"  |  taxel max {tac:5.2f} N"))
+    return text_banner([(line1, (255, 255, 255)),
+                        (line2, (90, 220, 120) if (info["flag"] or verdict == "SUCCESS") else (200, 200, 200)),
+                        (line3, (120, 180, 255))], width, BANNER_H)
 
 
 def _write_video(path, frames, infos, verdict, fps):
     import imageio.v3 as iio
     out = []
     for frame, info in zip(frames, infos):
-        out.append(np.concatenate([frame, _banner(info, verdict, frame.shape[1])], axis=0))
+        banner = _banner(info, verdict, frame.shape[1])
+        out.append(frame if banner is None else np.concatenate([frame, banner], axis=0))
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     iio.imwrite(path, out, fps=fps, codec="libx264")
 
@@ -112,9 +113,10 @@ def replay_one(client, env_id, path, drift_warn_mm, video_path=None, fps=10):
         if xy < closest[0]:
             closest = (xy, step)
         force = o.get("extra/ft_force")
+        stats = tactile_stats(o.get("extra/tactile"))
         frames.append(fr)
         infos.append({"step": step, "offset_mm": off.tolist(), "closest_xy_mm": closest[0], "closest_step": closest[1],
-                      "flag": bool(flag), "gap_mrad": gap,
+                      "flag": bool(flag), "gap_mrad": gap, "tactile_max_n": None if stats is None else stats[0],
                       "force_n": None if force is None else float(np.linalg.norm(np.asarray(force, dtype=np.float64).reshape(-1)[:3]))})
 
     record(obs, 0, False, None)

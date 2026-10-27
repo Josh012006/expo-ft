@@ -115,8 +115,9 @@ _unpackb = functools.partial(msgpack.unpackb, object_hook=_unpack_array)
 # only used to turn "mouse right / forward" into directions of the table plane as seen in the left image.
 EXTERIOR_EYE = (1.05, 0.35, 0.35)
 EXTERIOR_TARGET = (0.57, 0.02, 0.08)
-# Wrist camera pose on panda_hand (forge_env_patched.py WRIST_ROT, quaternion w x y z, ROS convention:
-# image right = camera x, image down = camera y, optical axis = camera z).
+# Wrist camera orientation in the fingertip frame (quaternion w x y z, ROS convention: image right = camera x, image
+# down = camera y, optical axis = camera z). This is the Franka Hand camera; the server tells the one of its own robot
+# (debug op "robot_info", see Session.start), this value is only the fallback for a server that does not know the op.
 WRIST_ROT = (0.6916, -0.1471, -0.1471, 0.6916)
 HOLD_AFTER_SUCCESS = 5      # same as the scripted demos: the episode ends this many steps after "inserted"
 # observation key -> array name in the .npz (same as RECORDED of collect_waypoint_demos.py)
@@ -128,6 +129,8 @@ RECORDED = {
     "extra/ft_force": "ft_force",
     "extra/peg_socket_offset": "peg_socket_offset",
 }
+# saved only when the server sends it (robot with taxels): (T, 2, 7, 4) N, [:, 0] left finger, [:, 1] right
+RECORDED_OPTIONAL = {"extra/tactile": "tactile"}
 
 
 # ---- Connection to forge_server.py ----------------------------------------------------------------
@@ -265,14 +268,14 @@ def quat_to_matrix(q):
                      [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
 
 
-def wrist_axes(hand_quat, flip_x=False, flip_y=False, rotate_deg=0.0):
+def wrist_axes(hand_quat, flip_x=False, flip_y=False, rotate_deg=0.0, wrist_rot=WRIST_ROT):
     """Unit vectors (x, y of the env frame) of 'towards the right' and 'towards the top' of the WRIST image.
 
     The camera is fixed on the hand, whose orientation is held (hand_quat = fingertip quaternion of the server,
     w x y z): image right / up are the camera's x / -y axes in the env frame, projected on the horizontal plane.
     The hand looks down, so the camera is nearly vertical (tilted ~24 deg) and these projections are well defined.
     """
-    rot = quat_to_matrix(hand_quat) @ quat_to_matrix(WRIST_ROT)
+    rot = quat_to_matrix(hand_quat) @ quat_to_matrix(wrist_rot)
     right, up = rot[:2, 0], -rot[:2, 1]
     right, up = right / np.linalg.norm(right), up / np.linalg.norm(up)
     a = np.deg2rad(rotate_deg)
@@ -281,11 +284,11 @@ def wrist_axes(hand_quat, flip_x=False, flip_y=False, rotate_deg=0.0):
     return (-right if flip_x else right), (-up if flip_y else up)
 
 
-def view_axes(args, hand_quat):
+def view_axes(args, hand_quat, wrist_rot=WRIST_ROT):
     """Directions of mouse right / mouse up in the env frame, for the chosen view (wrist or exterior image)."""
     if args.view == "exterior":
         return screen_axes(args.flip_x, args.flip_y, args.rotate_deg)
-    return wrist_axes(hand_quat, args.flip_x, args.flip_y, args.rotate_deg)
+    return wrist_axes(hand_quat, args.flip_x, args.flip_y, args.rotate_deg, wrist_rot)
 
 
 def build_delta(inp, axes, xy_gain_mm, z_rate_mm, max_xy_mm, max_z_mm, key_xy_mm=2.0):
@@ -317,7 +320,12 @@ class Session:
         self.seed = seed
         self.obs = self.env.reset(seed)
         self.quat0 = self.env.debug("fingertip_pose")["quat"]       # orientation held for the whole episode
-        self.axes = view_axes(self.args, self.quat0)               # mouse right / up in the env frame
+        if getattr(self, "wrist_rot", None) is None:                # camera of the server's robot (asked once)
+            robot = self.env.debug("robot_info")
+            rot = robot.get("wrist_rot_ros_in_fingertip") if isinstance(robot, dict) else None
+            self.wrist_rot = tuple(rot) if rot else WRIST_ROT
+            self.robot_name = robot.get("name", "?") if isinstance(robot, dict) else "?"
+        self.axes = view_axes(self.args, self.quat0, self.wrist_rot)   # mouse right / up in the env frame
         self.step_count = 0
         self.success_run = 0
         self.success = False
@@ -326,7 +334,8 @@ class Session:
         self.clipped_steps = 0
         self.last_delta = np.zeros(3)
         self.last_clipped = False
-        self.frames = {name: [] for name in RECORDED.values()}      # what is saved: the observations ...
+        self.recorded = {**RECORDED, **{k: v for k, v in RECORDED_OPTIONAL.items() if k in self.obs}}
+        self.frames = {name: [] for name in self.recorded.values()}   # what is saved: the observations ...
         self.actions = []                                           # ... and the actions sent
         self.idle_steps = 0                                         # steps without any move
         self.max_force = 0.0
@@ -338,7 +347,7 @@ class Session:
         if self.t_first is None:
             self.t_first = time.perf_counter()
         # the observation the action is computed from (the one on screen), like the scripted demos
-        for key, name in RECORDED.items():
+        for key, name in self.recorded.items():
             self.frames[name].append(np.asarray(self.obs[key]))
         r = self.env.teleop_step(delta, self.quat0, self.args.cmd_gain, self.args.max_joint_step)
         self.t_last = time.perf_counter()

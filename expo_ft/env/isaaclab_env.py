@@ -22,14 +22,16 @@ import os
 import numpy as np
 
 from expo_ft.env.env_client import EnvClientWrapper
+from expo_ft.env.video_panels import TACTILE_VMAX, compose_frame, tactile_stats, text_banner
 
 
 class IsaacLabEnvWrapper:
     """Drop-in replacement for EnvClientWrapper/ManiSkillEnvWrapper, backed
     by an Isaac Lab / FORGE environment server."""
 
-    BANNER_H = 48      # height (px) of the metrics banner under the eval video frames (224 + 48 = 272: a multiple of 16,
-                       # otherwise the video encoder rescales the frames)
+    BANNER_H = 48      # height (px) of the metrics banner under the eval video frames. A frame is 448 x 448 (two cameras on
+                       # top, the taxel panel below, see video_panels.py) + 48 = 496: a multiple of 16, otherwise the video
+                       # encoder rescales the frames
     LAST_N = 20        # "last 20 steps" window of the contact-force / command-gap statistics of an episode
 
     def __init__(self, env_creation_request: dict, cfg=None):
@@ -89,31 +91,34 @@ class IsaacLabEnvWrapper:
         self._last_q = None           # joint positions of the last observation
         self._last_gap = None         # gap of the last command (video banner)
 
+        # Taxels (robot profile with tactile zones: the server then sends extra/tactile, (2, 7, 4) N). The video panel
+        # below the cameras is drawn for every robot (a placeholder without taxels) so that all videos have the same
+        # 448 x 448 layout; `video_tactile_panel: false` in the YAML turns it off (cameras only, 448 x 224).
+        self._tactile = None          # last extra/tactile of the episode
+        self._tactile_max = []        # max over the zones, at every observation (N)
+        self._tactile_panel = bool(getattr(cfg, "video_tactile_panel", True))
+        self._tactile_vmax = float(getattr(cfg, "tactile_vmax", TACTILE_VMAX))
+
         logging.info(f"IsaacLabEnvWrapper: connected, task={self.task_description!r}")
 
     def _banner(self, info, verdict, width):
         """Two text lines under a video frame, like the demo collector's videos: step, peg offset
         (xy distance, z, x, y), closest approach so far, the server's "inserted" flag and the verdict
         of the whole episode. Returns a (BANNER_H, width, 3) uint8 array, or None if PIL is missing."""
-        try:
-            from PIL import Image, ImageDraw
-        except ImportError:
-            return None
         mm = info["offset_mm"]
         xy = float(np.hypot(mm[0], mm[1]))
-        force, gap = info.get("force_n"), info.get("gap_mrad")
+        force, gap, tac = info.get("force_n"), info.get("gap_mrad"), info.get("tactile_max_n")
         line1 = (f"t={info['step']:3d}  xy={xy:6.2f} mm  z={mm[2]:+6.1f} mm   "
                  f"x={mm[0]:+6.2f} y={mm[1]:+6.2f}")
         line2 = (f"closest xy {info['closest_xy_mm']:5.2f} mm @t={info['closest_step']:<3d} | "
                  f"{'INSERTED' if info['flag'] else '-':8s} | episode: {verdict}")
-        line3 = (f"contact force {'-' if force is None else f'{force:5.2f} N'}  |  "
-                 f"command gap {'-' if gap is None else f'{gap:5.1f} mrad'}")
-        banner = Image.new("RGB", (width, self.BANNER_H), (0, 0, 0))
-        draw = ImageDraw.Draw(banner)
-        draw.text((4, 5), line1, fill=(255, 255, 255))
-        draw.text((4, 18), line2, fill=(90, 220, 120) if (info["flag"] or verdict == "SUCCESS") else (200, 200, 200))
-        draw.text((4, 31), line3, fill=(120, 180, 255))
-        return np.asarray(banner)
+        line3 = (f"force {'-' if force is None else f'{force:5.2f} N'}  |  "
+                 f"cmd gap {'-' if gap is None else f'{gap:5.1f} mrad'}"
+                 + ("" if tac is None else f"  |  taxel max {tac:5.2f} N"))
+        return text_banner([
+            (line1, (255, 255, 255)),
+            (line2, (90, 220, 120) if (info["flag"] or verdict == "SUCCESS") else (200, 200, 200)),
+            (line3, (120, 180, 255))], width, self.BANNER_H)
 
     def _flush_video(self):
         """Write the accumulated frames of the episode just finished. Called
@@ -145,6 +150,10 @@ class IsaacLabEnvWrapper:
             self._peg_offsets.append(off)
             q = obs.get("observation/joint_position")
             self._last_q = None if q is None else np.asarray(q, dtype=np.float64).reshape(-1)[:7]
+            tactile = obs.get("extra/tactile")
+            self._tactile = None if tactile is None else np.asarray(tactile, dtype=np.float32)
+            if self._tactile is not None:
+                self._tactile_max.append(tactile_stats(self._tactile)[0])
             force = obs.get("extra/ft_force")
             if force is not None:
                 self._forces.append(float(np.linalg.norm(np.asarray(force, dtype=np.float64).reshape(-1)[:3])))
@@ -179,11 +188,17 @@ class IsaacLabEnvWrapper:
             g = np.asarray(self._gaps)
             extra["gap_last20_mrad"] = float(g[-n_last:].mean())
             extra["gap_mean_mrad"] = float(g.mean())
+        if self._tactile_max:                    # robot with taxels: max over the 56 zones, per step (net contact force)
+            t = np.asarray(self._tactile_max)
+            extra["tactile_max_N"] = float(t.max())
+            extra["tactile_last20_N"] = float(t[-n_last:].mean())
         extra_txt = ""
         if "force_last20_N" in extra:
             extra_txt += f" | force last {n_last} steps {extra['force_last20_N']:.2f} N (max {extra['force_max_N']:.2f})"
         if "gap_last20_mrad" in extra:
             extra_txt += f" | command gap last {n_last} steps {extra['gap_last20_mrad']:.1f} mrad"
+        if "tactile_max_N" in extra:
+            extra_txt += f" | taxel max {extra['tactile_max_N']:.2f} N (last {n_last} steps {extra['tactile_last20_N']:.2f})"
         print(
             f"[peg-socket] episode {self._metrics_episode}: start xy={mm(xy[0]):.1f} mm z={mm(o[0, 2]):+.1f} mm"
             f" | closest xy={mm(xy[k]):.1f} mm (z={mm(o[k, 2]):+.1f} mm) at step {k}"
@@ -206,6 +221,7 @@ class IsaacLabEnvWrapper:
         self._peg_offsets = []
         self._forces = []
         self._gaps = []
+        self._tactile_max = []
         self._metrics_episode += 1
 
     def reset(self, **reset_kwargs):
@@ -274,9 +290,10 @@ class IsaacLabEnvWrapper:
             ext = obs.get("observation/exterior_image_1_left", obs.get("exterior_image_1_left"))
             wrist = obs.get("observation/wrist_image_left", obs.get("wrist_image_left"))
             if ext is not None and wrist is not None:
-                tiled = np.concatenate(
-                    [np.asarray(ext, dtype=np.uint8), np.asarray(wrist, dtype=np.uint8)], axis=1
-                )  # side by side, same height
+                if self._tactile_panel:      # cameras side by side, the taxel panel below: 448 x 448
+                    tiled = compose_frame(ext, wrist, self._tactile, vmax=self._tactile_vmax)
+                else:
+                    tiled = np.concatenate([np.asarray(ext, dtype=np.uint8), np.asarray(wrist, dtype=np.uint8)], axis=1)
                 self._frames.append(tiled)
                 off = self._peg_offsets[-1] if self._peg_offsets else np.zeros(3)
                 self._frame_infos.append({
@@ -287,6 +304,7 @@ class IsaacLabEnvWrapper:
                     "flag": self._flag,
                     "force_n": self._forces[-1] if self._forces else None,
                     "gap_mrad": self._last_gap,
+                    "tactile_max_n": self._tactile_max[-1] if self._tactile_max else None,
                 })
         return obs
 
