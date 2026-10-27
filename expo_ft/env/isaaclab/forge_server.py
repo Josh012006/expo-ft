@@ -233,6 +233,11 @@ class ForgeBackend:
         self._last_success = False
         self._last_reward = 0.0
         self._grasp_points = None                       # vertices of the robot bodies, filled by the first grasp_geometry call
+        self._trace_armed = False                       # debug op `trace_next_reset` arms the recording of the NEXT reset
+        self._trace = None                              # rows being recorded during a reset (None = not recording)
+        self._trace_last = None                         # rows of the last recorded reset (debug op `reset_trace`)
+        self._trace_placed = False
+        self._install_reset_trace()
 
     # -- Backend protocol -------------------------------------------------
 
@@ -279,6 +284,13 @@ class ForgeBackend:
         if kind == "grasp_geometry":    # scripts/isaaclab/grasp_check.py: how far does the peg stick out below the fingers?
             return self._grasp_geometry(float(request.get("lateral_min_mm", 5.0)), float(request.get("lateral_max_mm", 60.0)),
                                         int(request.get("top", 8)))
+        if kind == "trace_next_reset":  # scripts/isaaclab/grip_check.py: record the peg / fingers during the NEXT reset's grasp
+            self._trace_armed = True
+            return {"armed": True}
+        if kind == "reset_trace":       # the rows recorded by the last armed reset (see _install_reset_trace)
+            if self._trace_last is None:
+                return {"error": "no trace: call debug kind trace_next_reset, then reset"}
+            return {"rows": self._trace_last}
         if kind == "ik_joint_target":
             return self._ik_joint_target(request["delta_pos"], request["target_quat"])
         if kind == "teleop_step":
@@ -427,6 +439,59 @@ class ForgeBackend:
             "bodies_with_vertices": len(points), "bodies": len(names),
         }
 
+    def _install_reset_trace(self):
+        """Records WHAT HAPPENS during FORGE's reset grasp, only when armed (debug op `trace_next_reset`, one reset).
+
+        FORGE's reset (factory_env._reset_idx, upstream, unmodified) puts the peg at the fingertip midpoint (offset by the
+        task's `held_asset_pos_noise`), then closes the gripper for 0.25 s while the arm holds. Two hooks on THIS env
+        instance (nothing else changes): the held asset's root-pose write that places the peg (row "place") and every
+        step_sim_no_action() after it (rows "step", one per physics step of the closing). Each row, all in the frame of the
+        body `panda_fingertip_centered` (mm): `peg` = the point of the peg axis level with the fingertip midpoint (where
+        the pads hold it), `axis` = the peg axis (unit, towards the gripper), `L` / `R` = origins of the two finger bodies;
+        plus `w_mm` (finger opening, FORGE's convention) and `effort` (finger motor torque, N.m, Robotiq only)."""
+        from expo_ft.env.isaaclab import grasp_geometry as gg
+        env = self.env
+
+        def row(event, peg_pos=None, peg_quat=None):
+            robot = env._robot
+            names = list(robot.body_names)
+            bp = robot.data.body_pos_w[0].detach().cpu().numpy().astype(np.float64)
+            bq = robot.data.body_quat_w[0].detach().cpu().numpy().astype(np.float64)
+            tip, rot = bp[env.fingertip_body_idx], gg.quat_to_matrix(bq[env.fingertip_body_idx])
+            if peg_pos is None:
+                peg_pos = env._held_asset.data.root_pos_w[0].detach().cpu().numpy().astype(np.float64)
+                peg_quat = env._held_asset.data.root_quat_w[0].detach().cpu().numpy().astype(np.float64)
+            axis = gg.quat_to_matrix(peg_quat)[:, 2]
+            if float(np.dot(tip - peg_pos, axis)) < 0:
+                axis = -axis
+            centre = peg_pos + axis * float(np.dot(tip - peg_pos, axis))
+            to_tip = lambda p: (rot.T @ (p - tip)) * 1000.0
+            eff = env.gripper_effort()
+            return {"ev": event, "w_mm": float(env.gripper_width(fresh=True)[0]) * 1000.0,
+                    "effort": None if eff is None else float(eff[0]),
+                    "peg": [round(v, 3) for v in to_tip(centre)],
+                    "axis": [round(float(v), 4) for v in rot.T @ axis],
+                    "L": [round(v, 3) for v in to_tip(bp[names.index("panda_leftfinger")])],
+                    "R": [round(v, 3) for v in to_tip(bp[names.index("panda_rightfinger")])]}
+
+        raw_step, raw_write = env.step_sim_no_action, env._held_asset.write_root_pose_to_sim
+
+        def step_sim_no_action():
+            out = raw_step()
+            if self._trace is not None and self._trace_placed:
+                self._trace.append(row("step"))
+            return out
+
+        def write_root_pose_to_sim(pose, env_ids=None):
+            if self._trace is not None and env_ids is None:      # the placement in the hand; (the first call has env_ids)
+                self._trace.append(row("place", pose[0, 0:3].detach().cpu().numpy().astype(np.float64),
+                                       pose[0, 3:7].detach().cpu().numpy().astype(np.float64)))
+                self._trace_placed = True
+            return raw_write(pose, env_ids=env_ids)
+
+        env.step_sim_no_action = step_sim_no_action
+        env._held_asset.write_root_pose_to_sim = write_root_pose_to_sim
+
     def _ik_joint_target(self, delta_pos, target_quat):
         """ONE inverse-kinematics step: the 7 ABSOLUTE joint targets that move the fingertip by
         `delta_pos` (m, env frame) while turning it towards `target_quat` (w, x, y, z).
@@ -481,12 +546,18 @@ class ForgeBackend:
         # BEFORE env.reset() (and not passing seed to env.reset() itself, to
         # avoid a second, non-deterministic reseed overwriting this one) is
         # the fix being tested for that.
-        if seed is not None:
-            from isaaclab.utils.seed import configure_seed
-            configure_seed(int(seed), torch_deterministic=True)
-            self.env.reset()
-        else:
-            self.env.reset()
+        self._trace = [] if self._trace_armed else None       # one-shot, see _install_reset_trace
+        self._trace_armed, self._trace_placed = False, False
+        try:
+            if seed is not None:
+                from isaaclab.utils.seed import configure_seed
+                configure_seed(int(seed), torch_deterministic=True)
+                self.env.reset()
+            else:
+                self.env.reset()
+        finally:
+            if self._trace is not None:
+                self._trace_last, self._trace = self._trace, None
         self.env.step(self._hold_action())  # let camera/observation buffers populate
         obs = self.get_observation(env_id)
         self._last_done = False
