@@ -29,7 +29,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from expo_ft.env.env_client import EnvClient  # noqa: E402
-from expo_ft.env.video_panels import add_banner, compose_frame, tactile_stats  # noqa: E402
+from expo_ft.env.video_panels import add_banner, compose_frame, panel_kwargs, tactile_stats  # noqa: E402
 
 GRIPPER_OPEN_WIDTH = 0.04   # m per finger (forge_env_patched.GRIPPER_OPEN_WIDTH)
 
@@ -79,7 +79,7 @@ def snapshot(phase, t):
     width, dist = float(debug("finger_width")), float(debug("finger_distance"))
     zones = None if tac is None else [int((np.asarray(tac)[s] > 0.05).sum()) for s in (0, 1)]
     last[phase] = {"width": width, "dist": dist, "tac": stats, "zones": zones}
-    frame = compose_frame(obs["observation/exterior_image_1_left"], obs["observation/wrist_image_left"], tac)
+    frame = compose_frame(obs["observation/exterior_image_1_left"], obs["observation/wrist_image_left"], **panel_kwargs(obs))
     text = [(f"{phase:5s} t={t:3d}  gripper obs {float(np.ravel(obs['observation/gripper_position'])[0]):.3f}", (255, 255, 255)),
             (f"finger width {1000 * width:5.2f} mm  distance {1000 * dist:6.2f} mm", (200, 200, 200)),
             (f"hand force {np.linalg.norm(ft):5.2f} N" + ("" if stats is None else f"  taxel max {stats[0]:5.2f} N"), (120, 180, 255))]

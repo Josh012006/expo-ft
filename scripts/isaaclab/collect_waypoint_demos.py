@@ -147,6 +147,7 @@ RECORDED = {
 # finger, [:, 1] right finger, row 0 = fingertip. Demos of other robots simply have no "tactile" array.
 RECORDED_OPTIONAL = {
     "extra/tactile": "tactile",
+    "extra/gripper_effort": "gripper_effort",      # Robotiq only: PD torque demanded of the finger joint (N.m), scalar per step
 }
 
 
@@ -160,10 +161,8 @@ def make_debug(client, env_id):
 # ---- Video ------------------------------------------------------------------------------------
 def video_frame(obs, text):
     """Exterior | wrist side by side, the taxel panel below them (448 x 448), a one-line text strip under it all."""
-    from expo_ft.env.video_panels import compose_frame, text_banner
-    tactile = obs.get("extra/tactile")
-    frame = compose_frame(obs["observation/exterior_image_1_left"], obs["observation/wrist_image_left"],
-                          None if tactile is None else np.asarray(tactile, dtype=np.float32))
+    from expo_ft.env.video_panels import compose_frame, panel_kwargs, text_banner
+    frame = compose_frame(obs["observation/exterior_image_1_left"], obs["observation/wrist_image_left"], **panel_kwargs(obs))
     banner = text_banner([(text, (255, 255, 255))], frame.shape[1], BANNER_H)
     return frame if banner is None else np.concatenate([frame, banner], axis=0)
 

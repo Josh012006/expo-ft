@@ -130,7 +130,7 @@ RECORDED = {
     "extra/peg_socket_offset": "peg_socket_offset",
 }
 # saved only when the server sends it (robot with taxels): (T, 2, 7, 4) N, [:, 0] left finger, [:, 1] right
-RECORDED_OPTIONAL = {"extra/tactile": "tactile"}
+RECORDED_OPTIONAL = {"extra/tactile": "tactile", "extra/gripper_effort": "gripper_effort"}
 
 
 # ---- Connection to forge_server.py ----------------------------------------------------------------

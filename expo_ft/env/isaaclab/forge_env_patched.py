@@ -138,6 +138,12 @@ class ForgeEnvJointPosPi05(ForgeEnv):
             return self._theta_to_width(self._robot.data.joint_pos[:, 7]) if fresh else self.joint_pos[:, 7]
         return (self._robot.data.joint_pos if fresh else self.joint_pos)[:, 7]
 
+    def gripper_effort(self):
+        """(num_envs,) torque (N.m) that the finger joint's PD law demanded at the last physics sub-step, clipped to its effort
+        limit (Isaac Lab's applied_torque: the COMMAND of the motor, not a measured joint torque). Robotiq only (the Franka
+        Hand's fingers are prismatic: a force, in another unit); None for the Franka Hand."""
+        return self._robot.data.applied_torque[:, 7] if self._is_robotiq else None
+
     def gripper_info(self):
         """What the adapter measured / uses (debug op `robot_info` of the server); {} for the Franka Hand."""
         if self._finger_adapter is None:

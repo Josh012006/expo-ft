@@ -23,10 +23,10 @@ at `drift` and at where it starts (printed: first step beyond the threshold) bef
 The report is also written to <demos-dir>/replay_report.json.
 
 Videos (to show the demos to someone): add --save-videos [--video-first 20]. One mp4 per replayed demo in
-<demos-dir>/replay_videos/ (--video-dir to change), 448 x 496: exterior + wrist camera side by side, the taxels of the
-two fingers below (a placeholder when the server's robot has none), and the same banner as the evaluation videos (step,
-peg -> hole offset, closest approach, "inserted" flag, contact force, command gap, taxel max, verdict). The look is
-defined once in expo_ft/env/video_panels.py:
+<demos-dir>/replay_videos/ (--video-dir to change), 448 x 496: exterior + wrist camera side by side, below them the taxels of the
+two fingers with their readings (a placeholder when the server's robot has no taxels), and the same banner as the
+evaluation videos (step, peg -> hole offset, closest approach, "inserted" flag, contact force, command gap, verdict).
+The look is defined once in expo_ft/env/video_panels.py:
 
     python scripts/isaaclab/replay_demos.py --config configs/task/isaaclab/peg_insert_forge_pi05.yaml \
         --demos-dir demos/isaaclab/ForgePegInsertTeleop --save-videos --video-first 20
@@ -45,7 +45,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from expo_ft.env.env_client import EnvClient  # noqa: E402
-from expo_ft.env.video_panels import BANNER_H, compose_frame, tactile_stats, text_banner  # noqa: E402
+from expo_ft.env.video_panels import BANNER_H, compose_frame, panel_kwargs, text_banner  # noqa: E402
 
 HOLD_AFTER_SUCCESS = 5    # same as the collectors: success = "inserted" this many steps in a row
 
@@ -56,21 +56,19 @@ def _frame(obs):
     wrist = obs.get("observation/wrist_image_left")
     if ext is None or wrist is None:
         return None
-    tactile = obs.get("extra/tactile")
-    return compose_frame(ext, wrist, None if tactile is None else np.asarray(tactile, dtype=np.float32))
+    return compose_frame(ext, wrist, **panel_kwargs(obs))
 
 
 def _banner(info, verdict, width):
     """Three text lines under a video frame (same content as the evaluation videos)."""
     mm = info["offset_mm"]
     xy = float(np.hypot(mm[0], mm[1]))
-    force, gap, tac = info["force_n"], info["gap_mrad"], info.get("tactile_max_n")
+    force, gap = info["force_n"], info["gap_mrad"]
     line1 = f"t={info['step']:3d}  xy={xy:6.2f} mm  z={mm[2]:+6.1f} mm   x={mm[0]:+6.2f} y={mm[1]:+6.2f}"
     line2 = (f"closest xy {info['closest_xy_mm']:5.2f} mm @t={info['closest_step']:<3d} | "
              f"{'INSERTED' if info['flag'] else '-':8s} | replay: {verdict}")
     line3 = (f"force {'-' if force is None else f'{force:5.2f} N'}  |  "
-             f"cmd gap {'-' if gap is None else f'{gap:5.1f} mrad'}"
-             + ("" if tac is None else f"  |  taxel max {tac:5.2f} N"))
+             f"cmd gap {'-' if gap is None else f'{gap:5.1f} mrad'}")
     return text_banner([(line1, (255, 255, 255)),
                         (line2, (90, 220, 120) if (info["flag"] or verdict == "SUCCESS") else (200, 200, 200)),
                         (line3, (120, 180, 255))], width, BANNER_H)
@@ -113,10 +111,9 @@ def replay_one(client, env_id, path, drift_warn_mm, video_path=None, fps=10):
         if xy < closest[0]:
             closest = (xy, step)
         force = o.get("extra/ft_force")
-        stats = tactile_stats(o.get("extra/tactile"))
         frames.append(fr)
         infos.append({"step": step, "offset_mm": off.tolist(), "closest_xy_mm": closest[0], "closest_step": closest[1],
-                      "flag": bool(flag), "gap_mrad": gap, "tactile_max_n": None if stats is None else stats[0],
+                      "flag": bool(flag), "gap_mrad": gap,
                       "force_n": None if force is None else float(np.linalg.norm(np.asarray(force, dtype=np.float64).reshape(-1)[:3]))})
 
     record(obs, 0, False, None)

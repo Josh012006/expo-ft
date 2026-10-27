@@ -3,7 +3,7 @@
     +---------------------+---------------------+
     |  exterior camera    |   wrist camera      |   224 px
     +---------------------+---------------------+
-    |  taxels: left finger 7x4 | right finger 7x4 |   224 px   <- compose_frame()  (448 x 448)
+    |  taxels: left 7x4 | right 7x4 | readings  |   224 px   <- compose_frame()  (448 x 448)
     +-------------------------------------------+
     |  banner: 3 lines of text                  |    48 px   <- text_banner()    (448 x 496, a multiple of 16)
     +-------------------------------------------+
@@ -23,6 +23,7 @@ import numpy as np
 PANEL_H = 224
 BANNER_H = 48
 TACTILE_VMAX = 5.0      # N per zone at the top of the colour scale (fixed: frames of one video, or of two videos, compare)
+CONTACT_N = 0.05        # a zone above this force counts as "in contact"
 
 _KEYS = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
 _COLORS = np.array([(18, 18, 40), (40, 80, 220), (40, 200, 120), (240, 220, 50), (230, 40, 30)], dtype=np.float64)
@@ -50,49 +51,83 @@ def tactile_stats(tactile):
     return float(t.max()), float(t[0].max()), float(t[1].max())
 
 
-def tactile_panel(tactile, width=448, height=PANEL_H, vmax=TACTILE_VMAX):
-    """(height, width, 3) uint8 image of the two taxel grids. `tactile` None -> placeholder."""
+def panel_kwargs(obs):
+    """What the taxel panel shows, taken from one observation of the server: the taxel grids (None without taxels), the
+    norm of the hand force sensor (N) and the finger motor effort (N.m, Robotiq only). Missing entries are None."""
+    tactile, force, effort = obs.get("extra/tactile"), obs.get("extra/ft_force"), obs.get("extra/gripper_effort")
+    return {
+        "tactile": None if tactile is None else np.asarray(tactile, dtype=np.float32),
+        "hand_force": None if force is None else float(np.linalg.norm(np.asarray(force, dtype=np.float64).reshape(-1)[:3])),
+        "gripper_effort": None if effort is None else float(np.asarray(effort, dtype=np.float64).reshape(-1)[0]),
+    }
+
+
+def _font(size):
+    from PIL import ImageFont
+    try:
+        return ImageFont.load_default(size=size)       # Pillow >= 10.1; older versions: the small bitmap font
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def tactile_panel(tactile, width=448, height=PANEL_H, vmax=TACTILE_VMAX, hand_force=None, gripper_effort=None):
+    """(height, width, 3) uint8 panel: the two taxel grids (square cells, no gap: the pad is 26 x 40 mm for 4 x 7 zones)
+    on the left, readings on the right. `tactile` None -> placeholder."""
     img = np.full((height, width, 3), 12, dtype=np.uint8)
     Image, ImageDraw = _pil()
-    texts = []                                            # (x, y, text, colour), drawn at the end with PIL
     if tactile is None:
-        texts.append((width // 2 - 62, height // 2 - 5, "no tactile data (robot without taxels)", (130, 130, 130)))
+        if Image is not None:
+            pil = Image.fromarray(img)
+            ImageDraw.Draw(pil).text((width // 2 - 62, height // 2 - 5), "no tactile data (robot without taxels)", fill=(130, 130, 130))
+            img = np.asarray(pil)
+        return img
+    t = np.asarray(tactile, dtype=np.float64)
+    n_rows, n_cols = t.shape[1], t.shape[2]
+    cell = max(8, (height - 70) // n_rows)                  # 22 px for a 224 px panel
+    gw, gh, gap, x_first, top = n_cols * cell, n_rows * cell, 18, 14, 40
+    x_grid = [x_first, x_first + gw + gap]
+    for side in (0, 1):
+        colours = colormap(t[side] / max(vmax, 1e-9))       # (rows, cols, 3)
+        for r in range(n_rows):
+            y1 = top + gh - r * cell                        # row 0 (fingertip) at the bottom
+            for c in range(n_cols):
+                img[y1 - cell:y1, x_grid[side] + c * cell:x_grid[side] + (c + 1) * cell] = colours[r, c]
+        img[top - 1, x_grid[side]:x_grid[side] + gw] = img[top + gh, x_grid[side]:x_grid[side] + gw] = 70   # frame
+    if Image is None:
+        return img
+    pil = Image.fromarray(img)
+    draw = ImageDraw.Draw(pil)
+    big, small = _font(max(10, round(height * 15 / 224))), _font(max(9, round(height * 13 / 224)))
+    for side, name in enumerate(("LEFT", "RIGHT")):
+        draw.text((x_grid[side] + gw // 2 - 4 * len(name) * height // 224 - 2, 14), name, fill=(255, 255, 255), font=big)
+    in_contact = [int((t[i] > CONTACT_N).sum()) for i in (0, 1)]
+    if all(in_contact):
+        state, colour = "BOTH FINGERS", (120, 230, 140)
+    elif any(in_contact):
+        state, colour = "ONE FINGER ONLY", (255, 190, 90)
     else:
-        t = np.asarray(tactile, dtype=np.float64)
-        n_rows, n_cols = t.shape[1], t.shape[2]
-        half = width // 2
-        top, bottom = 22, height - 22                    # grid area: below the title, above the colour bar
-        cell_h = (bottom - top) // n_rows
-        cell_w = (half - 28) // n_cols
-        for side, name in enumerate(("LEFT", "RIGHT")):
-            x0 = side * half + (half - cell_w * n_cols) // 2
-            y_bottom = top + cell_h * n_rows
-            colours = colormap(t[side] / max(vmax, 1e-9))            # (rows, cols, 3)
-            for r in range(n_rows):
-                y1 = y_bottom - r * cell_h                          # row 0 (fingertip) at the bottom
-                for c in range(n_cols):
-                    xa = x0 + c * cell_w
-                    img[y1 - cell_h + 1:y1 - 1, xa + 1:xa + cell_w - 1] = colours[r, c]
-            texts.append((x0, 5, f"{name}  max {t[side].max():5.2f} N", (230, 230, 230)))
-        # colour bar: 0 .. vmax
-        bar_w = 140
-        bx = (width - bar_w) // 2
-        img[height - 14:height - 8, bx:bx + bar_w] = colormap(np.linspace(0, 1, bar_w))[None]
-        texts.append((bx - 30, height - 17, "0 N", (160, 160, 160)))
-        texts.append((bx + bar_w + 6, height - 17, f"{vmax:g} N", (160, 160, 160)))
-    if Image is not None and texts:
-        pil = Image.fromarray(img)
-        draw = ImageDraw.Draw(pil)
-        for x, y, s, colour in texts:
-            draw.text((x, y), s, fill=colour)
-        img = np.asarray(pil)
-    return img
+        state, colour = "NO CONTACT", (150, 150, 150)
+    lines = [(state, colour),
+             (f"zones max  L {t[0].max():4.1f}  R {t[1].max():4.1f} N", (230, 230, 230)),
+             (f"zones sum  L {t[0].sum():4.1f}  R {t[1].sum():4.1f} N", (230, 230, 230)),
+             (f"in contact L {in_contact[0]}/{n_rows * n_cols}  R {in_contact[1]}/{n_rows * n_cols}", (230, 230, 230))]
+    if hand_force is not None:
+        lines.append((f"hand force  {hand_force:5.2f} N", (230, 230, 230)))
+    if gripper_effort is not None:
+        lines.append((f"gripper effort  {gripper_effort:5.1f} Nm", (230, 230, 230)))
+    lines.append((f"color scale 0..{vmax:g} N", (130, 150, 255)))
+    x_text, step = x_grid[1] + gw + 24, round(height * 22 / 224)
+    for i, (text, col) in enumerate(lines):
+        draw.text((x_text, 44 + i * step), text, fill=col, font=small)
+    return np.asarray(pil)
 
 
-def compose_frame(ext, wrist, tactile, vmax=TACTILE_VMAX):
+def compose_frame(ext, wrist, tactile, vmax=TACTILE_VMAX, hand_force=None, gripper_effort=None):
     """Exterior | wrist side by side on top, the taxel panel below: (2 * h, 2 * w, 3) uint8, 448 x 448 for 224 px cameras."""
     top = np.concatenate([np.asarray(ext, dtype=np.uint8), np.asarray(wrist, dtype=np.uint8)], axis=1)
-    return np.concatenate([top, tactile_panel(tactile, width=top.shape[1], height=top.shape[0], vmax=vmax)], axis=0)
+    panel = tactile_panel(tactile, width=top.shape[1], height=top.shape[0], vmax=vmax,
+                          hand_force=hand_force, gripper_effort=gripper_effort)
+    return np.concatenate([top, panel], axis=0)
 
 
 def text_banner(lines, width, height=BANNER_H):

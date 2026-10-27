@@ -497,6 +497,8 @@ class ForgeBackend:
             # turns it into a per-episode summary.
             "extra/peg_socket_offset": self._peg_socket_offset().astype("float32"),
         }
+        if env._is_robotiq:           # PD torque demanded of the finger joint (N.m, last sub-step): the "gripper effort"
+            obs["extra/gripper_effort"] = float(env.gripper_effort()[0].item())
         if env._tactile_sensors:      # robot profile with taxels: (2, 7, 4) N, [0] left finger, [1] right, row 0 = fingertip
             obs["extra/tactile"] = env.tactile_grids()[0].detach().cpu().numpy().astype("float32")
         return obs
