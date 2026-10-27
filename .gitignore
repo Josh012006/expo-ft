@@ -22,3 +22,5 @@ weights-backup/
 .venv-isaaclab/
 smoke_test_frames/
 frames_*/
+expo_ft/third_party/robotiq/
+/*.zip

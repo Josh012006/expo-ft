@@ -21,6 +21,13 @@ OK = replayed with success. WARN = success but the replay drifted more than --dr
 success. A FAIL does NOT necessarily mean a bad demo: the replay needs a repeatable simulation, the policy does not. Look
 at `drift` and at where it starts (printed: first step beyond the threshold) before throwing a demo away.
 The report is also written to <demos-dir>/replay_report.json.
+
+Videos (to show the demos to someone): add --save-videos [--video-first 20]. One mp4 per replayed demo in
+<demos-dir>/replay_videos/ (--video-dir to change), exterior + wrist camera side by side with the same banner as the
+evaluation videos (step, peg -> hole offset, closest approach, "inserted" flag, contact force, command gap, verdict):
+
+    python scripts/isaaclab/replay_demos.py --config configs/task/isaaclab/peg_insert_forge_pi05.yaml \
+        --demos-dir demos/isaaclab/ForgePegInsertTeleop --save-videos --video-first 20
 """
 import argparse
 import json
@@ -38,9 +45,47 @@ if str(REPO_ROOT) not in sys.path:
 from expo_ft.env.env_client import EnvClient  # noqa: E402
 
 HOLD_AFTER_SUCCESS = 5    # same as the collectors: success = "inserted" this many steps in a row
+BANNER_H = 48             # height (px) of the metrics banner under the video frames (224 + 48 = 272, a multiple of 16)
 
 
-def replay_one(client, env_id, path, drift_warn_mm):
+def _frame(obs):
+    """Exterior + wrist camera side by side (uint8, H x 2W x 3), or None if the observation has no images."""
+    ext = obs.get("observation/exterior_image_1_left")
+    wrist = obs.get("observation/wrist_image_left")
+    if ext is None or wrist is None:
+        return None
+    return np.concatenate([np.asarray(ext, dtype=np.uint8), np.asarray(wrist, dtype=np.uint8)], axis=1)
+
+
+def _banner(info, verdict, width):
+    """Three text lines under a video frame (same content as the evaluation videos)."""
+    from PIL import Image, ImageDraw
+    mm = info["offset_mm"]
+    xy = float(np.hypot(mm[0], mm[1]))
+    force, gap = info["force_n"], info["gap_mrad"]
+    line1 = f"t={info['step']:3d}  xy={xy:6.2f} mm  z={mm[2]:+6.1f} mm   x={mm[0]:+6.2f} y={mm[1]:+6.2f}"
+    line2 = (f"closest xy {info['closest_xy_mm']:5.2f} mm @t={info['closest_step']:<3d} | "
+             f"{'INSERTED' if info['flag'] else '-':8s} | replay: {verdict}")
+    line3 = (f"contact force {'-' if force is None else f'{force:5.2f} N'}  |  "
+             f"command gap {'-' if gap is None else f'{gap:5.1f} mrad'}")
+    img = Image.new("RGB", (width, BANNER_H), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.text((4, 5), line1, fill=(255, 255, 255))
+    draw.text((4, 18), line2, fill=(90, 220, 120) if (info["flag"] or verdict == "SUCCESS") else (200, 200, 200))
+    draw.text((4, 31), line3, fill=(120, 180, 255))
+    return np.asarray(img)
+
+
+def _write_video(path, frames, infos, verdict, fps):
+    import imageio.v3 as iio
+    out = []
+    for frame, info in zip(frames, infos):
+        out.append(np.concatenate([frame, _banner(info, verdict, frame.shape[1])], axis=0))
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    iio.imwrite(path, out, fps=fps, codec="libx264")
+
+
+def replay_one(client, env_id, path, drift_warn_mm, video_path=None, fps=10):
     z = np.load(path)
     seed = int(z["seed"])
     actions = np.asarray(z["actions"], dtype=np.float32)
@@ -54,13 +99,35 @@ def replay_one(client, env_id, path, drift_warn_mm):
     in_a_row, best_run, first_success, ended_early = 0, 0, None, False
     drift = []                                                               # mm, replayed vs recorded, frames 1 .. T-1
     final_offset = None
+    frames, infos = [], []                                                   # video: one frame per observation
+    closest = (float("inf"), 0)                                              # (xy in mm, step) of the closest approach
+
+    def record(o, step, flag, gap):
+        nonlocal closest
+        fr = _frame(o)
+        if video_path is None or fr is None:
+            return
+        off = 1000.0 * np.asarray(o["extra/peg_socket_offset"], dtype=np.float64)
+        xy = float(np.hypot(off[0], off[1]))
+        if xy < closest[0]:
+            closest = (xy, step)
+        force = o.get("extra/ft_force")
+        frames.append(fr)
+        infos.append({"step": step, "offset_mm": off.tolist(), "closest_xy_mm": closest[0], "closest_step": closest[1],
+                      "flag": bool(flag), "gap_mrad": gap,
+                      "force_n": None if force is None else float(np.linalg.norm(np.asarray(force, dtype=np.float64).reshape(-1)[:3]))})
+
+    record(obs, 0, False, None)
     for t in range(steps):
+        q_before = np.asarray(obs["observation/joint_position"], dtype=np.float64)[:7]
+        gap = 1000.0 * float(np.max(np.abs(actions[t][:7].astype(np.float64) - q_before)))
         client.step(env_id, actions[t])
         obs = client.get_observation(env_id)
         done, inserted, _, _ = client.get_info_for_step(env_id)
         if done:                                                             # timeout: the env has already reset itself
             ended_early = True
             break
+        record(obs, t + 1, inserted, gap)
         offset = np.asarray(obs["extra/peg_socket_offset"], dtype=np.float64)
         final_offset = offset
         if t + 1 < steps:
@@ -73,6 +140,8 @@ def replay_one(client, env_id, path, drift_warn_mm):
     drift_max = max(drift) if drift else 0.0
     beyond = next((i + 1 for i, d in enumerate(drift) if d > drift_warn_mm), None)
     verdict = ("WARN" if drift_max > drift_warn_mm else "OK") if success else "FAIL"
+    if video_path is not None and frames:
+        _write_video(video_path, frames, infos, "SUCCESS" if success else "fail", fps)
     return {
         "file": Path(path).name, "seed": seed, "steps": steps, "verdict": verdict, "success": bool(success),
         "longest_success_run": int(best_run), "first_success_step": first_success, "ended_early": ended_early,
@@ -90,6 +159,10 @@ def main():
     p.add_argument("--limit", type=int, default=0, help="Replay only the first N demos (0 = all).")
     p.add_argument("--drift-warn-mm", type=float, default=2.0,
                    help="WARN when the replayed offset peg -> hole differs from the recorded one by more than this.")
+    p.add_argument("--save-videos", action="store_true", help="Write one mp4 per replayed demo (see the docstring).")
+    p.add_argument("--video-first", type=int, default=0, help="With --save-videos: only the first N replayed demos (0 = all).")
+    p.add_argument("--video-dir", default=None, help="Where the videos go (default <demos-dir>/replay_videos).")
+    p.add_argument("--fps", type=int, default=10, help="Video frame rate (the demos run at 15 Hz: 10 is a bit slower).")
     p.add_argument("--report", default=None, help="Where to write the JSON report (default <demos-dir>/replay_report.json).")
     args = p.parse_args()
 
@@ -110,7 +183,10 @@ def main():
     results = []
     t0 = time.time()
     for i, path in enumerate(files):
-        r = replay_one(client, env_id, path, args.drift_warn_mm)
+        want_video = args.save_videos and (args.video_first <= 0 or i < args.video_first)
+        video_path = str(Path(args.video_dir or Path(args.demos_dir) / "replay_videos") / (Path(path).stem + ".mp4")) \
+            if want_video else None
+        r = replay_one(client, env_id, path, args.drift_warn_mm, video_path, args.fps)
         results.append(r)
         extra = f"   drift > {args.drift_warn_mm:g} mm from step {r['first_step_beyond_threshold']}" \
             if r["first_step_beyond_threshold"] else ""
