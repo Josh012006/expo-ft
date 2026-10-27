@@ -131,7 +131,7 @@ max_steps_per_episode: 150
 # kept only to reproduce old numbers.
 success_hold_steps: 1
 # Matches ManiSkill's replan_steps:action_horizon ratio (8:16) at pi05's
-# action_horizon=15 for DROID. Not a correctness requirement like
+# action_horizon=16 for DROID. Not a correctness requirement like
 # max_steps_per_episode — a reactivity/compute tradeoff, worth revisiting
 # once real rollout behavior is visible.
 replan_steps: 8

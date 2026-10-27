@@ -72,7 +72,7 @@ def _font(size):
 
 def tactile_panel(tactile, width=448, height=PANEL_H, vmax=TACTILE_VMAX, hand_force=None, gripper_effort=None):
     """(height, width, 3) uint8 panel: the two taxel grids (square cells, no gap: the pad is 26 x 40 mm for 4 x 7 zones)
-    on the left, readings on the right. `tactile` None -> placeholder."""
+    in the middle, a colour bar (0 .. vmax N), readings on the right. `tactile` None -> placeholder."""
     img = np.full((height, width, 3), 12, dtype=np.uint8)
     Image, ImageDraw = _pil()
     if tactile is None:
@@ -93,6 +93,9 @@ def tactile_panel(tactile, width=448, height=PANEL_H, vmax=TACTILE_VMAX, hand_fo
             for c in range(n_cols):
                 img[y1 - cell:y1, x_grid[side] + c * cell:x_grid[side] + (c + 1) * cell] = colours[r, c]
         img[top - 1, x_grid[side]:x_grid[side] + gw] = img[top + gh, x_grid[side]:x_grid[side] + gw] = 70   # frame
+    bar_x, bar_w = x_grid[1] + gw + 10, max(8, round(height * 12 / 224))         # colour bar: same height as the grids
+    img[top:top + gh, bar_x:bar_x + bar_w] = colormap(np.linspace(1.0, 0.0, gh))[:, None, :]      # vmax at the top
+    img[top - 1, bar_x:bar_x + bar_w] = img[top + gh, bar_x:bar_x + bar_w] = 70
     if Image is None:
         return img
     pil = Image.fromarray(img)
@@ -115,8 +118,13 @@ def tactile_panel(tactile, width=448, height=PANEL_H, vmax=TACTILE_VMAX, hand_fo
         lines.append((f"hand force  {hand_force:5.2f} N", (230, 230, 230)))
     if gripper_effort is not None:
         lines.append((f"gripper effort  {gripper_effort:5.1f} Nm", (230, 230, 230)))
-    lines.append((f"color scale 0..{vmax:g} N", (130, 150, 255)))
-    x_text, step = x_grid[1] + gw + 24, round(height * 22 / 224)
+    x_lab = bar_x + bar_w + 4
+    draw.text((bar_x - 2, top - 20), "N", fill=(130, 150, 255), font=small)
+    for frac in (0.0, 0.5, 1.0):                                 # ticks: 0, vmax / 2, vmax (the colours saturate above vmax)
+        y = top + round(gh * (1.0 - frac))
+        draw.line([(bar_x + bar_w, y), (bar_x + bar_w + 3, y)], fill=(130, 150, 255))
+        draw.text((x_lab, y - 7), f"{vmax * frac:g}", fill=(130, 150, 255), font=small)
+    x_text, step = x_lab + 4 * len(f"{vmax:g}") * round(height / 224) + 34, round(height * 22 / 224)
     for i, (text, col) in enumerate(lines):
         draw.text((x_text, 44 + i * step), text, fill=col, font=small)
     return np.asarray(pil)
