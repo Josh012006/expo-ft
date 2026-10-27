@@ -25,5 +25,12 @@ frames_*/
 *.zip
 *.gz
 
+robot_check_franka/
+robot_check_tsf/
+robot_tsf_report.txt
+server_tsf.log
+
+
+
 # NVIDIA assets (Robotiq USD, TSF_85.usd, tactile repository): never committed
 expo_ft/third_party/robotiq/
