@@ -277,7 +277,8 @@ class ForgeBackend:
         if kind == "task_geometry":
             return self._task_geometry()
         if kind == "grasp_geometry":    # scripts/isaaclab/grasp_check.py: how far does the peg stick out below the fingers?
-            return self._grasp_geometry(float(request.get("lateral_min_mm", 5.0)), int(request.get("top", 8)))
+            return self._grasp_geometry(float(request.get("lateral_min_mm", 5.0)), float(request.get("lateral_max_mm", 60.0)),
+                                        int(request.get("top", 8)))
         if kind == "ik_joint_target":
             return self._ik_joint_target(request["delta_pos"], request["target_quat"])
         if kind == "teleop_step":
@@ -369,13 +370,15 @@ class ForgeBackend:
             "success_z": hole_depth * float(task.success_threshold),
         }
 
-    def _grasp_geometry(self, lateral_min_mm, top):
+    def _grasp_geometry(self, lateral_min_mm, lateral_max_mm, top):
         """Heights of the lowest vertices of the robot bodies above the held peg's base, along the peg axis (mm).
 
-        The peg base is 0, positive = towards the gripper. `h_min_mm` is the lowest vertex of any body that is at least
-        `lateral_min_mm` away from the peg axis (so it cannot go into the hole): when the peg is pushed in, that body
-        reaches the socket top, `hole_depth` above the fully inserted peg base, when the peg base is still
-        `stall_z_pred_mm = hole_depth - h_min` above its final height (negative: the fingers never touch the socket).
+        The peg base is 0, positive = towards the gripper. Only the vertices between `lateral_min_mm` and
+        `lateral_max_mm` from the peg axis count: at least lateral_min (they cannot go into the hole), at most
+        lateral_max (the rest of the robot, e.g. its base, is left out). `h_min_mm` is the lowest of them among the COLLISION
+        meshes (all meshes if no body has a collision one; `h_min_visual_mm` is the lowest of all of them): when the peg is
+        pushed in, that body reaches the socket top, `hole_depth` above the fully inserted peg base, when the peg base is
+        still `stall_z_pred_mm = hole_depth - h_min` above its final height (negative: the fingers never touch the socket).
         Read-only, the simulation is not stepped. The vertices come from the USD (see grasp_geometry.py), the poses from
         the simulation."""
         from isaaclab_tasks.direct.factory import factory_utils
@@ -402,18 +405,22 @@ class ForgeBackend:
             axis = -axis
         pos = (robot.data.body_pos_w[0] - origin).detach().cpu().numpy()
         quat = robot.data.body_quat_w[0].detach().cpu().numpy()
-        rows = gg.lowest_per_body(points, names, pos, quat, base, axis, lateral_min=lateral_min_mm * 1e-3)
+        rows = gg.lowest_per_body(points, names, pos, quat, base, axis, lateral_min=lateral_min_mm * 1e-3,
+                                  lateral_max=lateral_max_mm * 1e-3)
+        coll = [r for r in rows if source[r[0]] == "collision"] or rows
 
         hole_depth_mm = float(env.cfg_task.fixed_asset_cfg.height) * 1000.0
-        h_min_mm = rows[0][1] * 1000.0 if rows else None
+        h_min_mm = coll[0][1] * 1000.0 if coll else None
         return {
             "robot": env._profile.name,
             "hole_depth_mm": hole_depth_mm,
             "peg_tilt_deg": float(np.degrees(np.arccos(np.clip(abs(axis[2]), 0.0, 1.0)))),   # peg axis vs the vertical
             "fingertip_midpoint_height_mm": float(np.dot(tip - base, axis)) * 1000.0,        # where FORGE says the grasp is
             "lateral_min_mm": lateral_min_mm,
+            "lateral_max_mm": lateral_max_mm,
             "h_min_mm": h_min_mm,
-            "h_min_body": rows[0][0] if rows else None,
+            "h_min_body": coll[0][0] if coll else None,
+            "h_min_visual_mm": rows[0][1] * 1000.0 if rows else None,
             "stall_z_pred_mm": None if h_min_mm is None else hole_depth_mm - h_min_mm,
             "lowest": [{"body": n, "h_mm": h * 1000.0, "lateral_mm": lat * 1000.0, "vertices": source[n]}
                        for n, h, lat in rows[:top]],

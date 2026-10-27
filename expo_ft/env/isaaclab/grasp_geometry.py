@@ -83,9 +83,10 @@ def collect_body_points(stage, root_path, body_names):
     return points, source
 
 
-def lowest_per_body(points, names, pos, quat, origin, axis, lateral_min=0.0):
+def lowest_per_body(points, names, pos, quat, origin, axis, lateral_min=0.0, lateral_max=None):
     """For every body with vertices: its lowest vertex along `axis` from `origin`, among the vertices at least
-    `lateral_min` (m) away from the axis line (the ones that cannot go into the hole).
+    `lateral_min` (m) away from the axis line (the ones that cannot go into the hole) and, if given, at most
+    `lateral_max` away (to leave out the rest of the robot, e.g. its base).
 
     names / pos (B, 3) / quat (B, 4, w x y z): the simulated bodies, all in the same frame as origin and axis.
     Returns [(name, height m, lateral distance m of that vertex)] sorted by height."""
@@ -101,6 +102,8 @@ def lowest_per_body(points, names, pos, quat, origin, axis, lateral_min=0.0):
         h = d @ axis
         lat = np.linalg.norm(d - np.outer(h, axis), axis=1)
         ok = lat >= lateral_min
+        if lateral_max is not None:
+            ok &= lat <= lateral_max
         if not ok.any():
             continue
         k = np.where(ok)[0][np.argmin(h[ok])]

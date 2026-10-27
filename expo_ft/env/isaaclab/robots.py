@@ -99,8 +99,13 @@ def get_profile(name: str) -> RobotProfile:
 
 
 def profile_from_yaml(cfg: dict) -> RobotProfile:
-    """The profile selected by the task YAML (`robot`, default "franka"; `robot_usd` replaces the built USD)."""
+    """The profile selected by the task YAML (`robot`, default "franka"; `robot_usd` replaces the built USD;
+    `fingerpad_length` (m) replaces the profile's value of FORGE's franka_fingerpad_length, which sets how deep the peg
+    is held between the fingers at reset: a smaller value holds it higher up, leaving more of the peg below the fingers.
+    For one run: forge_server.py --set fingerpad_length=0.0056)."""
     profile = get_profile(str(cfg.get("robot", "franka")))
+    if cfg.get("fingerpad_length") is not None:
+        profile = replace(profile, fingerpad_length=float(cfg["fingerpad_length"]))
     if cfg.get("robot_usd"):
         if profile.gripper == "franka_hand":
             raise ValueError("robot_usd is for the Robotiq profiles; robot: franka uses FORGE's own USD")

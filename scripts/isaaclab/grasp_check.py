@@ -12,8 +12,10 @@ from one seed to the next (3.5-8.2 mm above the final one), with 3-6 N on the wr
 bottom of the peg's grip, they reach the socket top before the peg is fully in. For each seed the script prints
 
     grasp height   height of FORGE's fingertip midpoint above the peg base (where FORGE says the grasp is)
-    h_min          lowest vertex of any robot body above the peg base, among the vertices at least --lateral-min-mm away
-                   from the peg axis (the ones that cannot go into the hole), and which body it belongs to
+    h_min          lowest COLLISION vertex of any robot body above the peg base, among the vertices between
+                   --lateral-min-mm and --lateral-max-mm from the peg axis (at least: they cannot go into the hole; at
+                   most: leaves out the rest of the robot), and which body it belongs to. Visual-only meshes (listed with
+                   "(visual)") have no collision: they would go through the socket
     predicted stall   hole_depth - h_min: the height of the peg base (mm above its final height) where that body reaches
                    the socket top. Negative = the fingers never touch the socket.
     peg tilt       angle between the peg axis and the vertical (a tilted peg jams in the hole)
@@ -56,6 +58,8 @@ def main():
     p.add_argument("--num-seeds", type=int, default=10, help="Seeds seed ... seed + num-seeds - 1.")
     p.add_argument("--lateral-min-mm", type=float, default=5.0,
                    help="Only vertices at least this far from the peg axis count (a peg of 8 mm has a radius of 4 mm).")
+    p.add_argument("--lateral-max-mm", type=float, default=60.0,
+                   help="Only vertices at most this far from the peg axis count (leaves out the rest of the robot, e.g. its base).")
     p.add_argument("--top", type=int, default=6, help="Bodies listed for the first seed (the lowest ones).")
     p.add_argument("--observed", default="", help="Observed stall heights, mm: SEED=Z,SEED=Z,... (final offset z of failed demos).")
     p.add_argument("--out", default=None, help="Write all the results here as JSON.")
@@ -77,12 +81,14 @@ def main():
     for i in range(args.num_seeds):
         seed = args.seed + i
         client.reset(env_id, seed)
-        g = debug("grasp_geometry", lateral_min_mm=args.lateral_min_mm, top=max(args.top, 8))
+        g = debug("grasp_geometry", lateral_min_mm=args.lateral_min_mm, lateral_max_mm=args.lateral_max_mm,
+                  top=max(args.top, 8))
         g["seed"] = seed
         results.append(g)
         if i == 0:
             print(f"robot {g['robot']} | hole depth {g['hole_depth_mm']:.1f} mm | {g['bodies_with_vertices']}/{g['bodies']} "
-                  f"bodies with vertices | vertices counted from {args.lateral_min_mm:g} mm off the peg axis")
+                  f"bodies with vertices | vertices counted between {args.lateral_min_mm:g} and {args.lateral_max_mm:g} mm "
+                  f"off the peg axis | h_min and the prediction use the COLLISION meshes")
             print(f"\nlowest bodies for seed {seed} (height above the peg base):")
             for r in g["lowest"][: args.top]:
                 print(f"    {r['body']:34s} {r['h_mm']:7.1f} mm   {r['lateral_mm']:5.1f} mm off the axis   ({r['vertices']})")
