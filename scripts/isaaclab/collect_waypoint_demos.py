@@ -64,15 +64,50 @@ Diagnosis tools (added after the first runs, where `align` never finished)
                       variety between demos (all 0 = every demo from the same start follows the same path);
                       the values drawn are written to index.jsonl. The start states already differ from
                       one seed to the next. How many demos: --num-episodes (kept) / --max-attempts.
+                      (--noise-mm jitters the desired move and the label contains it: that is NOT the noise
+                      injection below, whose labels stay clean.)
   --align-tol-mm X    xy error (mm) under which `align` is considered done (default 0.2). Raising it
                       lets the descent start, to see what the peg does at the hole
   --probe             collect nothing: measure how the arm answers to tiny joint commands, to find
                       the dead zone seen at the end of the failed attempts (see run_probe)
 
+Noise injection (arXiv 2507.09061, "Practice 2" / Algorithm 2) -- off by default
+---------------------------------------------------------------------------------
+A share --noise-fraction of the kept demos is recorded with noise on the arm: the joint targets SENT to the
+simulation are  label + sigma * z  (z uniform in the 7-d unit ball), but the saved `actions` stay the CLEAN label,
+i.e. what the expert would command from the state it actually reached. The policy therefore sees perturbed
+states and learns the expert's reaction to them (recovery), and the noise never enters a label. The gripper is
+never noised. --noise-fraction 0 (default) = exactly the previous behaviour, same files, same index.jsonl.
+(In the paper alpha is the share of CLEAN trajectories; here it is the share of NOISY ones.) Which demos are
+noisy is decided per demo, not per step; clean and noisy demos are interleaved, so the first N files of a
+folder keep the mix (the SFT conversion takes the first --max-episodes files).
+
+  --noise-mode burst  (default) --noise-bursts bursts of --noise-burst-len steps, first one starting at a random
+                      step in [1, --noise-start-max]; the rest of the demo is clean, so the frames after a
+                      burst show the expert recovering with an exact label
+  --noise-mode white  noise at every step (what the paper does for a policy that predicts ONE action). With
+                      chunks the label of a frame (the next 16 actions) is hard to keep consistent: prefer small sigma
+  --action-noise-sigma  radius of the noise (rad per step, all 7 joints). Default 0.01 (burst) / 0.003 (white).
+                      The arm follows ~36% of a command per step, so this moves the peg by a few mm: calibrate it
+                      with a pilot (peak_xy_lift_align_mm and the success rate in the summary / index.jsonl)
+  --noise-insert-scale  noise multiplier in `descend` / `insert` (default 0: noise only in `lift` / `align`, never
+                      near or in the hole); 1 = noise during the whole demo
+  --noise-off-xy-mm   no noise in `align` once the xy error is below this (default 0 = off). Useful with white
+                      noise: the 0.2 mm align tolerance otherwise fights the noise and `align` lasts much longer
+
+A noisy demo is saved as ep_NNNN_seedS_noisy.npz with two extra arrays, `noise` (T, 7) = what was added to the
+label (after the MAX_JOINT_STEP clip) and `noisy`; clean demos get a zero `noise` array. The conversion and
+norm-stats scripts read only the usual arrays, so they work on these folders unchanged. replay_demos.py replays
+the clean labels, so it does not reproduce the noise. Use a separate --out folder for a noisy dataset.
+
 Usage (server already running, restarted after the forge_server.py change):
     python scripts/isaaclab/collect_waypoint_demos.py \
         --config configs/task/isaaclab/peg_insert_forge_pi05.yaml \
         --out demos/isaaclab/ForgePegInsert --num-episodes 20
+    # with noise: 35% of the 50 demos get a 4-step burst
+    python scripts/isaaclab/collect_waypoint_demos.py \
+        --config configs/task/isaaclab/peg_insert_forge_pi05.yaml \
+        --out demos/isaaclab/ForgePegInsertNoise --num-episodes 50 --noise-fraction 0.35
 """
 import argparse
 import json
@@ -97,6 +132,9 @@ GRIPPER_TOL = 0.001       # finger position may drift at most 1 mm from its valu
 HOLD_AFTER_SUCCESS = 5    # keep recording this many steps once inserted, then stop the episode
 MIN_HOVER_MARGIN = 0.004  # smallest hover height above the hole's top edge, whatever the jitter
 BANNER_H = 32             # height (px) of the text strip under the video frames (448 + 32 = 480: a multiple of 16, no resize)
+NOISE_STREAM = 0x4E015E   # second entry of the per-attempt noise seed [seed, NOISE_STREAM]: own stream, never touches `rng`
+NOISE_PHASES = ("lift", "align")   # the only phases with full noise (the others get --noise-insert-scale)
+SIGMA_DEFAULT = {"burst": 0.01, "white": 0.003}   # rad, see --action-noise-sigma
 
 
 class Waypoint(NamedTuple):
@@ -158,12 +196,29 @@ def make_debug(client, env_id):
     return debug
 
 
+# ---- Noise injection --------------------------------------------------------------------------
+def unit_ball(rng, dim):
+    """One point drawn uniformly in the unit ball of R^dim (the z of Algorithm 2)."""
+    v = rng.normal(size=dim)
+    return v / np.linalg.norm(v) * rng.uniform() ** (1.0 / dim)
+
+
+def burst_steps(rng, n_bursts, length, gap, start_max):
+    """Steps of the noise bursts: the first starts at a random step in [1, start_max], each next one `gap` (+0..3)
+    steps after the end of the previous one. A burst that falls in `descend` / `insert` is silent (scale 0)."""
+    steps, s = set(), int(rng.integers(1, start_max + 1))
+    for _ in range(n_bursts):
+        steps.update(range(s, s + length))
+        s += length + gap + int(rng.integers(0, 4))
+    return steps
+
+
 # ---- Video ------------------------------------------------------------------------------------
-def video_frame(obs, text):
+def video_frame(obs, text, colour=(255, 255, 255)):
     """Exterior | wrist side by side, the taxel panel below them (448 x 448), a one-line text strip under it all."""
     from expo_ft.env.video_panels import compose_frame, panel_kwargs, text_banner
     frame = compose_frame(obs["observation/exterior_image_1_left"], obs["observation/wrist_image_left"], **panel_kwargs(obs))
-    banner = text_banner([(text, (255, 255, 255))], frame.shape[1], BANNER_H)
+    banner = text_banner([(text, colour)], frame.shape[1], BANNER_H)
     return frame if banner is None else np.concatenate([frame, banner], axis=0)
 
 
@@ -173,9 +228,15 @@ def write_video(path, frames, fps):
 
 
 # ---- One scripted attempt ---------------------------------------------------------------------
-def run_episode(client, env_id, seed, geom, args, rng):
-    """One scripted attempt. Returns (arrays_to_save, info_dict, video_frames)."""
+def run_episode(client, env_id, seed, geom, args, rng, noisy=False):
+    """One scripted attempt. Returns (arrays_to_save, info_dict, video_frames).
+    noisy=True: noise is added to the joint targets SENT to the arm (see "Noise injection"); the recorded action
+    stays the clean label."""
     debug = make_debug(client, env_id)
+    noise_rng = np.random.default_rng([seed, NOISE_STREAM])         # separate stream: `rng` is used as before
+    bursts = (burst_steps(noise_rng, args.noise_bursts, args.noise_burst_len, args.noise_burst_gap, args.noise_start_max)
+              if noisy and args.noise_mode == "burst" else set())
+    noise_log, noise_steps, peak_xy = [], 0, 0.0
 
     def finger_width():                          # finger joint position in metres (server-side ground truth)
         return float(debug("finger_width"))
@@ -231,15 +292,36 @@ def run_episode(client, env_id, seed, geom, args, rng):
         if not np.isfinite(action).all():
             raise RuntimeError(f"non-finite action at step {t} (seed {seed}): {action}")
 
+        # Noise injection: what is SENT is the clean target + noise (kept within MAX_JOINT_STEP of the measured
+        # angles); what is RECORDED stays `action`. Noise only in lift / align unless --noise-insert-scale > 0.
+        sent = action
+        noise = np.zeros(7)
+        if noisy:
+            scale = 1.0 if w.name in NOISE_PHASES else args.noise_insert_scale
+            xy_mm = float(np.hypot(offset[0], offset[1])) * 1000.0
+            quiet = w.name == "align" and args.noise_off_xy_mm > 0 and xy_mm < args.noise_off_xy_mm
+            if scale > 0 and not quiet and (args.noise_mode == "white" or t in bursts):
+                noisy_target = q_target + args.action_noise_sigma * scale * unit_ball(noise_rng, 7)
+                noisy_target = np.clip(noisy_target, q_meas - MAX_JOINT_STEP, q_meas + MAX_JOINT_STEP)
+                noise = noisy_target - q_target
+                sent = np.concatenate([noisy_target, [GRIPPER_CLOSED]]).astype(np.float32)
+            noise_steps += int(np.any(noise != 0.0))
+            noise_log.append(noise)
+        if w.name in NOISE_PHASES:
+            peak_xy = max(peak_xy, float(np.hypot(offset[0], offset[1])))
+
         # Record the observation the action was computed from, then act.
         for key, name in recorded.items():
             frames[name].append(np.asarray(obs[key]))
         actions.append(action)
         if args.video_dir:
             mm = offset * 1000.0
-            video.append(video_frame(
-                obs, f"t={t:3d}  {w.name:6s}  xy={np.hypot(mm[0], mm[1]):6.2f} mm  z={mm[2]:5.1f} mm"))
-        client.step(env_id, action)
+            text = f"t={t:3d}  {w.name:6s}  xy={np.hypot(mm[0], mm[1]):6.2f} mm  z={mm[2]:5.1f} mm"
+            if np.any(noise != 0.0):
+                video.append(video_frame(obs, f"{text}  NOISE {np.linalg.norm(noise) * 1e3:4.1f} mrad", (255, 170, 40)))
+            else:
+                video.append(video_frame(obs, text + ("  [noisy demo]" if noisy else "")))
+        client.step(env_id, sent)
         obs = client.get_observation(env_id)
         done, inserted, _, _ = client.get_info_for_step(env_id)
 
@@ -253,6 +335,9 @@ def run_episode(client, env_id, seed, geom, args, rng):
 
     arrays = {name: np.stack(vals) for name, vals in frames.items()}
     arrays["actions"] = np.stack(actions)
+    if args.noise_fraction > 0:                  # only when the option is used: fraction 0 saves exactly the old files
+        arrays["noise"] = np.stack(noise_log).astype(np.float32) if noise_log else np.zeros((len(actions), 7), np.float32)
+        arrays["noisy"] = np.array(bool(noisy))
     # When the episode times out, env.step() has already auto-reset the simulation: `obs` is then the
     # first observation of a NEW episode, not the end of this one. Use the last recorded frame instead.
     final = np.asarray(arrays["peg_socket_offset"][-1] if done else obs["extra/peg_socket_offset"], dtype=np.float64)
@@ -270,6 +355,15 @@ def run_episode(client, env_id, seed, geom, args, rng):
         "hover_margin_mm": round(hover_margin * 1000, 2),
         "approach_speed_factor": round(speed, 3),
     }
+    if args.noise_fraction > 0:
+        info.update({
+            "noisy": bool(noisy),
+            "noise_mode": args.noise_mode if noisy else None,
+            "noise_sigma_rad": args.action_noise_sigma if noisy else 0.0,
+            "noise_steps": noise_steps,                                   # steps where the arm really got noise
+            "noise_burst_steps": sorted(bursts),
+            "peak_xy_lift_align_mm": round(peak_xy * 1000, 2),            # largest xy error while in lift / align
+        })
     return arrays, info, video
 
 
@@ -336,7 +430,24 @@ def main():
     p.add_argument("--max-attempts", type=int, default=None, help="Default: 2 x num-episodes.")
     p.add_argument("--seed", type=int, default=0, help="Attempt i uses reset seed (seed + i): reproducible.")
     p.add_argument("--max-steps", type=int, default=None, help="Default: max_steps_per_episode of the YAML.")
-    p.add_argument("--noise-mm", type=float, default=0.0, help="Gaussian xy jitter (mm) on lift/align moves.")
+    p.add_argument("--noise-mm", type=float, default=0.0,
+                   help="Gaussian xy jitter (mm) on lift/align moves; the label contains it (variety, not noise injection).")
+    p.add_argument("--noise-fraction", type=float, default=0.0,
+                   help="Share of the kept demos recorded WITH noise injection (0 = none, as before; e.g. 0.35). "
+                        "Their labels stay clean. See 'Noise injection' at the top of the file.")
+    p.add_argument("--noise-mode", choices=("burst", "white"), default="burst",
+                   help="burst: a few short bursts then clean (default); white: noise at every step.")
+    p.add_argument("--action-noise-sigma", type=float, default=None,
+                   help="Noise radius (rad per step, 7 joints, uniform in the unit ball). Default 0.01 (burst) / 0.003 (white).")
+    p.add_argument("--noise-burst-len", type=int, default=4, help="Steps per burst (burst mode).")
+    p.add_argument("--noise-bursts", type=int, default=1,
+                   help="Bursts per noisy demo (burst mode). Noise only acts in lift/align, ~12 steps: more than 1 rarely fits.")
+    p.add_argument("--noise-burst-gap", type=int, default=8, help="Clean steps between two bursts (+0..3).")
+    p.add_argument("--noise-start-max", type=int, default=6, help="The first burst starts at a random step in [1, this].")
+    p.add_argument("--noise-insert-scale", type=float, default=0.0,
+                   help="Noise multiplier in descend/insert (0 = none there, 1 = same as lift/align).")
+    p.add_argument("--noise-off-xy-mm", type=float, default=0.0,
+                   help="No noise in `align` once the xy error is below this many mm (0 = disabled).")
     p.add_argument("--hover-margin-mm", type=float, default=HOVER_MARGIN * 1000,
                    help="Height of the peg base above the hole's top edge before the descent (mm).")
     p.add_argument("--hover-jitter-mm", type=float, default=0.0,
@@ -373,7 +484,17 @@ def main():
         raise SystemExit("gripper_can_open must be false in the task YAML (and the server restarted from it): "
                          "the demos need the gripper closed on the peg for the whole episode.")
     args.max_steps = args.max_steps or cfg.get("max_steps_per_episode", 150)
+    if not 0.0 <= args.noise_fraction <= 1.0:
+        raise SystemExit(f"--noise-fraction must be in [0, 1], got {args.noise_fraction}")
+    if args.action_noise_sigma is None:
+        args.action_noise_sigma = SIGMA_DEFAULT[args.noise_mode]
+    if args.noise_fraction > 0 and (args.action_noise_sigma <= 0 or args.noise_burst_len < 1 or args.noise_bursts < 1
+                                    or args.noise_start_max < 1 or args.noise_insert_scale < 0):
+        raise SystemExit("noise injection needs --action-noise-sigma > 0, --noise-burst-len >= 1, --noise-bursts >= 1, "
+                         "--noise-start-max >= 1 and --noise-insert-scale >= 0")
     max_attempts = args.max_attempts or 2 * args.num_episodes
+    n_noisy = int(round(args.noise_fraction * args.num_episodes))
+    quota = {"clean": args.num_episodes - n_noisy, "noisy": n_noisy}      # successful demos wanted of each kind
     out = Path(args.out)
     rng = np.random.default_rng(args.seed)
 
@@ -396,32 +517,51 @@ def main():
           f" | descend xy {args.descend_max_xy_mm:g} z {args.descend_max_z_mm:g}"
           f" | insert xy {args.insert_max_xy_mm:g} z {args.insert_max_z_mm:g}   hover margin {args.hover_margin_mm:g} mm")
 
+    if args.noise_fraction > 0:
+        what = (f"{args.noise_bursts} burst(s) of {args.noise_burst_len} steps" if args.noise_mode == "burst"
+                else "noise at every step")
+        print(f"noise injection: {quota['noisy']} noisy + {quota['clean']} clean demos wanted | mode {args.noise_mode} ({what}) "
+              f"| sigma {args.action_noise_sigma:g} rad | scale in descend/insert {args.noise_insert_scale:g} "
+              f"| labels stay clean")
+
     saved = 0
     attempts = 0
     step_counts = []                                  # length of the successful attempts
+    kinds = {k: {"tried": 0, "ok": 0, "steps": [], "peak": [], "align": []} for k in quota}
     with open(out / "index.jsonl", "a") as index:
         while saved < args.num_episodes and attempts < max_attempts:
             seed = args.seed + attempts
             attempts += 1
+            # clean / noisy interleaved: the kind that is furthest behind its quota goes next (all clean at fraction 0)
+            kind = min((k for k in quota if kinds[k]["ok"] < quota[k]), key=lambda k: kinds[k]["ok"] / quota[k])
+            noisy = kind == "noisy"
+            kinds[kind]["tried"] += 1
             t0 = time.time()
-            arrays, info, video = run_episode(client, env_id, seed, geom, args, rng)
+            arrays, info, video = run_episode(client, env_id, seed, geom, args, rng, noisy=noisy)
             tag = "OK  " if info["success"] else "FAIL"
+            extra = f"  [noisy: {info['noise_steps']} noise steps]" if noisy else ""
             print(f"[{tag}] seed {seed:4d}  {info['steps']:3d} steps  final offset (mm) {info['final_offset_mm']}"
                   f"  max|F| {info['max_force_N']:.1f} N  gripper drift {info['gripper_drift_mm']:.2f} mm"
-                  f"  waypoints {info['waypoint_entered_at_step']}  clipped {info['clipped_steps']}"
+                  f"  waypoints {info['waypoint_entered_at_step']}  clipped {info['clipped_steps']}{extra}"
                   f"  ({time.time() - t0:.0f}s)")
             if info["success"]:
-                fname = f"ep_{saved:04d}_seed{seed}.npz"
+                fname = f"ep_{saved:04d}_seed{seed}{'_noisy' if noisy else ''}.npz"
                 saved += 1
                 step_counts.append(info["steps"])
+                kinds[kind]["ok"] += 1
+                kinds[kind]["steps"].append(info["steps"])
+                if "peak_xy_lift_align_mm" in info:
+                    kinds[kind]["peak"].append(info["peak_xy_lift_align_mm"])
+                    entered = info["waypoint_entered_at_step"]
+                    kinds[kind]["align"].append(entered.get("descend", info["steps"]))   # steps spent before `descend`
             elif args.save_failures:
-                fname = f"fail_seed{seed}.npz"
+                fname = f"fail_seed{seed}{'_noisy' if noisy else ''}.npz"
             else:
                 fname = None
             if fname:
                 np.savez(out / fname, **arrays, prompt=np.array(prompt), seed=np.array(seed))
             if video_dir:
-                write_video(video_dir / f"{tag.strip()}_seed{seed}.mp4", video, args.video_fps)
+                write_video(video_dir / f"{tag.strip()}_seed{seed}{'_noisy' if noisy else ''}.mp4", video, args.video_fps)
             index.write(json.dumps({**info, "file": fname}) + "\n")
             index.flush()
 
@@ -429,6 +569,15 @@ def main():
     if step_counts:
         print(f"successful attempts: {len(step_counts)}, mean length {np.mean(step_counts):.0f} steps "
               f"(max allowed {args.max_steps})")
+    if args.noise_fraction > 0:
+        print("\nclean vs noisy (success rate = kept / attempted of that kind; 'before descend' = steps spent in lift + align)")
+        for k, s in kinds.items():
+            if s["tried"] == 0:
+                continue
+            print(f"  {k:5s}: {s['ok']}/{s['tried']} ok ({100 * s['ok'] / s['tried']:.0f}%)"
+                  f" | mean length {np.mean(s['steps']):.0f} steps | before descend {np.mean(s['align']):.1f} steps"
+                  f" | mean peak xy in lift/align {np.mean(s['peak']):.2f} mm" if s["ok"] else
+                  f"  {k:5s}: 0/{s['tried']} ok")
 
 
 if __name__ == "__main__":
