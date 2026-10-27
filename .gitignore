@@ -22,5 +22,8 @@ weights-backup/
 .venv-isaaclab/
 smoke_test_frames/
 frames_*/
+*.zip
+*.gz
+
+# NVIDIA assets (Robotiq USD, TSF_85.usd, tactile repository): never committed
 expo_ft/third_party/robotiq/
-/*.zip
