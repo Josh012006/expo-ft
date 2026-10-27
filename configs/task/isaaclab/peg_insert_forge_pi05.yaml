@@ -5,8 +5,10 @@
 #                                                       server_host, server_port,
 #                                                       max_steps_per_episode, gripper_can_open,
 #                                                       gripper_obs, disable_sleep,
-#                                                       arm_stiffness, arm_damping
-#   - IsaacLabEnvWrapper (.venv)                reads: server_host, server_port
+#                                                       arm_stiffness, arm_damping,
+#                                                       robot, robot_usd, finger_stiffness, finger_damping,
+#                                                       finger_effort, tactile_exclude_zone_joints
+#   - IsaacLabEnvWrapper (.venv)                reads: server_host, server_port, video_tactile_panel, tactile_vmax
 #   - eval_policy.py / make_env_wrapper (.venv) reads: everything else below,
 #                                                       including max_steps_per_episode too
 
@@ -15,6 +17,29 @@ env_id: "ForgePegInsert"   # label only (output filenames/logging) — no functi
 
 # -- Server side -------------------------------------------------------------
 task_name: "Isaac-Forge-PegInsert-Direct-v0"
+
+# Which robot the simulation uses: ONE field, nothing else to change anywhere (expo_ft/env/isaaclab/robots.py).
+#   franka            FORGE's own Franka + Franka Hand (what every result so far was obtained with)
+#   robotiq_2f85      Franka arm + Robotiq 2F-85 gripper (NVIDIA RoboLab USD), no taxels
+#   robotiq_2f85_tsf  same + the 7x4 tactile zones of NVIDIA's TSF-85 contact twin on each finger. The server then also
+#                     sends `extra/tactile` (2, 7, 4): net contact force (N) of each zone, [0] left finger, [1] right,
+#                     row 0 = fingertip. The demo / eval / replay videos show it under the cameras.
+# The Robotiq USD is built the first time (assets/robots/<robot>.usda, gitignored) from expo_ft/third_party/robotiq/ and
+# rebuilt when an input changes. For one run only: forge_server.py --config <this file> --set robot=robotiq_2f85_tsf
+# The robots differ in dynamics (grasp, TCP 65 mm lower, other friction): demos recorded with one robot do not replay
+# on another and a checkpoint trained on one is evaluated on the other as a different embodiment.
+robot: "franka"
+
+# Optional, Robotiq profiles only (None / absent = values of NVIDIA's USD: stiffness 5.7e3, damping ~0, effort 16.5 N.m
+# on the finger joint). Tune them if the grasp is too violent or too weak.
+# finger_stiffness: 5.7e3
+# finger_damping: 50.0
+# finger_effort: 8.0
+# Already built USD to spawn instead of the generated one (Robotiq profiles only):
+# robot_usd: "assets/robots/my_robot.usda"
+# Fallback if PhysX refuses the number of links of robotiq_2f85_tsf (the 56 zones as articulation links): zones as free
+# bodies tied to the fingers by joints, re-positioned by the server after each reset.
+# tactile_exclude_zone_joints: true
 
 # Wall-clock pacing of env.step() on the server. False = run as fast as the
 # GPU allows. This does NOT affect what pi05_droid_jointpos sees or does:
@@ -50,6 +75,13 @@ disable_sleep: false
 # Can be overridden on the command line: forge_server.py --arm-stiffness 80 --arm-damping 40
 arm_stiffness: 400
 arm_damping: 60
+
+# -- Videos (client side: eval, replay) ----------------------------------------
+# Frame of the videos = cameras on top, taxels below (448 x 448, +48 px banner). A robot without taxels gets a
+# placeholder in the panel, so that all videos have the same layout. false = cameras only (448 x 224).
+video_tactile_panel: true
+# Force (N) of the top of the colour scale of the taxel panel, fixed so that videos can be compared.
+tactile_vmax: 5.0
 
 # -- Shared (client + server) -------------------------------------------------
 server_host: "localhost"   # override to the env-server node's hostname if

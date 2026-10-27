@@ -4,6 +4,8 @@ Run inside .venv-isaaclab ONLY (needs isaacsim/isaaclab installed):
 
     export CUBLAS_WORKSPACE_CONFIG=:4096:8
     python -m expo_ft.env.isaaclab.forge_server --config configs/task/isaaclab/peg_insert_forge_pi05.yaml
+    # any YAML field can be overridden for one run, e.g. another robot (see expo_ft/env/isaaclab/robots.py):
+    python -m expo_ft.env.isaaclab.forge_server --config ... --set robot=robotiq_2f85_tsf
 
 The CUBLAS_WORKSPACE_CONFIG export is required, not optional, and must be set
 BEFORE this process starts — CUDA initializes as soon as Isaac Sim/AppLauncher
@@ -48,11 +50,20 @@ parser.add_argument("--arm-stiffness", type=float, default=None,
                     help="PD stiffness of the arm joints (N.m/rad). Overrides arm_stiffness of the YAML (default 80).")
 parser.add_argument("--arm-damping", type=float, default=None,
                     help="PD damping of the arm joints (N.m.s/rad). Overrides arm_damping of the YAML (default 40).")
+parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                    help="Override any field of the YAML for this run (repeatable), e.g. --set robot=robotiq_2f85_tsf "
+                         "--set gripper_can_open=true. The value is read as YAML (true, 0.5, "
+                         "path/to/file ...).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
 with open(args.config) as f:
     cfg_yaml = yaml.safe_load(f)
+for _item in args.set:
+    _key, _sep, _value = _item.partition("=")
+    if not _sep or not _key.strip():
+        parser.error(f"--set expects KEY=VALUE, got {_item!r}")
+    cfg_yaml[_key.strip()] = yaml.safe_load(_value)
 for _key in ("arm_stiffness", "arm_damping"):       # command line > YAML > default
     if getattr(args, _key) is not None:
         cfg_yaml[_key] = getattr(args, _key)
@@ -96,6 +107,8 @@ import isaaclab_tasks  # noqa: E402,F401  (registers Isaac-Forge-*-Direct-v0)
 from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 
 from expo_ft.env.isaaclab.forge_env_patched import ForgeEnvJointPosPi05, GRIPPER_OPEN_WIDTH  # noqa: E402
+from expo_ft.env.isaaclab.robot_assets import ensure_robot_usd  # noqa: E402
+from expo_ft.env.isaaclab.robots import apply_to_env_cfg, profile_from_yaml, robot_info  # noqa: E402
 from expo_ft.env.isaaclab.ws_env_server import WsEnvServer  # noqa: E402
 
 
@@ -123,6 +136,17 @@ def gripper_obs_value(width, mode):
 def build_env(cfg_yaml: dict):
     task_name = cfg_yaml["task_name"]  # e.g. "Isaac-Forge-PegInsert-Direct-v0"
     env_cfg = parse_env_cfg(task_name, device="cuda:0", num_envs=1)
+
+    # Robot (YAML field `robot`, default "franka" = FORGE's own Franka + Franka Hand, nothing changes). The Robotiq profiles
+    # spawn a USD derived from NVIDIA's (built once into assets/robots/, see robot_assets.py).
+    profile = profile_from_yaml(cfg_yaml)
+    usd_path = profile.robot_usd
+    if profile.build_usd:
+        usd_path = ensure_robot_usd(profile, exclude_zone_joints=bool(cfg_yaml.get("tactile_exclude_zone_joints", False)),
+                                    log=lambda m: print(f"[forge_server] {m}", flush=True))
+    apply_to_env_cfg(env_cfg, profile, usd_path, cfg_yaml)
+    print(f"[forge_server] robot: {profile.name} ({profile.description})"
+          + (f"\n[forge_server] robot USD: {usd_path}" if usd_path else ""), flush=True)
 
     # Match pi05_droid_jointpos: 8D (7 absolute joint-position targets + gripper),
     # replacing FORGE's native 7D task-space + success-prediction action.
@@ -189,6 +213,7 @@ def build_env(cfg_yaml: dict):
     env = ForgeEnvJointPosPi05(
         cfg=env_cfg, render_mode=None,
         gripper_can_open=cfg_yaml.get("gripper_can_open", True),
+        robot_profile=profile,
     )
     return env, task_name
 
@@ -239,8 +264,15 @@ class ForgeBackend:
         # -- Used by scripts/isaaclab/collect_waypoint_demos.py (scripted demos) --------------
         # Simulation-only helpers: a real robot has no such op. They only READ the state of the
         # env and return numbers; nothing here moves the arm (the client does that via "step").
-        if kind == "finger_width":      # raw finger joint position (m), whatever `gripper_obs` is
-            return float(self.env.joint_pos[0, 7])
+        if kind == "finger_width":      # finger opening (m per finger, FORGE's convention), whatever `gripper_obs` is
+            return float(self.env.gripper_width()[0])
+        if kind == "robot_info":        # which robot this server runs, what the clients may want to know about it
+            return self._robot_info()
+        if kind == "finger_distance":   # distance (m) between the origins of the two finger bodies, from the simulated poses
+            env = self.env
+            names = list(env._robot.body_names)
+            pos = env._robot.data.body_pos_w[0]
+            return float(torch.linalg.norm(pos[names.index("panda_leftfinger")] - pos[names.index("panda_rightfinger")]))
         if kind == "task_geometry":
             return self._task_geometry()
         if kind == "ik_joint_target":
@@ -250,6 +282,11 @@ class ForgeBackend:
         if kind == "save_teleop_demo":
             return self._save_teleop_demo(request)
         return {"error": f"unknown debug kind: {kind}"}
+
+    def _robot_info(self):
+        profile = self.env._profile
+        return {**robot_info(profile), "joint_names": self.get_joint_names(),
+                "gripper_can_open": bool(self.env._gripper_can_open), "gripper_adapter": self.env.gripper_info()}
 
     def _teleop_step(self, request):
         """ONE teleoperation control step in ONE round trip (scripts/isaaclab/teleop_client.py).
@@ -366,7 +403,7 @@ class ForgeBackend:
         targets, so an all-zero action would drive every joint to 0 rad."""
         data = self.env._robot.data
         q = data.joint_pos[0, 0:7]
-        cmd = (1.0 - data.joint_pos[0, 7] / GRIPPER_OPEN_WIDTH).clamp(0.0, 1.0)   # 0 open, 1 closed
+        cmd = (1.0 - self.env.gripper_width(fresh=True)[0] / GRIPPER_OPEN_WIDTH).clamp(0.0, 1.0)   # 0 open, 1 closed
         return torch.cat([q, cmd.reshape(1)]).reshape(1, -1).to(self.env.device)
 
     def reset(self, env_id: str, seed):
@@ -438,8 +475,8 @@ class ForgeBackend:
         ext = env._exterior_cam.data.output["rgb"][0].cpu().numpy()
         wrist = env._wrist_cam.data.output["rgb"][0].cpu().numpy()
         joint_pos = env.joint_pos[0, 0:7].detach().cpu().numpy()
-        gripper_pos = gripper_obs_value(env.joint_pos[0, 7:8].detach().cpu().numpy(), self.gripper_obs)
-        return {
+        gripper_pos = gripper_obs_value(env.gripper_width()[0:1].detach().cpu().numpy(), self.gripper_obs)
+        obs = {
             "observation/exterior_image_1_left": ext.astype("uint8"),
             "observation/wrist_image_left": wrist.astype("uint8"),
             "observation/joint_position": joint_pos.astype("float32"),
@@ -460,6 +497,9 @@ class ForgeBackend:
             # turns it into a per-episode summary.
             "extra/peg_socket_offset": self._peg_socket_offset().astype("float32"),
         }
+        if env._tactile_sensors:      # robot profile with taxels: (2, 7, 4) N, [0] left finger, [1] right, row 0 = fingertip
+            obs["extra/tactile"] = env.tactile_grids()[0].detach().cpu().numpy().astype("float32")
+        return obs
 
     def get_info_for_step(self, env_id: str):
         mask = 1.0 - float(self._last_done)
