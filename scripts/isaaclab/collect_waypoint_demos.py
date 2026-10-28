@@ -153,7 +153,11 @@ class Caps(NamedTuple):
     descend_xy: float = 0.001
     descend_z: float = 0.008
     insert_xy: float = 0.0005
-    insert_z: float = 0.0015
+    # 3 mm, above INSERT_PUSH (2 mm): the cap no longer clips the goal, so the step is the full 2 mm press. With 1.5 mm
+    # the push (max|F| ~2.6-3.3 N) was too weak for a peg held tilted: seed 1 (3.8 deg) stopped 5-7 mm short of the
+    # bottom in 4 of 4 runs and seed 111 (3.4 deg) 1.7 mm short in 1 of 1; with 3 mm they went in in 4 of 4 and 1 of 1
+    # (max|F| ~5-6 N). Seeds up to 2.9 deg went in with either value.
+    insert_z: float = 0.003
 
 
 def make_waypoints(hole_depth, align_tol, hover_margin=HOVER_MARGIN, speed=1.0, caps=Caps()):
