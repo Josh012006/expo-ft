@@ -26,7 +26,10 @@ Table 2 (reset trace, skipped with --no-trace): what the server recorded during 
     placed        where the peg axis is, level with the fingertip midpoint, when FORGE puts it in the hand (before closing):
                   x y z, and `across` = the component along the closing axis (the fingers have ~1 mm of play per side)
     closed        the same after the 0.25 s of closing; `w` = finger opening placed -> closed
-For the LIGHT seeds the time series of the closing (every --trace-every physics steps) is printed too.
+    jit           max - min of the finger opening over the last 15 physics steps (mm): ~0.02 = the contact is at rest,
+                  0.1 or more = the pads chatter on the peg
+For the LIGHT seeds (and the seeds of --trace-seeds) the time series of the closing (every --trace-every physics steps) is
+printed too. To see a NORMAL closing: `--num-seeds 5 --trace-every 1 --trace-seeds 0,1,2`.
 Reading it: `across` at placement much larger than the play (|across| > ~1 mm) on LIGHT seeds only -> the random placement puts
 the peg inside a pad / out of the gap before closing; `across` small and the fingers still close to 0 -> the closing itself
 pushes the peg out (the time series shows when).
@@ -53,13 +56,18 @@ def closing_axis(row):
     return d / max(np.linalg.norm(d), 1e-9)
 
 
+JITTER_STEPS = 15         # the finger opening is watched over the last physics steps of the closing
+
+
 def trace_summary(rows):
-    """(closing axis, placed row, last row) of a reset trace, or None when it has no placement / step rows."""
+    """(closing axis, placed row, last row, jitter) of a reset trace, or None when it has no placement / step rows.
+    jitter = max - min of the finger opening (mm) over the last JITTER_STEPS steps: ~0.02 = the contact is at rest."""
     placed = next((r for r in rows if r["ev"] == "place"), None)
     steps = [r for r in rows if r["ev"] == "step"]
     if placed is None or not steps:
         return None
-    return closing_axis(placed), placed, steps[-1]
+    tail = [r["w_mm"] for r in steps[-JITTER_STEPS:]]
+    return closing_axis(placed), placed, steps[-1], max(tail) - min(tail)
 
 
 def main():
@@ -71,6 +79,8 @@ def main():
     p.add_argument("--light-effort", type=float, default=2.0, help="Effort (N.m) below which a seed is flagged LIGHT.")
     p.add_argument("--no-trace", action="store_true", help="Skip the reset trace (needs the forge_server.py with `trace_next_reset`).")
     p.add_argument("--trace-every", type=int, default=3, help="Time series of the LIGHT seeds: one row every N physics steps.")
+    p.add_argument("--trace-seeds", default="", help="Seeds (comma list) whose closing time series is printed too, LIGHT or not "
+                                                      "(e.g. 0,1,2 to see how a normal closing goes).")
     args = p.parse_args()
 
     with open(args.config) as f:
@@ -128,22 +138,23 @@ def main():
         print("\nno reset trace (is forge_server.py the version with `trace_next_reset`? restart it after copying the file)")
         return
     print("\nreset trace, frame of panda_fingertip_centered, mm  (across = along the closing axis; the fingers have ~1 mm of play per side)")
-    print("seed | closing axis        | placed: peg x, y, z            across | closed: peg x, y, z            across | w placed -> closed")
+    print("seed | closing axis        | placed: peg x, y, z            across | closed: peg x, y, z            across | w placed -> closed | jit mm")
     for seed, s in traces.items():
         if s is None:
             print(f"{seed:4d} | no trace")
             continue
-        c, placed, last = s
+        c, placed, last, jit = s
         pa, pl = np.asarray(placed["peg"]), np.asarray(last["peg"])
         print(f"{seed:4d} | ({c[0]:5.2f},{c[1]:5.2f},{c[2]:5.2f}) | {xyz(pa)} {float(pa @ c):7.2f} | {xyz(pl)} {float(pl @ c):7.2f} | "
-              f"{placed['w_mm']:5.2f} -> {last['w_mm']:5.2f} {'  <- LIGHT' if seed in flagged else ''}")
-    for seed in flagged:
+              f"{placed['w_mm']:5.2f} -> {last['w_mm']:5.2f} | jit {jit:4.2f}{'  <- LIGHT' if seed in flagged else ''}")
+    wanted = [int(v) for v in args.trace_seeds.split(",") if v.strip()]
+    for seed in list(dict.fromkeys(flagged + [s for s in wanted if s in traces])):
         s = traces.get(seed)
         if s is None:
             continue
         c = s[0]
         rows = light_rows[seed]
-        print(f"\nseed {seed} (LIGHT): closing, every {args.trace_every} physics steps")
+        print(f"\nseed {seed}{' (LIGHT)' if seed in flagged else ''}: closing, every {args.trace_every} physics steps")
         print("  step |  w mm | effort N.m | peg x, y, z (mm)                 | across | L-R across (mm)")
         for k, r in enumerate(r for r in rows if r["ev"] in ("place", "step")):
             if k % args.trace_every and r["ev"] != "place":

@@ -145,6 +145,22 @@ def build_env(cfg_yaml: dict):
         usd_path = ensure_robot_usd(profile, exclude_zone_joints=bool(cfg_yaml.get("tactile_exclude_zone_joints", False)),
                                     log=lambda m: print(f"[forge_server] {m}", flush=True))
     apply_to_env_cfg(env_cfg, profile, usd_path, cfg_yaml)
+
+    # YAML field `reset_grip_open_width` (m per finger, FORGE's convention: 0 = closed, 0.04 = fully open; default None =
+    # FORGE's own value). FORGE's reset opens the fingers to 1.25 x the peg radius (factory_env._set_franka_to_default_pose:
+    # held_asset_cfg.diameter / 2 * 1.25, 4.99 mm for the 7.986 mm peg), puts the peg between them and closes for 0.25 s. That
+    # formula assumes the pad faces sit at the finger origin, as on the Franka Hand (1 mm of play per side). On the Robotiq
+    # the pad faces sit further out: the measured width at which the pads touch the peg is >= 5.3 mm, so the fingers start
+    # INSIDE the peg and the closing starts as a collision, not as an approach. This field sets the opening directly
+    # (it is the ONLY use of held_asset_cfg.diameter, so it is rewritten to give exactly that opening).
+    # MEASURED (grip_check.py, 100 seeds each): 6.5 mm does NOT remove the crushed grips at the USD's effort of 16.5 (4/100)
+    # and, at effort 6, lets the peg slide along the pad before it is gripped (up to 5.9 mm vs 0.2 mm). Not used: the
+    # effort limit (robots.py, finger_effort = 6) is what fixes it. Kept for experiments.
+    open_width = cfg_yaml.get("reset_grip_open_width")
+    if open_width is not None:
+        env_cfg.task.held_asset_cfg.diameter = 2.0 * float(open_width) / 1.25
+        print(f"[forge_server] reset_grip_open_width: {float(open_width) * 1000:.2f} mm per finger at the reset "
+              f"(FORGE's default: 1.25 x peg radius)", flush=True)
     print(f"[forge_server] robot: {profile.name} ({profile.description})"
           + (f"\n[forge_server] robot USD: {usd_path}" if usd_path else ""), flush=True)
 
