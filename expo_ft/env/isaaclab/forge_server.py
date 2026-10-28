@@ -259,8 +259,11 @@ class ForgeBackend:
         self._last_success = False
         self._last_reward = 0.0
         self._grasp_points = None                       # vertices of the robot bodies, filled by the first grasp_geometry call
+        self.reset_passes = int(cfg_yaml.get("reset_passes", 1))        # see reset()
+        if self.reset_passes < 1:
+            raise ValueError(f"reset_passes must be >= 1, got {self.reset_passes}")
         self._trace_armed = False                       # debug op `trace_next_reset` arms the recording of the NEXT reset
-        self._trace = None                              # rows being recorded during a reset (None = not recording)
+        self._trace = None                             # rows being recorded during a reset (None = not recording)
         self._trace_last = None                         # rows of the last recorded reset (debug op `reset_trace`)
         self._trace_placed = False
         self._install_reset_trace()
@@ -572,15 +575,23 @@ class ForgeBackend:
         # BEFORE env.reset() (and not passing seed to env.reset() itself, to
         # avoid a second, non-deterministic reseed overwriting this one) is
         # the fix being tested for that.
-        self._trace = [] if self._trace_armed else None       # one-shot, see _install_reset_trace
-        self._trace_armed, self._trace_placed = False, False
+        # YAML `reset_passes` (default 1): the whole reset (reseed + env.reset()) is done this many times in a row. Measured
+        # with repro_check.py: the state right after reset(seed) depends a little on the episode that ran BEFORE it (what the
+        # physics engine keeps from it), so the same seed does not give exactly the same start. A second pass starts from
+        # the state the first pass produced instead of from the end of the previous episode; whether that removes the
+        # dependence is what repro_check.py --order interleaved tells.
+        trace_wanted = self._trace_armed                      # one-shot, see _install_reset_trace; only the LAST pass is recorded
+        self._trace_armed = False
         try:
-            if seed is not None:
-                from isaaclab.utils.seed import configure_seed
-                configure_seed(int(seed), torch_deterministic=True)
-                self.env.reset()
-            else:
-                self.env.reset()
+            for k in range(self.reset_passes):
+                self._trace = [] if (trace_wanted and k == self.reset_passes - 1) else None
+                self._trace_placed = False
+                if seed is not None:
+                    from isaaclab.utils.seed import configure_seed
+                    configure_seed(int(seed), torch_deterministic=True)
+                    self.env.reset()
+                else:
+                    self.env.reset()
         finally:
             if self._trace is not None:
                 self._trace_last, self._trace = self._trace, None
