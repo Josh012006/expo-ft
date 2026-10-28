@@ -7,7 +7,8 @@
 #                                                       gripper_obs, disable_sleep,
 #                                                       arm_stiffness, arm_damping,
 #                                                       robot, robot_usd, finger_stiffness, finger_damping,
-#                                                       finger_effort, tactile_exclude_zone_joints
+#                                                       finger_effort, tactile_exclude_zone_joints,
+#                                                       enhanced_determinism, reset_passes
 #   - IsaacLabEnvWrapper (.venv)                reads: server_host, server_port, video_tactile_panel, tactile_vmax
 #   - eval_policy.py / make_env_wrapper (.venv) reads: everything else below,
 #                                                       including max_steps_per_episode too
@@ -67,6 +68,20 @@ gripper_obs: normalized
 # When true, PhysX is not allowed to put the arm to sleep (sleep_threshold = 0). Tested with
 # `collect_waypoint_demos.py --probe`: it changed nothing, the dead zone is not caused by sleeping.
 disable_sleep: false
+
+# Reproducibility of the simulation (measured with scripts/isaaclab/repro_check.py and reset_history.py on an L40S; both
+# need a server restart to change):
+#   enhanced_determinism: PhysX's deterministic GPU solver mode. Without it, two server runs that execute the SAME sequence
+#       of resets and steps give different results (joint angles after reset(seed) differ by up to 4e-4 rad, the peg by up to
+#       5 mm in the hand). With it they are identical bit for bit, contact-rich insertions included: restarting the server
+#       and running the same collection command gives the same demos. Must be the same for ALL the data of an experiment.
+#   reset_passes: the reset (reseed + env.reset()) is done this many times. The start state after reset(seed) depends a
+#       little on the episode that ran just before. With 2 passes: repeats of a hold episode back to back are exact (1 pass:
+#       2 seeds of 4 were not) and after mixed episodes the differences shrink (peg 1.5 -> 0.2 mm on seed 40). 3 passes gave
+#       the same numbers as 2. What is left is a dependence on the previous episode that exists with the Robotiq (with or
+#       without taxel zones) and not with the Franka; its cause is not identified. 1 = FORGE's single reset.
+enhanced_determinism: true
+reset_passes: 2
 
 # PD gains of the arm joints (code defaults: 80 / 40). 400 / 60 chosen after the comparison of the
 # scripted demos: with 80 / 40 the arm follows only ~12% of a target change per control step and ignores
