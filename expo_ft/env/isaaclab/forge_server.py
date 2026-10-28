@@ -206,6 +206,16 @@ def build_env(cfg_yaml: dict):
                 disabled.append(name)
         print(f"[forge_server] disable_sleep: sleep_threshold = 0 on {disabled}", flush=True)
 
+    # Optional: PhysX "enhanced determinism" (Isaac Lab PhysxCfg.enable_enhanced_determinism): a slightly more expensive
+    # mode of the GPU solver meant to make the result independent of the order in which contacts / bodies are processed.
+    # Off by default in Isaac Lab and in FORGE. Test it with scripts/isaaclab/repro_check.py (--demos-dir) before using it
+    # for data: it changes the dynamics a little, so it must be on for ALL the data of an experiment or for none.
+    if cfg_yaml.get("enhanced_determinism", False):
+        if not hasattr(env_cfg.sim.physx, "enable_enhanced_determinism"):
+            raise ValueError("enhanced_determinism: this Isaac Lab's PhysxCfg has no enable_enhanced_determinism field")
+        env_cfg.sim.physx.enable_enhanced_determinism = True
+        print("[forge_server] enhanced_determinism: PhysX enable_enhanced_determinism = True", flush=True)
+
     # One render per env step (env step = decimation physics steps).
     env_cfg.sim.render_interval = env_cfg.decimation
 
