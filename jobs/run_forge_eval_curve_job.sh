@@ -5,7 +5,7 @@
 #
 # Usage:
 #   sbatch jobs/run_forge_eval_curve_job.sh --checkpoints-dir DIR [--n-episodes N] [--steps "S1 S2"] [--seed N]
-#        [--max-steps N] [--server-port P] [--save-videos] [--video-dir NAME|PATH] [--skip-base] [--output-dir DIR]
+#        [--robot NAME] [--max-steps N] [--server-port P] [--save-videos] [--video-dir NAME|PATH] [--skip-base] [--output-dir DIR]
 #     --checkpoints-dir  (required) folder that contains the numeric step folders, e.g.
 #                        logs/forge_peg_insert/<run>/sft/expo_pi05_droid_lora_finetune_sft_joint_state_delta/<exp_name>
 #     --n-episodes       episodes per checkpoint, same seeds for all (default 200)
@@ -18,6 +18,9 @@
 #     --steps            only these checkpoints, e.g. --steps 1000 or --steps "1000 1600" (quoted); implies --skip-base
 #     --seed             master seed of the fixed episode list (default 42). The seeds of a run are written to
 #                        <output-dir>/episode_seeds.json: the same --seed and --n-episodes give the same seeds
+#     --robot            robot of the simulation: franka | robotiq_2f85 | robotiq_2f85_tsf (default: the YAML's, franka).
+#                        MUST be the robot the checkpoints were trained on (the Robotiq SFT runs: robotiq_2f85_tsf).
+#                        Server AND client use it, through the copy of the YAML in <output-dir>/config/
 #     --max-steps        episode length in steps (default: the YAML's max_steps_per_episode, 150). Server AND client
 #                        use it: the script writes a copy of the YAML with this value into <output-dir>/config/
 #     --server-port      port of the Isaac Lab server (default: the YAML's server_port, 8102). Needed when two of
@@ -59,7 +62,7 @@ set -u  # catch unset-variable typos; NOT set -e (would fight the trap/backgroun
 usage() {
     cat <<'EOF'
 Usage: sbatch jobs/run_forge_eval_curve_job.sh --checkpoints-dir DIR [--n-episodes N] [--steps "S1 S2"] [--seed N]
-         [--max-steps N] [--server-port P] [--save-videos] [--video-dir NAME|PATH] [--skip-base] [--output-dir DIR]
+         [--robot NAME] [--max-steps N] [--server-port P] [--save-videos] [--video-dir NAME|PATH] [--skip-base] [--output-dir DIR]
   --checkpoints-dir  (required) folder with the numeric step sub-folders of an SFT run
   --n-episodes       episodes per checkpoint, same seeds for all (default 200)
   --save-videos      switch: also record the rollout videos of every checkpoint
@@ -68,6 +71,7 @@ Usage: sbatch jobs/run_forge_eval_curve_job.sh --checkpoints-dir DIR [--n-episod
   --skip-base        switch: do not evaluate the zero-shot base model
   --steps            only these checkpoints, e.g. --steps 1000 or --steps "1000 1600" (implies --skip-base)
   --seed             master seed of the fixed episode list (default 42)
+  --robot            franka | robotiq_2f85 | robotiq_2f85_tsf (default: the YAML's, franka); the robot of the training
   --max-steps        episode length in steps (default: the YAML's, 150)
   --server-port      port of the Isaac Lab server (default: the YAML's, 8102)
   --output-dir       where results/, logs/, episode_seeds.json, curve.* go (default: --checkpoints-dir;
@@ -88,6 +92,7 @@ STEPS=""
 MASTER_SEED=""
 MAX_STEPS=""
 PORT_OVERRIDE=""
+ROBOT=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --checkpoints-dir) need_value "$1" "$#" "${2-}"; CHECKPOINTS_DIR="$2"; shift 2 ;;
@@ -98,6 +103,7 @@ while [[ $# -gt 0 ]]; do
         --skip-base) SKIP_BASE=1; shift ;;
         --steps) need_value "$1" "$#" "${2-}"; STEPS="$2"; shift 2 ;;
         --seed) need_value "$1" "$#" "${2-}"; MASTER_SEED="$2"; shift 2 ;;
+        --robot) need_value "$1" "$#" "${2-}"; ROBOT="$2"; shift 2 ;;
         --max-steps) need_value "$1" "$#" "${2-}"; MAX_STEPS="$2"; shift 2 ;;
         --server-port) need_value "$1" "$#" "${2-}"; PORT_OVERRIDE="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -125,13 +131,18 @@ if [ "$N_CKPT" -eq 0 ]; then
     exit 1
 fi
 
-# --max-steps / --server-port: a copy of the YAML (same file name) in <output-dir>/config/ is used by the server AND the
+# --robot / --max-steps / --server-port: a copy of the YAML (same file name) in <output-dir>/config/ is used by the server AND the
 # client, so both always agree and the run keeps the exact config it used. Without them the repo's YAML is used as is.
-if [ -n "$MAX_STEPS" ] || [ -n "$PORT_OVERRIDE" ]; then
+if [ -n "$ROBOT" ] || [ -n "$MAX_STEPS" ] || [ -n "$PORT_OVERRIDE" ]; then
     DERIVED_DIR="${OUTPUT_DIR:-$CHECKPOINTS_DIR}/config"
     mkdir -p "$DERIVED_DIR" || { echo "FATAL: cannot create $DERIVED_DIR"; exit 1; }
     DERIVED="$DERIVED_DIR/$(basename "$CONFIG")"
     cp "$CONFIG" "$DERIVED"
+    if [ -n "$ROBOT" ]; then
+        case "$ROBOT" in franka|robotiq_2f85|robotiq_2f85_tsf) ;; *) echo "FATAL: --robot must be franka, robotiq_2f85 or robotiq_2f85_tsf (got $ROBOT)"; exit 1 ;; esac
+        sed -i -E "s/^(robot:)[[:space:]]*.*/\1 \"$ROBOT\"/" "$DERIVED"
+        grep -q -E "^robot: \"$ROBOT\"" "$DERIVED" || { echo "FATAL: could not set robot in $DERIVED"; exit 1; }
+    fi
     if [ -n "$MAX_STEPS" ]; then
         sed -i -E "s/^(max_steps_per_episode:)[[:space:]]*[0-9]+/\1 $MAX_STEPS/" "$DERIVED"
         grep -q -E "^max_steps_per_episode: $MAX_STEPS( |$)" "$DERIVED" || { echo "FATAL: could not set max_steps_per_episode in $DERIVED"; exit 1; }
@@ -145,7 +156,7 @@ if [ -n "$MAX_STEPS" ] || [ -n "$PORT_OVERRIDE" ]; then
 fi
 SERVER_PORT=$(grep -E "^server_port:" "$CONFIG" | head -1 | sed -E 's/^server_port:[[:space:]]*([0-9]+).*/\1/')
 [ -n "$SERVER_PORT" ] || { echo "FATAL: no server_port in $CONFIG"; exit 1; }
-echo "[config] $CONFIG: max_steps_per_episode=$(grep -E '^max_steps_per_episode:' "$CONFIG" | head -1 | sed -E 's/[^0-9]*([0-9]+).*/\1/'), server_port=$SERVER_PORT"
+echo "[config] $CONFIG: robot=$(grep -E '^robot:' "$CONFIG" | head -1 | sed -E 's/^robot:[[:space:]]*"?([A-Za-z0-9_]+)"?.*/\1/'), max_steps_per_episode=$(grep -E '^max_steps_per_episode:' "$CONFIG" | head -1 | sed -E 's/[^0-9]*([0-9]+).*/\1/'), server_port=$SERVER_PORT"
 
 SERVER_PID=""
 
