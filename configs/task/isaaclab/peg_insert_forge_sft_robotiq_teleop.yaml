@@ -1,0 +1,56 @@
+# configs/task/isaaclab/peg_insert_forge_sft_robotiq_teleop.yaml
+#
+# SFT 3/3 of the comparison between demonstrators on FORGE PegInsert with the Robotiq 2F-85 + taxel robot
+# (server started with robot=robotiq_2f85_tsf). This run: teleoperated demos (teleop_client.py).
+#   scripted  demos/isaaclab/ForgePegInsert_Robotiq_scripted   LeRobot expo_ft/forge_peg_insert_robotiq_scripted
+#   noisy     demos/isaaclab/ForgePegInsert_Robotiq_noisy      LeRobot expo_ft/forge_peg_insert_robotiq_noisy
+#   teleop    demos/isaaclab/ForgePegInsert_Robotiq_teleop     LeRobot expo_ft/forge_peg_insert_robotiq_teleop
+# The three YAMLs are identical except lerobot_repo_id, run_name and sft_exp_name (steps, batch size, LoRA, lr, 50 demos
+# each). ALL THREE use the SAME normalization statistics: those of the noisy set (assets/forge_demo_norm/
+# forge_demos_robotiq_noisy), the one that covers the other two best (cross-check of the q01 / q99 of the three sets),
+# so that the only difference between the runs is the demonstrations.
+#
+# SFT (LoRA) of pi05_droid_jointpos. Read by scripts/run_pipeline.py --stage sft (launched by jobs/job_forge_sft.sh):
+#   sbatch --job-name=sft_robotiq_teleop jobs/job_forge_sft.sh --venv .venv --config configs/task/isaaclab/peg_insert_forge_sft_robotiq_teleop.yaml
+# Eval of the resulting checkpoints uses configs/task/isaaclab/peg_insert_forge_pi05.yaml (not this file), with the
+# server started with robot=robotiq_2f85_tsf.
+
+# -- Data -----------------------------------------------------------------------
+# LeRobot dataset = <lerobot_home>/<lerobot_repo_id>, written by
+#   scripts/isaaclab/convert_waypoint_demos_to_lerobot.py --output-dir <lerobot_home> --repo-name <lerobot_repo_id>
+lerobot_home: "demos/isaaclab/lerobot"
+lerobot_repo_id: "expo_ft/forge_peg_insert_robotiq_teleop"
+language_instruction: "Insert the peg into the socket."   # for reference: the conversion stores the prompt of the .npz files
+
+# -- openpi config (FORGE-specific) -----------------------------------------------
+# The demos store ABSOLUTE joint targets; this config turns the 7 joints into offsets from the chunk-start state
+# at training time (DeltaActions), like the pi05_droid_jointpos weights. LoRA, lr 2.5e-5 constant, batch/steps below.
+sft_train_config_name: "expo_pi05_droid_lora_finetune_sft_joint_state_delta"
+
+# -- Run / Logging ------------------------------------------------------------------
+project_name: "expo-ft"
+run_name: "forge_peg_insert_robotiq_sft_teleop"
+# A timestamped subdir <run_name>_<date>-<slurm job id> is created per run, SFT checkpoints are written in
+# <that dir>/sft/<config>/<sft_exp_name>_.../<step>/.
+output_dir: "logs/forge_peg_insert"
+
+# -- SFT ------------------------------------------------------------------------------
+sft_exp_name: "forge_peg_insert_robotiq_sft_teleop"
+
+# Normalization statistics, COMMON to the three runs: <sft_norm_stats_dir>/<sft_norm_stats_asset_id>/norm_stats.json, written by
+#   python scripts/isaaclab/compute_demo_norm_stats.py --demos-dir demos/isaaclab/ForgePegInsert_Robotiq_noisy \
+#       --output-dir assets/forge_demo_norm --asset-id forge_demos_robotiq_noisy --max-episodes 50
+# openpi saves them inside every checkpoint (<step>/assets/forge_demos_robotiq_noisy/), where scripts/eval_policy.py
+# reads them again: evaluation uses the same statistics as the training.
+sft_norm_stats_dir: "assets/forge_demo_norm"
+sft_norm_stats_asset_id: "forge_demos_robotiq_noisy"
+sft_num_workers: 12
+# openpi runs `for step in range(num_train_steps)`: 4001 -> 4001 gradient updates, last step index 4000.
+# With save_interval 200 the checkpoints are 200, 400, ..., 4000.
+sft_num_train_steps: 4001
+sft_batch_size: 64
+sft_save_interval: 200      # each checkpoint holds the whole model (several GB): 20 of them are kept
+sft_log_interval: 100
+sft_resume: true            # no effect on a fresh run (new run dir); continues <sft_resume_dir> if set
+sft_resume_dir: null
+num_data_sft: 50            # 0 = all episodes of the dataset (50). N > 0 -> first N episodes, exp_name gets "_demosN"
