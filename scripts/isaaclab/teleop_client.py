@@ -1,13 +1,17 @@
-
 """Teleoperation client for the FORGE PegInsert simulation -- STEP 3/3: you drive the arm and record demos.
 
 Runs on YOUR PC (Windows / WSL is fine), not on the cluster. The simulation keeps running in forge_server.py on an
 L40S node; this script connects to it through an SSH tunnel and shows what the policy sees:
 
-    left   exterior camera (224x224, enlarged)
-    right  wrist camera    (224x224, enlarged)
-    under  the offset peg -> hole (ground truth, simulation only), the command you sent, the contact force,
-           the state of the inputs and the time of every round trip to the server
+    left        exterior camera (224x224, enlarged)
+    middle      wrist camera    (224x224, enlarged)
+    far right   the TAXEL PANEL of the demo / replay videos (robot with taxels, i.e. robot=robotiq_2f85_tsf on the
+                server): the two 7x4 grids of contact force (row 0 = fingertip at the bottom), the colour scale
+                (0 .. --tactile-vmax N, same as tactile_vmax of the YAML), the verdict (BOTH FINGERS / ONE FINGER
+                ONLY / NO CONTACT), zones max / sum, zones in contact, hand force, gripper effort. A robot without
+                taxels gets the same placeholder as in the videos. --no-tactile removes the column.
+    under       the offset peg -> hole (ground truth, simulation only), the command you sent, the contact force,
+                the state of the inputs and the time of every round trip to the server
 
 You move the PEG (it is rigidly held: the fingertip follows) with the mouse and the keyboard. The orientation of
 the hand is held fixed and the gripper stays closed, exactly as in the scripted demos. Each control step the
@@ -28,7 +32,8 @@ the whole episode is sent to forge_server.py, which writes it ON THE CLUSTER, in
 root there, default demos/isaaclab/ForgePegInsertTeleop):
 
     ep_0000_seed100.npz   exterior_image, wrist_image, joint_position, gripper_position, ft_force,
-                          peg_socket_offset, actions, prompt, seed  (same keys as the scripted demos)
+                          peg_socket_offset, actions, prompt, seed  (same keys as the scripted demos), plus
+                          tactile (T, 2, 7, 4) and gripper_effort (T,) when the server's robot has taxels
     index.jsonl           one line per saved demo: seed, steps, wall seconds, final offset, max force, ...
 
 then the next seed starts. Not saved: failed episodes, and successes you skip with R / Z (nothing is written
@@ -447,6 +452,104 @@ def draw_text(screen, font, x, y, text, colour=TEXT):
     return y + font.get_linesize()
 
 
+# ---- Taxel panel: the one of the demo / replay videos (expo_ft/env/video_panels.py), redrawn here with pygame ----
+# Same layout, same colours, same readings. This file imports nothing from the repo on purpose, hence the copy.
+# The panel is 2:1 (448 x 224 px in the videos); every length is multiplied by height / 224 so that it can be enlarged.
+TACTILE_CONTACT_N = 0.05      # a zone above this force counts as "in contact"
+_CMAP_KEYS = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+_CMAP_COLORS = np.array([(18, 18, 40), (40, 80, 220), (40, 200, 120), (240, 220, 50), (230, 40, 30)], dtype=np.float64)
+_FONT_CACHE = {}
+
+
+def colormap(x):
+    """x in [0, 1] (any shape) -> uint8 colours (..., 3): dark blue (no contact) .. green .. yellow .. red."""
+    x = np.clip(np.asarray(x, dtype=np.float64), 0.0, 1.0)
+    return np.stack([np.interp(x, _CMAP_KEYS, _CMAP_COLORS[:, c]) for c in range(3)], axis=-1).astype(np.uint8)
+
+
+def sized_font(pygame, size):
+    size = int(max(8, size))
+    if size not in _FONT_CACHE:
+        _FONT_CACHE[size] = pygame.font.SysFont("consolas,dejavusansmono,couriernew", size)
+    return _FONT_CACHE[size]
+
+
+def tactile_from_obs(obs):
+    """The (2, rows, cols) taxel array of an observation, or None (robot without taxels / unexpected shape)."""
+    t = obs.get("extra/tactile")
+    if t is None:
+        return None
+    t = np.asarray(t, dtype=np.float64)
+    return t if t.ndim == 3 and t.shape[0] == 2 else None
+
+
+def tactile_panel_surface(pygame, tactile, width, height, vmax, hand_force=None, gripper_effort=None):
+    """pygame surface (width x height) of the taxel panel. `tactile` None -> the placeholder of the videos."""
+    k = height / 224.0
+    img = np.full((height, width, 3), 12, dtype=np.uint8)
+    if tactile is None:
+        surface = pygame.surfarray.make_surface(np.ascontiguousarray(img.swapaxes(0, 1)))
+        label = sized_font(pygame, round(13 * k)).render("no tactile data (robot without taxels)", True, (130, 130, 130))
+        surface.blit(label, ((width - label.get_width()) // 2, (height - label.get_height()) // 2))
+        return surface
+    t = np.asarray(tactile, dtype=np.float64)
+    n_rows, n_cols = t.shape[1], t.shape[2]
+    cell = max(8, (height - round(70 * k)) // n_rows)               # 22 px for a 224 px panel
+    gw, gh = n_cols * cell, n_rows * cell
+    gap, x_first, top = round(18 * k), round(14 * k), round(40 * k)
+    x_grid = [x_first, x_first + gw + gap]
+    for side in (0, 1):
+        colours = colormap(t[side] / max(vmax, 1e-9))               # (rows, cols, 3)
+        for r in range(n_rows):
+            y1 = top + gh - r * cell                                # row 0 (fingertip) at the bottom
+            for c in range(n_cols):
+                img[y1 - cell:y1, x_grid[side] + c * cell:x_grid[side] + (c + 1) * cell] = colours[r, c]
+        img[top - 1, x_grid[side]:x_grid[side] + gw] = img[top + gh, x_grid[side]:x_grid[side] + gw] = 70   # frame
+    bar_x, bar_w = x_grid[1] + gw + round(10 * k), max(8, round(12 * k))     # colour bar, as tall as the grids
+    img[top:top + gh, bar_x:bar_x + bar_w] = colormap(np.linspace(1.0, 0.0, gh))[:, None, :]            # vmax at the top
+    img[top - 1, bar_x:bar_x + bar_w] = img[top + gh, bar_x:bar_x + bar_w] = 70
+    surface = pygame.surfarray.make_surface(np.ascontiguousarray(img.swapaxes(0, 1)))
+
+    big, small = sized_font(pygame, round(15 * k)), sized_font(pygame, round(13 * k))
+    for side, name in enumerate(("LEFT", "RIGHT")):
+        label = big.render(name, True, (255, 255, 255))
+        surface.blit(label, (x_grid[side] + (gw - label.get_width()) // 2, round(14 * k)))
+    in_contact = [int((t[i] > TACTILE_CONTACT_N).sum()) for i in (0, 1)]
+    if all(in_contact):
+        state, colour = "BOTH FINGERS", (120, 230, 140)
+    elif any(in_contact):
+        state, colour = "ONE FINGER ONLY", (255, 190, 90)
+    else:
+        state, colour = "NO CONTACT", (150, 150, 150)
+    lines = [(state, colour),
+             (f"zones max  L {t[0].max():4.1f}  R {t[1].max():4.1f} N", (230, 230, 230)),
+             (f"zones sum  L {t[0].sum():4.1f}  R {t[1].sum():4.1f} N", (230, 230, 230)),
+             (f"in contact L {in_contact[0]}/{n_rows * n_cols}  R {in_contact[1]}/{n_rows * n_cols}", (230, 230, 230))]
+    if hand_force is not None:
+        lines.append((f"hand force  {hand_force:5.2f} N", (230, 230, 230)))
+    if gripper_effort is not None:
+        lines.append((f"gripper effort  {gripper_effort:5.1f} Nm", (230, 230, 230)))
+    blue = (130, 150, 255)
+    x_lab = bar_x + bar_w + round(4 * k)
+    surface.blit(small.render("N", True, blue), (bar_x - 2, top - round(20 * k)))
+    tick_w = 0
+    for frac in (0.0, 0.5, 1.0):                                    # ticks: 0, vmax / 2, vmax (colours saturate above vmax)
+        y = top + round(gh * (1.0 - frac))
+        pygame.draw.line(surface, blue, (bar_x + bar_w, y), (bar_x + bar_w + round(3 * k), y))
+        tick = small.render(f"{vmax * frac:g}", True, blue)
+        tick_w = max(tick_w, tick.get_width())
+        surface.blit(tick, (x_lab, y - tick.get_height() // 2))
+    x_text = x_lab + tick_w + round(26 * k)
+    avail = width - x_text - 4
+    size = round(13 * k)                                            # shrink the readings if they would leave the panel
+    while size > 8 and max(sized_font(pygame, size).size(text)[0] for text, _ in lines) > avail:
+        size -= 1
+    font, step = sized_font(pygame, size), round(22 * k)
+    for i, (text, col) in enumerate(lines):
+        surface.blit(font.render(text, True, col), (x_text, round(44 * k) + i * step))
+    return surface
+
+
 def main():
     p = argparse.ArgumentParser(description="Teleop client, step 3: drive the arm with the mouse and the keyboard, "
                                             "record demos on the cluster.")
@@ -462,6 +565,14 @@ def main():
                    help="The step counter turns orange beyond this many steps (the policy has 150; shorter demos "
                         "are closer to the scripted ones). Display only.")
     p.add_argument("--scale", type=int, default=3, help="Camera enlargement factor (224 px x scale).")
+    p.add_argument("--no-tactile", action="store_true", help="No taxel panel (the window is then 2 cameras wide, as before).")
+    p.add_argument("--tactile-width", type=int, default=448,
+                   help="Width (px) of the taxel panel, drawn to the right of the cameras; its height is half. 448 = the "
+                        "size of the panel in the videos. The window is 2 * 224 * scale + this wide: with --scale 3 that "
+                        "is 1792 px; use --scale 2 on a smaller screen.")
+    p.add_argument("--tactile-vmax", type=float, default=5.0,
+                   help="Force (N) at the top of the colour scale (tactile_vmax of the YAML, so that this panel and the "
+                        "videos compare). Display only.")
     p.add_argument("--max-steps", type=int, default=150, help="Episode length (YAML max_steps_per_episode).")
     p.add_argument("--max-seconds", type=float, default=0.0,
                    help="Quit by itself after this time and print the latency summary (0 = no limit).")
@@ -497,7 +608,9 @@ def main():
     LATCHED_KEYS = (pygame.K_w, pygame.K_s, pygame.K_SPACE, pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN)
     size = 224 * args.scale
     hud_height = 284
-    screen = pygame.display.set_mode((max(2 * size, 1000), size + hud_height))
+    panel_w = 0 if args.no_tactile else max(224, args.tactile_width)      # taxel panel column, right of the cameras
+    panel_h = panel_w // 2
+    screen = pygame.display.set_mode((max(2 * size + panel_w, 1000), size + hud_height))
     pygame.display.set_caption("FORGE PegInsert -- teleop client (step 3)")
     font = pygame.font.SysFont("consolas,dejavusansmono,couriernew", 18)
     big_font = pygame.font.SysFont("consolas,dejavusansmono,couriernew", 28, bold=True)
@@ -535,6 +648,7 @@ def main():
     t_start = time.perf_counter()
     last_print = t_start
     last_logged = None
+    panel_obs, panel_surface = None, None     # the taxel panel is redrawn only when the observation changes
     running = True
     while running:
         for event in pygame.event.get():
@@ -614,6 +728,15 @@ def main():
         screen.fill(BACKGROUND)
         screen.blit(to_surface(pygame, session.obs["observation/exterior_image_1_left"], args.scale), (0, 0))
         screen.blit(to_surface(pygame, session.obs["observation/wrist_image_left"], args.scale), (size, 0))
+        if panel_w:
+            if panel_obs is not session.obs:
+                effort = session.obs.get("extra/gripper_effort")
+                panel_surface = tactile_panel_surface(
+                    pygame, tactile_from_obs(session.obs), panel_w, panel_h, args.tactile_vmax,
+                    hand_force=session.force_n(),
+                    gripper_effort=None if effort is None else float(np.asarray(effort, dtype=np.float64).reshape(-1)[0]))
+                panel_obs = session.obs
+            screen.blit(panel_surface, (2 * size, 0))
         offset_mm = session.offset_mm()
         xy = float(np.hypot(offset_mm[0], offset_mm[1]))
         xy_colour = GOOD if xy < geom["success_xy"] * 1000 else TEXT
