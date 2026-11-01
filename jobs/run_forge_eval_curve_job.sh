@@ -47,7 +47,6 @@
 #SBATCH --mail-user=josue.mongan@mila.quebec
 #SBATCH --output=logs/slurm/%x_%j.out
 #SBATCH --error=logs/slurm/%x_%j.err
-#SBATCH --no-requeue
 
 # Server + client, same node, same GPU, one allocation. The server stays up for the whole sweep; eval_curve.py
 # starts one eval_policy.py process per checkpoint (fresh GPU memory each time) and they all connect to it.
