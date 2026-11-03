@@ -81,7 +81,14 @@ fi
 
 SERVER_PID=""
 
+# GPU memory of every process on the card, every 5 s, whole job: what the Isaac Lab server and the JAX client each take
+# (process_name tells them apart: .venv-isaaclab/bin/python vs .venv/bin/python). Used to size the RL node.
+SMI_LOG="logs/slurm/${SLURM_JOB_NAME}_${SLURM_JOB_ID}_gpumem.csv"
+nvidia-smi --query-compute-apps=timestamp,pid,process_name,used_memory --format=csv -l 5 > "$SMI_LOG" 2>&1 &
+SMI_PID=$!
+
 cleanup() {
+    kill "$SMI_PID" 2>/dev/null
     if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
         echo "[cleanup] stopping server (pid $SERVER_PID, process group)..."
         # Negative PID = signal the whole process group (setsid below put the
