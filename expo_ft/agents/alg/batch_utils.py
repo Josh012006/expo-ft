@@ -18,8 +18,14 @@ def prepare_critic_batch(batch, padded_dim, action_dim, state_dim, action_horizo
 
     batch['states'] = batch["state"].reshape(batch_size, padded_dim)[..., :state_dim].reshape(batch_size, state_dim)
     batch['next_states'] = batch["next_state"].reshape(batch_size, padded_dim)[..., :state_dim].reshape(batch_size, state_dim)
+    # What the residual actor and the critic see. The pi0.5 base policy keeps using `states` / `next_states` only.
+    # The replay buffer has an "aux" field (tactile / force / gripper effort, see utils/aux_features.py) only when
+    # use_tactile_aux is enabled; without it critic_states IS states, exactly as before.
     batch['critic_states'] = batch['states']
     batch['next_critic_states'] = batch['next_states']
+    if "aux" in batch:
+        batch['critic_states'] = jnp.concatenate([batch['states'], batch["aux"]], axis=-1)
+        batch['next_critic_states'] = jnp.concatenate([batch['next_states'], batch["next_aux"]], axis=-1)
 
     actions_unpadded = batch["actions"].reshape(batch_size, action_horizon, padded_dim)[..., :action_dim]
     batch['full_actions'] = actions_unpadded.reshape(batch_size, action_horizon * action_dim)
@@ -60,13 +66,22 @@ def prepare_actor_sampling_batch_current(batch):
     }
 
 
-def extract_critic_fields(processed_inputs, padded_dim, state_dim):
-    """Add critic_obs and critic_states keys to a processed inputs dict."""
+def extract_critic_fields(processed_inputs, padded_dim, state_dim, aux=None):
+    """Add critic_obs and critic_states keys to a processed inputs dict.
+
+    aux: optional (aux_dim,) tactile / force / gripper-effort vector of the same observation (see
+    utils/aux_features.py). When given it is appended to critic_states only; processed_inputs["state"], which the base
+    policy reads, is left as it is.
+    """
     processed_inputs["critic_obs"] = jnp.concatenate([
         processed_inputs["image"]["base_0_rgb"],
         processed_inputs["image"]["left_wrist_0_rgb"],
     ], axis=-1)
-    processed_inputs["critic_states"] = processed_inputs["state"].reshape(
+    critic_states = processed_inputs["state"].reshape(
         processed_inputs["state"].shape[0], padded_dim
     )[..., :state_dim]
+    if aux is not None:
+        aux = jnp.asarray(aux, dtype=critic_states.dtype).reshape(1, -1)   # one observation -> (1, aux_dim)
+        critic_states = jnp.concatenate([critic_states, jnp.broadcast_to(aux, (critic_states.shape[0], aux.shape[-1]))], axis=-1)
+    processed_inputs["critic_states"] = critic_states
     return processed_inputs

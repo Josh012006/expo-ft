@@ -135,6 +135,13 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
     sft_config_name = get_sft_config_name(cfg)
     model_config.pi05_config_name  = sft_config_name
     model_config.skip_repack_transforms = cfg.skip_repack_transforms
+    # Tactile / force / gripper-effort input of the residual actor and critic: the architecture of an RL checkpoint
+    # trained with it only restores with it (expo_ft/utils/aux_features.py). model_cls other than EXPOLearner has no
+    # such key, hence the check.
+    if bool(getattr(cfg, "use_tactile_aux", False)):
+        if getattr(cfg, "model_cls", "EXPOLearner") != "EXPOLearner":
+            raise ValueError("use_tactile_aux is only implemented for model_cls=EXPOLearner")
+        model_config.use_tactile_aux = True
 
     # IMPORTANT : ne PAS fixer pi05_assets_dir / pi05_asset_id ici.
     # La config openpi "expo_pi05_droid_lora_finetune_sft_joint_state" porte déjà

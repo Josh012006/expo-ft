@@ -338,6 +338,15 @@ def main(_):
     # BCLearner: no RL hyperparameter overrides needed — imitation-only,
     # no critic/GAE/advantage machinery to tune here.
 
+    # Tactile / force / gripper-effort input of the residual actor and the critic (expo_ft/utils/aux_features.py).
+    # Read by the replay buffer (create_replay_buffer), the agent (EXPOLearner.create) and the evaluation scripts, all
+    # from the same config entry. Implemented for EXPOLearner only: another learner would train without it while the
+    # buffer stored it, so refuse instead.
+    if bool(getattr(cfg, "use_tactile_aux", False)):
+        if model_cls != "EXPOLearner":
+            raise ValueError(f"use_tactile_aux is only implemented for model_cls=EXPOLearner, got {model_cls}")
+        FLAGS.config.use_tactile_aux = True
+
     # Sync actor_success_only from the task YAML into the model config too —
     # BatchProcessor already reads it from cfg (line below, via train_pi_robo's
     # own actor_success_only variable), but the EXPOLearner agent itself reads

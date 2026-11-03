@@ -149,6 +149,10 @@ def main(_):
     logging.info(f"Created training environment {env.env_id}")
 
     model_cls = FLAGS.config.model_cls
+    # This trainer never builds the tactile / force / gripper-effort input (expo_ft/utils/aux_features.py): refuse
+    # instead of silently training without what the task YAML asks for.
+    if getattr(FLAGS.config_task, "use_tactile_aux", False):
+        raise NotImplementedError("use_tactile_aux is not supported by train_pi_robo_async.py; use train_pi_robo.py")
     # BCLearner uses human-intervention chunks for the actor batch only (no critic).
     use_dagger_hil_sampling = model_cls == "BCLearner"
     if model_cls == "BCLearner":

@@ -44,6 +44,10 @@ def make_dummy_transition(task_config):
         "observation/gripper_position": np.zeros((1,), dtype=np.float32),
         "prompt": task_config.language_instruction,
     }
+    if getattr(task_config, "use_tactile_aux", False):
+        # The replay buffer derives the tactile / force / gripper-effort input from these entries (shapes only).
+        from expo_ft.utils.aux_features import dummy_aux_observations
+        observations.update(dummy_aux_observations())
     return [{
         "observations": observations,
         "actions": np.zeros((task_config.output_action_dim,), dtype=np.float32),

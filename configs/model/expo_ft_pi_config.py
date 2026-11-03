@@ -66,6 +66,10 @@ def get_config():
     config.latent_dim_image = 512
     config.latent_dim_state = 64
     config.include_state = True
+    # True = the residual actor and the critic also receive tactile / force / gripper effort (60 values, built from
+    # the environment's extra/* observations, see expo_ft/utils/aux_features.py). The frozen pi0.5 base policy never
+    # does. Set from the task YAML key `use_tactile_aux` (train_pi_robo.py, scripts/eval_policy.py).
+    config.use_tactile_aux = False
     config.encoder_stage_sizes = (3, 4, 6, 3)
     config.encoder_num_filters = 64
     config.hidden_dims = (256, 256, 256)
