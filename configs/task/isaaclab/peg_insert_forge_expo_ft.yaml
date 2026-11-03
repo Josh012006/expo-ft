@@ -218,10 +218,22 @@ keep_period: 20000
 max_to_keep: 1
 
 # -- Monitoring ------------------------------------------------------------------
-success_rate_window: 200     # in-training rolling success rate
-rl_eval_interval: 0          # in-training deterministic eval: 0 = off (it opens a second environment on the server)
-rl_eval_episodes: 200
-rl_eval_seed: 42
+success_rate_window: 200     # in-training rolling success rate (stochastic, over the last training episodes). It is also the
+                             # length of the step-0 pass (frozen base policy): must be >= rl_eval_episodes when the eval is on
+# In-training DETERMINISTIC evaluation, logged as eval_rigorous/* (wandb) and appended to
+# <run dir>/checkpoints/eval_rigorous.jsonl (seeds, success per episode, steps, time). OFF for now.
+#   rl_eval_interval: every N env steps; 0 = off. On this server the "eval environment" is the SAME simulation as the
+#       training one, so an evaluation starts at the first episode end at or after each multiple of N (never in the
+#       middle of an episode) and the training env is reset right after it. One evaluation of rl_eval_episodes episodes
+#       costs about rl_eval_episodes x (episode time) = ~2.4 h for 100 episodes (85 s per tactile episode), training paused.
+#   Step 0 = the first rl_eval_episodes episodes of the step-0 pass: frozen base policy, so stochastic (not deterministic).
+#   Later evaluations: residual actor mode (deterministic); the base VLA's flow-matching sampling stays stochastic.
+rl_eval_interval: 0
+rl_eval_episodes: 100        # number of evaluation episodes, same at every evaluation
+rl_eval_seed: 42             # seeds = np.random.default_rng(42).integers(0, 2**31-1, size=rl_eval_episodes), same generator as
+                             # scripts/eval_curve.py: identical to the SFT evaluation's 100 seeds when it used seed 42
+rl_eval_seeds_file: null     # or the path of the SFT evaluation's episode_seeds.json: used as is (its length must equal rl_eval_episodes)
+rl_eval_critic_only: false   # also evaluate with n_edit_samples=0 (critic picks among the base candidates only): off
 
 # -- RL hyperparameters (EXPOLearner) -- values of configs/task/maniskill/stack_cube_expo_ft.yaml -------
 rl_lr: 3.0e-4

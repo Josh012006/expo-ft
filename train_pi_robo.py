@@ -84,6 +84,82 @@ def get_or_create_episode_seeds(output_dir, n_episodes, master_seed):
     return seeds
 
 
+def get_rigorous_eval_seeds(cfg, output_dir, n_episodes, master_seed):
+    """The fixed seeds of EVERY rigorous evaluation of a run (rl_eval_episodes of them).
+
+    rl_eval_seeds_file (optional YAML key): path of the episode_seeds.json written by the SFT evaluation
+    (scripts/eval_curve.py, <output-dir>/episode_seeds.json). It is used as is, so the in-training evaluation runs on
+    EXACTLY the episodes the SFT checkpoints were evaluated on. Without it, the seeds are generated like
+    eval_curve.py does (np.random.default_rng(rl_eval_seed).integers(0, 2**31 - 1, size=rl_eval_episodes)), which gives
+    the same list when the SFT evaluation used the same seed and number of episodes."""
+    seeds_file = getattr(cfg, "rl_eval_seeds_file", None)
+    if seeds_file:
+        with open(seeds_file) as f:
+            seeds = [int(x) for x in json.load(f)]
+        if len(seeds) != n_episodes:
+            raise ValueError(
+                f"rl_eval_seeds_file {seeds_file} has {len(seeds)} seeds but rl_eval_episodes={n_episodes}: "
+                f"set rl_eval_episodes to {len(seeds)} or point to another file."
+            )
+        logging.info(f"[rigorous-eval] {len(seeds)} fixed episode seeds read from {seeds_file}")
+        return seeds
+    return [int(x) for x in get_or_create_episode_seeds(output_dir, n_episodes, master_seed)]
+
+
+def get_step0_seeds(output_dir, window, master_seed, eval_seeds=None):
+    """Seeds of the step-0 baseline pass (success_rate_window episodes of the frozen base policy).
+
+    Rigorous evaluation OFF (eval_seeds None): unchanged, get_or_create_episode_seeds(window).
+    Rigorous evaluation ON: the FIRST len(eval_seeds) seeds ARE the evaluation seeds, so that the step-0 value of
+    eval_rigorous/success_rate is measured on the same episodes as every later evaluation; the remaining ones (when the
+    window is larger) come from np.random.default_rng(master_seed + 1), cached in step0_episode_seeds.json."""
+    if not eval_seeds:
+        return get_or_create_episode_seeds(output_dir, window, master_seed)
+    n = len(eval_seeds)
+    if window < n:
+        raise ValueError(
+            f"success_rate_window={window} is smaller than rl_eval_episodes={n}: the step-0 value of eval_rigorous is "
+            f"taken from the step-0 pass, which must therefore cover at least rl_eval_episodes episodes."
+        )
+    if window == n:
+        return list(eval_seeds)
+    seeds = list(eval_seeds) + np.random.default_rng(master_seed + 1).integers(0, 2**31 - 1, size=window - n).tolist()
+    path = Path(output_dir) / "step0_episode_seeds.json"
+    if path.exists():
+        with open(path) as f:
+            cached = json.load(f)
+        if cached != seeds:
+            raise ValueError(f"{path} does not match the current evaluation seeds: delete it to regenerate.")
+    else:
+        with open(path, "w") as f:
+            json.dump(seeds, f, indent=2)
+    return seeds
+
+
+def rigorous_eval_due(step, interval, last_bucket, at_episode_end, single_sim_env):
+    """Is a rigorous evaluation due now?
+
+    Environments with their own simulation per instance (ManiSkill): exactly at the multiples of `interval` (unchanged).
+    Servers with ONE simulation shared by every connection (Isaac Lab / FORGE: the eval environment IS the training
+    one): only between two training episodes, at the first episode end at or after each multiple of `interval`
+    (`last_bucket` = step // interval of the last evaluation done, or of the start of the run)."""
+    if interval <= 0 or step <= 0:
+        return False
+    if single_sim_env:
+        return bool(at_episode_end) and step // interval > last_bucket
+    return step % interval == 0
+
+
+def append_rigorous_eval_record(log_path, record):
+    """One JSON line per evaluation in <run>/checkpoints/eval_rigorous.jsonl: what was measured, on which seeds, with
+    which result per episode. The file survives a wandb failure; it never raises."""
+    try:
+        with open(str(log_path), "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        logging.error(f"[rigorous-eval] Could not append to {log_path}: {e}")
+
+
 def as_env_chunk(action_chunk, observation, cfg):
     """Chunk of the model -> chunk the environment executes (expo_ft/utils/action_space.py). `observation` is the one the
     chunk was planned from. Identity unless the task YAML sets chunk_action_reference."""
@@ -92,7 +168,7 @@ def as_env_chunk(action_chunk, observation, cfg):
     )
 
 
-def run_rigorous_eval(agent, eval_env, episode_seeds, cfg, only_base_actions=False):
+def run_rigorous_eval(agent, eval_env, episode_seeds, cfg, only_base_actions=False, episode_records=None):
     """Deterministic, fixed-seed evaluation -- Jesse's proposed protocol.
     Runs episode_seeds' episodes with agent.sample_actions(..., deterministic=True)
     (residual actor's mode, not a stochastic sample -- see expo_ft.py's
@@ -122,7 +198,10 @@ def run_rigorous_eval(agent, eval_env, episode_seeds, cfg, only_base_actions=Fal
     local and discarded when this function returns. The caller's own
     `agent` (and its .rng sequence) is completely unaffected by having run
     this evaluation -- training resumes exactly as if this detour never
-    happened, only wandb gets the new eval_rigorous/* numbers."""
+    happened, only wandb gets the new eval_rigorous/* numbers.
+
+    episode_records: optional list; when given, one {"seed", "success", "steps"} dict is appended per episode (what
+    eval_rigorous.jsonl stores)."""
     from collections import deque
     eval_agent = agent
     successes = []
@@ -143,6 +222,8 @@ def run_rigorous_eval(agent, eval_env, episode_seeds, cfg, only_base_actions=Fal
             obs = eval_env.get_observation()
             steps += 1
         successes.append(float(success))
+        if episode_records is not None:
+            episode_records.append({"seed": int(episode_seeds[ep]), "success": bool(success), "steps": int(steps)})
     successes = np.asarray(successes)
     success_rate = float(successes.mean())
     stderr = float(successes.std(ddof=1) / np.sqrt(len(successes))) if len(successes) > 1 else 0.0
@@ -308,8 +389,20 @@ def main(_):
     rl_eval_interval = int(getattr(cfg, "rl_eval_interval", 0) or 0)
     rl_eval_episodes = int(getattr(cfg, "rl_eval_episodes", 200))
     rl_eval_seed = int(getattr(cfg, "rl_eval_seed", 42))
+    # critic-only variant of the evaluation (n_edit_samples=0): ON when the key is absent (what every earlier run did),
+    # the FORGE task YAMLs set it to false.
+    rl_eval_critic_only = bool(getattr(cfg, "rl_eval_critic_only", True))
+    # Isaac Lab / FORGE: the server hands out ONE simulation, so the "eval environment" is the training simulation
+    # itself: the evaluation can only run between two training episodes (rigorous_eval_due).
+    single_sim_env = getattr(cfg, "env_wrapper", None) in ("isaaclab", "remote")
+    rl_eval_log_path = checkpoint_dir_path / "eval_rigorous.jsonl"
+    eval_seeds = None
     eval_env = None
     if rl_eval_interval > 0:
+        if rl_eval_episodes < 1:
+            raise ValueError(f"rl_eval_episodes must be >= 1 when rl_eval_interval > 0, got {rl_eval_episodes}")
+        # Read (or generated) NOW: a wrong rl_eval_seeds_file / rl_eval_episodes stops the run at the start, not hours in.
+        eval_seeds = get_rigorous_eval_seeds(cfg, checkpoint_dir_path, rl_eval_episodes, rl_eval_seed)
         eval_env_creation_request = {
             "example_action": example_action,
             "env_usage": "eval",
@@ -327,6 +420,11 @@ def main(_):
         logging.info(f"Created separate rigorous-eval environment {eval_env.env_id} "
                      f"(every {rl_eval_interval} steps, {rl_eval_episodes} episodes, "
                      f"deterministic actor, fixed seeds from master_seed={rl_eval_seed})")
+        logging.info(f"[rigorous-eval] {len(eval_seeds)} fixed seeds, critic-only variant "
+                     f"{'ON' if rl_eval_critic_only else 'OFF'}, results appended to {rl_eval_log_path}. "
+                     + ("Single-simulation server: evaluated between two training episodes (first episode end at or "
+                        "after each multiple of rl_eval_interval); the training environment is reset right after."
+                        if single_sim_env else "Separate environment instance: evaluated at every multiple of rl_eval_interval."))
 
     # model_cls already read near the top of main() (see hyperparameter
     # override block above) — reused here for the learner-import dispatch.
@@ -947,6 +1045,8 @@ def main(_):
     # episodes) so the two are never confused on the same dashboard.
     wandb.define_metric("eval_rigorous/success_rate", step_metric="training/global_step")
     wandb.define_metric("eval_rigorous/success_rate_stderr", step_metric="training/global_step")
+    wandb.define_metric("eval_rigorous/n_episodes", step_metric="training/global_step")
+    wandb.define_metric("eval_rigorous/seconds", step_metric="training/global_step")
     # Same protocol, but with n_edit_samples=0: the trained critic still
     # picks (argmax) among the N raw/un-edited VLA candidate samples, but the
     # residual actor is never invoked. Isolates how much of eval_rigorous's
@@ -992,7 +1092,7 @@ def main(_):
     # 200 conditions), and is what makes deriving eval_rigorous/success_rate
     # from this same pass valid at all.
     if not resuming and success_rate_window > 0:
-        step0_seeds = get_or_create_episode_seeds(checkpoint_dir_path, success_rate_window, rl_eval_seed)
+        step0_seeds = get_step0_seeds(checkpoint_dir_path, success_rate_window, rl_eval_seed, eval_seeds)
 
         # Large fixed offset for this pass's own saved-transition step
         # numbers: guaranteed far beyond any realistic cfg.max_steps (real
@@ -1146,16 +1246,29 @@ def main(_):
         wandb.log({"eval/init_progress": 1.0, "eval/init_step": priming_step})
 
         step0_success_rate = float(np.mean(training_log._success_window))
-        step0_stderr = float(np.std(training_log._success_window, ddof=1) / np.sqrt(success_rate_window)) if success_rate_window > 1 else 0.0
         wandb.log({"eval/success_rate": step0_success_rate, "training/global_step": 0})
         if eval_env is not None:
+            # The first len(eval_seeds) episodes of this pass ran on the evaluation seeds (get_step0_seeds): the step-0
+            # value is measured on the same episodes as every later evaluation. The policy is the frozen base VLA
+            # (only_base_actions=True), whose flow-matching sampling is stochastic: step 0 is not a deterministic number.
+            n_eval = len(eval_seeds)
+            first = np.asarray(list(training_log._success_window)[:n_eval], dtype=float)
+            rate0 = float(first.mean())
+            stderr0 = float(first.std(ddof=1) / np.sqrt(n_eval)) if n_eval > 1 else 0.0
             wandb.log({
-                "eval_rigorous/success_rate": step0_success_rate,
-                "eval_rigorous/success_rate_stderr": step0_stderr,
+                "eval_rigorous/success_rate": rate0,
+                "eval_rigorous/success_rate_stderr": stderr0,
+                "eval_rigorous/n_episodes": n_eval,
                 "training/global_step": 0,
             })
-            logging.info(f"[step-0] eval_rigorous/success_rate={step0_success_rate:.3f} +/- {step0_stderr:.3f} "
-                         f"(derived from this same pass -- no separate rigorous-eval-only rollout needed).")
+            logging.info(f"[step-0] eval_rigorous/success_rate={rate0:.3f} +/- {stderr0:.3f} on the {n_eval} evaluation "
+                         f"seeds (first episodes of this same pass, frozen base policy, stochastic).")
+            append_rigorous_eval_record(rl_eval_log_path, {
+                "step": 0, "training_episode": 0, "policy": "frozen base VLA (only_base_actions, stochastic)",
+                "critic_only": False, "n_episodes": n_eval, "success_rate": rate0, "stderr": stderr0,
+                "seconds": None, "seeds": [int(x) for x in eval_seeds], "successes": [bool(x) for x in first],
+                "episode_steps": None, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
 
         logging.info(f"[step-0] Done after {priming_step} raw steps -- {success_rate_window} episodes "
                      f"evaluated, starting success_rate={step0_success_rate:.3f}. Real "
@@ -1163,6 +1276,67 @@ def main(_):
                      f"eval/success_rate and training/* now use training/global_step as their own x-axis, "
                      f"starting fresh at 0 -- checkpoint step "
                      f"numbers (i) are NOT offset and remain exactly comparable across runs.")
+
+    def run_periodic_rigorous_eval(step, agent_now):
+        """Deterministic fixed-seed evaluation of `agent_now` on eval_env (see run_rigorous_eval), logged to wandb, to
+        the log and to eval_rigorous.jsonl. Never raises: a failed evaluation is logged and training carries on."""
+        eval_start = time.time()
+        records = []
+        try:
+            success_rate, stderr = run_rigorous_eval(agent_now, eval_env, eval_seeds, cfg, episode_records=records)
+            seconds = time.time() - eval_start
+            wandb.log({
+                "eval_rigorous/success_rate": success_rate,
+                "eval_rigorous/success_rate_stderr": stderr,
+                "eval_rigorous/n_episodes": len(eval_seeds),
+                "eval_rigorous/seconds": seconds,
+                "training/global_step": step,
+            })
+            logging.info(f"[rigorous-eval] step {step}: success_rate={success_rate:.3f} +/- {stderr:.3f} "
+                         f"({len(eval_seeds)} episodes, {seconds:.0f}s)")
+            append_rigorous_eval_record(rl_eval_log_path, {
+                "step": step, "training_episode": training_log.ep_count,
+                "policy": "trained agent, deterministic residual (critic argmax over base + edited candidates)",
+                "critic_only": False, "n_episodes": len(eval_seeds), "success_rate": success_rate, "stderr": stderr,
+                "seconds": seconds, "seeds": [r["seed"] for r in records], "successes": [r["success"] for r in records],
+                "episode_steps": [r["steps"] for r in records], "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        except Exception:
+            logging.exception(f"[rigorous-eval] Failed at step {step}")
+
+        if rl_eval_critic_only:
+            # Critic-only variant: agent.replace() is a cheap struct copy (n_edit_samples is a static, non-pytree
+            # field) -- the real agent is completely unaffected. Same seeds as the call above.
+            critic_start = time.time()
+            records = []
+            try:
+                critic_only_agent = agent_now.replace(n_edit_samples=0)
+                critic_only_success_rate, critic_only_stderr = run_rigorous_eval(
+                    critic_only_agent, eval_env, eval_seeds, cfg, episode_records=records
+                )
+                wandb.log({
+                    "eval_rigorous/success_rate_critic_only": critic_only_success_rate,
+                    "eval_rigorous/success_rate_critic_only_stderr": critic_only_stderr,
+                    "training/global_step": step,
+                })
+                logging.info(
+                    f"[rigorous-eval-critic-only] step {step}: "
+                    f"success_rate={critic_only_success_rate:.3f} +/- {critic_only_stderr:.3f}"
+                )
+                append_rigorous_eval_record(rl_eval_log_path, {
+                    "step": step, "training_episode": training_log.ep_count,
+                    "policy": "trained agent, critic only (n_edit_samples=0)",
+                    "critic_only": True, "n_episodes": len(eval_seeds), "success_rate": critic_only_success_rate,
+                    "stderr": critic_only_stderr, "seconds": time.time() - critic_start,
+                    "seeds": [r["seed"] for r in records], "successes": [r["success"] for r in records],
+                    "episode_steps": [r["steps"] for r in records], "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+            except Exception:
+                logging.exception(f"[rigorous-eval-critic-only] Failed at step {step}")
+
+    # Resume-safe trigger bookkeeping (single-simulation servers): an evaluation is due once step // interval gets
+    # beyond the bucket of the last one done / of the step the run (re)started from.
+    last_rigorous_eval_bucket = (start_step // rl_eval_interval) if rl_eval_interval > 0 else 0
 
     for i in tqdm.tqdm(
         range(start_step, cfg.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm
@@ -1241,6 +1415,18 @@ def main(_):
 
         if done:
             batch_processor.on_episode_done(success)
+
+            # Isaac Lab / FORGE: the evaluation shares the training simulation, so it runs HERE, between two
+            # training episodes: the finished training episode is over, nothing of the next one has started (the
+            # training env.reset() just below gives it a fresh start, as after any episode). It evaluates the agent
+            # as of the last completed update. The time it takes is taken out of this step's loop time.
+            if eval_env is not None and single_sim_env and rigorous_eval_due(
+                    i, rl_eval_interval, last_rigorous_eval_bucket, True, True):
+                last_rigorous_eval_bucket = i // rl_eval_interval
+                _eval_t0 = time.time()
+                run_periodic_rigorous_eval(i, agent)
+                loop_start += time.time() - _eval_t0
+
             env.reset()
 
             if is_on_policy_algo:
@@ -1309,47 +1495,11 @@ def main(_):
             except Exception as e:
                 logging.error(f"Could not save model checkpoint: {e}")
 
-        # Periodic rigorous deterministic eval (Jesse's proposed protocol) --
-        # see run_rigorous_eval()'s own docstring for why this is safe to
-        # call mid-training: it never touches the real `agent`/its .rng
-        # sequence, only reads it. i>0 skips step 0 here since that's
-        # already covered by the dedicated initialization eval above (fresh
-        # runs) -- on a resumed run there was no such initialization call,
-        # but the periodic boundary will still be hit at the next multiple
-        # of rl_eval_interval regardless.
-        if eval_env is not None and i > 0 and i % rl_eval_interval == 0:
-            try:
-                episode_seeds = get_or_create_episode_seeds(checkpoint_dir_path, rl_eval_episodes, rl_eval_seed)
-                success_rate, stderr = run_rigorous_eval(agent, eval_env, episode_seeds, cfg)
-                wandb.log({
-                    "eval_rigorous/success_rate": success_rate,
-                    "eval_rigorous/success_rate_stderr": stderr,
-                    "training/global_step": i,
-                })
-                logging.info(f"[rigorous-eval] step {i}: success_rate={success_rate:.3f} +/- {stderr:.3f}")
-            except Exception as e:
-                logging.error(f"[rigorous-eval] Failed at step {i}: {e}")
-
-            # Critic-only variant: agent.replace() is a cheap struct copy (n_edit_samples
-            # is a static, non-pytree field) -- the real `agent` below is completely
-            # unaffected, same as run_rigorous_eval's own non-mutation guarantee above.
-            # Same episode_seeds as the call above, for a like-for-like comparison.
-            try:
-                critic_only_agent = agent.replace(n_edit_samples=0)
-                critic_only_success_rate, critic_only_stderr = run_rigorous_eval(
-                    critic_only_agent, eval_env, episode_seeds, cfg
-                )
-                wandb.log({
-                    "eval_rigorous/success_rate_critic_only": critic_only_success_rate,
-                    "eval_rigorous/success_rate_critic_only_stderr": critic_only_stderr,
-                    "training/global_step": i,
-                })
-                logging.info(
-                    f"[rigorous-eval-critic-only] step {i}: "
-                    f"success_rate={critic_only_success_rate:.3f} +/- {critic_only_stderr:.3f}"
-                )
-            except Exception as e:
-                logging.error(f"[rigorous-eval-critic-only] Failed at step {i}: {e}")
+        # Periodic rigorous deterministic eval (Jesse's proposed protocol) -- see run_periodic_rigorous_eval() above the
+        # loop. Environments with their own simulation (ManiSkill): exactly here, at the multiples of rl_eval_interval.
+        # Isaac Lab / FORGE (single simulation): never here, only between two episodes (the `if done:` block).
+        if eval_env is not None and not single_sim_env and rigorous_eval_due(i, rl_eval_interval, 0, False, False):
+            run_periodic_rigorous_eval(i, agent)
 
         if cfg.checkpoint_buffer and (has_action or action_type == "human"):
             try:
