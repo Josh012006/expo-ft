@@ -12,6 +12,9 @@ programs on demonstration data:
     4 update (compile)   agent.update, both actor branches              compile-time peak of the update program
     5 update (steady)    --n-updates more agent.update                  steady peak, seconds per update
 
+With --with-env (jobs/job_check_rl_fit.sh, which starts the Isaac Lab server on the same card first) it also plays one
+real episode before the updates (3c) and one after (6b), and prints the memory of the whole card at every stage.
+
 "peak" is JAX's own allocator peak (jax Device.memory_stats()['peak_bytes_in_use']): it only grows, so read it as the
 running maximum up to that stage. "nvidia-smi used" is the whole process as the driver sees it (adds the CUDA context and
 the cuBLAS / cuDNN workspaces that JAX does not count). The number to size a GPU with is the LAST "nvidia-smi used".
@@ -89,6 +92,19 @@ def nvidia_smi_used_gb(pid):
     return float("nan")
 
 
+def card_used_gb():
+    """Memory used on the whole card, all processes (GB): with an Isaac Lab server on the same GPU this is the number
+    that must stay under the card size. nan if nvidia-smi is not usable."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=20, check=True,
+        ).stdout.strip().splitlines()
+        return max(float(x) for x in out) / 1024
+    except Exception:
+        return float("nan")
+
+
 class Recorder:
     def __init__(self, device, out_path):
         self.device, self.out_path, self.rows = device, out_path, []
@@ -103,6 +119,7 @@ class Recorder:
             "jax_peak_gb": stats.get("peak_bytes_in_use", float("nan")) / GB,
             "jax_limit_gb": stats.get("bytes_limit", float("nan")) / GB,
             "nvidia_smi_used_gb": nvidia_smi_used_gb(os.getpid()),
+            "card_used_gb": card_used_gb(),
             "host_rss_gb": host_rss_gb(),
             "seconds": seconds,
             "note": note,
@@ -110,7 +127,7 @@ class Recorder:
         self.rows.append(row)
         sec = "" if seconds is None else f"  {seconds:7.2f}s"
         print(f"[{name:<22}] jax in use {row['jax_in_use_gb']:6.2f} | jax peak {row['jax_peak_gb']:6.2f} | "
-              f"nvidia-smi used {row['nvidia_smi_used_gb']:6.2f} | host RSS {row['host_rss_gb']:6.2f} GB{sec} {note}",
+              f"nvidia-smi used {row['nvidia_smi_used_gb']:6.2f} | whole card {row['card_used_gb']:6.2f} | host RSS {row['host_rss_gb']:6.2f} GB{sec} {note}",
               flush=True)
         self.out_path.parent.mkdir(parents=True, exist_ok=True)
         self.out_path.write_text(json.dumps(self.rows, indent=2))      # rewritten at each stage: survives a crash
@@ -123,6 +140,28 @@ def timed(fn):
     out = fn()
     jax.block_until_ready(out)
     return out, time.time() - t
+
+
+def run_episode(env, agent, cfg, max_steps):
+    """One real episode on the Isaac Lab server with the agent's own chunks (same calls as the rollout / eval loops:
+    sample_actions -> chunk_to_env_actions -> step -> get_info_for_step -> get_observation). Returns (agent, steps, s)."""
+    from collections import deque
+    from expo_ft.utils.action_space import chunk_to_env_actions
+
+    t = time.time()
+    obs = env.reset()
+    plan, steps, done = deque(), 0, False
+    while not done and steps < max_steps:
+        if not plan:
+            action_chunk, agent, _ = agent.sample_actions(obs)
+            action_chunk = chunk_to_env_actions(
+                action_chunk, obs, getattr(cfg, "chunk_action_reference", None), cfg.state_obs_key)
+            plan.extend(action_chunk[:cfg.replan_steps])
+        env.step(plan.popleft().tolist())
+        done, _, _, _ = env.get_info_for_step()
+        obs = env.get_observation()
+        steps += 1
+    return agent, steps, time.time() - t
 
 
 # ------------------------------------------------------------------ setup (same sequence as train_pi_robo.py)
@@ -258,6 +297,16 @@ def main(args):
     rec.stage("3b sample (steady)", float(np.mean(times)), f"mean of {len(times)}  <- seconds per chunk, executed every "
                                                             f"{cfg.replan_steps} env steps")
 
+    env = None
+    episode_steps = args.episode_steps or int(getattr(cfg, "max_steps_per_episode", 150))
+    if args.with_env:
+        # The Isaac Lab server (jobs/job_check_rl_fit.sh starts it with this same YAML) is already on the card: what is
+        # measured from here on is JAX + the simulator together, as in the real run.
+        from expo_ft.env.env_factory import make_env_wrapper
+        env = make_env_wrapper({"example_action": example_action, "env_usage": "train", "video_dir": None}, cfg=cfg)
+        agent, n, seconds = run_episode(env, agent, cfg, episode_steps)
+        rec.stage("3c episode (before update)", seconds, f"{n} env steps with the sampled chunks")
+
     if args.skip_update:
         _finish(rec, cfg, model_config, args)
         return
@@ -273,9 +322,14 @@ def main(args):
         agent = agent.replace(rng=jax.device_put(agent.rng, replicated_sharding))
         return agent.update(agent, batch, cfg.utd_ratio, actor_batch)
 
-    (out, seconds) = timed(lambda: one_update(agent, batch, None))
-    agent, _ = out
-    rec.stage("4a update (compile)", seconds, "actor_batch=None branch")
+    if args.skip_none_branch and actor_batch is not None:
+        print("--skip-none-branch: the actor_batch=None program is not compiled (the demonstrations are success "
+              "transitions, so the real loop always has an actor batch); its peak was the same as the success-only "
+              "program in the measured runs.", flush=True)
+    else:
+        (out, seconds) = timed(lambda: one_update(agent, batch, None))
+        agent, _ = out
+        rec.stage("4a update (compile)", seconds, "actor_batch=None branch")
     if actor_batch is not None:
         batch, actor_batch, combine_rng = batch_processor.next_batch(combine_rng)
         (out, seconds) = timed(lambda: one_update(agent, batch, actor_batch))
@@ -295,6 +349,9 @@ def main(args):
     # the rollout cost once training has started
     (out, seconds) = timed(lambda: agent.sample_actions(observation))
     rec.stage("6 sample after update", seconds)
+    if env is not None:
+        agent, n, seconds = run_episode(env, agent, cfg, episode_steps)
+        rec.stage("6b episode (after updates)", seconds, f"{n} env steps, trained weights")
     _finish(rec, cfg, model_config, args)
 
 
@@ -310,6 +367,10 @@ def _finish(rec, cfg, model_config, args):
     print("=" * 100)
     print(f"GPU  : JAX peak {peak:.1f} GB | nvidia-smi used (max over stages) {smi:.1f} GB   <- size the GPU with this "
           f"+ ~10 % margin")
+    card = [r["card_used_gb"] for r in rec.rows if r["card_used_gb"] == r["card_used_gb"]]
+    if args.with_env and card:
+        print(f"CARD : whole card (JAX + Isaac Lab) at the stage boundaries, max {max(card):.1f} GB "
+              f"(jobs/job_check_rl_fit.sh adds the true peak of every process and the verdict)")
     if max_steps:
         buf = 2 * max_steps * row_bytes / GB
         print(f"HOST : 2 replay buffers at max_steps={max_steps} rows ~ {buf:.0f} GB (full), + model restore / python "
@@ -327,5 +388,12 @@ if __name__ == "__main__":
     parser.add_argument("--n-samples", type=int, default=5, help="timed sample_actions calls (default 5)")
     parser.add_argument("--n-updates", type=int, default=3, help="timed steady-state agent.update calls (default 3)")
     parser.add_argument("--skip-update", action="store_true", help="stop after sample_actions (inference-only numbers)")
+    parser.add_argument("--with-env", action="store_true",
+                        help="also play one real episode on the Isaac Lab server before the updates and one after "
+                             "(the server must already be running: jobs/job_check_rl_fit.sh)")
+    parser.add_argument("--episode-steps", type=int, default=0,
+                        help="env steps per episode with --with-env (default: max_steps_per_episode of the YAML)")
+    parser.add_argument("--skip-none-branch", action="store_true",
+                        help="do not compile the actor_batch=None update program (saves ~4 min; see the message it prints)")
     parser.add_argument("--output", default=None, help="JSON report path (default logs/profile_memory/<config>_<time>.json)")
     main(parser.parse_args())
