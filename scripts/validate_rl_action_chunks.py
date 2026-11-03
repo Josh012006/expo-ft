@@ -43,8 +43,8 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 
-from expo_ft.utils.config_loader import load_task_config, get_sft_config_name
-from expo_ft.env.droid_utils import process_droid_dataset
+from expo_ft.utils.config_loader import load_task_config, apply_task_overrides
+from expo_ft.env.droid_utils import load_demo_dataset
 from expo_ft.data.replay_buffer import create_replay_buffer
 
 
@@ -63,8 +63,7 @@ def build_model_config(cfg):
     spec.loader.exec_module(mod)
 
     model_config = mod.get_config()
-    model_config.pi05_config_name = get_sft_config_name(cfg)
-    model_config.skip_repack_transforms = cfg.skip_repack_transforms
+    apply_task_overrides(model_config, cfg)      # same YAML -> model config step as train_pi_robo.py (aux input included)
     model_config.pi05_weight_loader_path = None
     return model_config
 
@@ -92,11 +91,11 @@ def main(config_path, n_episodes, seed):
         state_dim = data_config.norm_stats["state"].mean.shape[-1]
         state_kwarg["state"] = np.zeros((action_horizon, state_dim), dtype=np.float32)
 
-    print(f"Loading demo data from {cfg.droid_format_dir} ...")
+    print(f"Loading demo data from {getattr(cfg, 'demos_dir', None) or getattr(cfg, 'droid_format_dir', None)} ...")
     # Only load as many episodes as this run will actually check (+1 margin) --
     # loading all 550 episodes' images just to validate the first --n-episodes
     # is wasted memory and was OOM-killing this on a shared/limited node.
-    dataset = process_droid_dataset(cfg.droid_format_dir, cfg, num_data=n_episodes + 1)
+    dataset = load_demo_dataset(cfg, num_data=n_episodes + 1)
     example_action = dataset[0]["actions"][np.newaxis]
 
     # Recover per-episode boundaries from the raw dataset's own "dones" field,

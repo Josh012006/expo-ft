@@ -1,0 +1,240 @@
+# FORGE (Isaac Lab) PegInsert -- RL (EXPO-FT: residual actor + critic on top of the frozen pi05) -- WITH TACTILE + FORCE
+#
+# TWO files, identical except the three lines marked "<-- differs" (use_tactile, use_force, run_name):
+#   peg_insert_forge_expo_ft.yaml            RL on the task alone                      (use_tactile: false, use_force: false)
+#   peg_insert_forge_expo_ft_tactile.yaml    RL with tactile + force given to the residual actor AND the critic
+# Edit one, edit the other (same convention as the ManiSkill *_sft / *_expo_ft files).
+#
+# Read by:
+#   - train_pi_robo.py (scripts/run_pipeline.py --stage rl, jobs/job_rl.sh)   everything below except the server block
+#   - forge_server.py (in .venv-isaaclab)      the "Server side" block (same keys as peg_insert_forge_pi05.yaml)
+#   - scripts/eval_policy.py                   the same file again, to evaluate the checkpoints of the run (--rl-checkpoint):
+#                                              the architecture of the agent (rl_hidden_dims, rl_N, use_tactile, ...) is
+#                                              rebuilt from it, so evaluate with the file the run was trained with.
+#
+# Tactile / force: see "Tactile / force input" below. The server must run the SAME robot as the demonstrations and the
+# SFT checkpoint: robot "robotiq_2f85_tsf" (the only robot with taxels and a gripper effort).
+#
+# KNOWN LIMIT, read before launching: the RL loop does not handle chunk_action_reference yet (see that key at the end of
+# this file), so train_pi_robo.py refuses this file with an explicit NotImplementedError until it does.
+#
+# The RL hyperparameters are those of the ManiSkill tasks (configs/task/maniskill/*_expo_ft.yaml), NOT tuned for FORGE.
+
+env_wrapper: "isaaclab"
+env_id: "ForgePegInsert"   # label only (output filenames/logging) — no functional effect
+
+# -- Server side -------------------------------------------------------------
+task_name: "Isaac-Forge-PegInsert-Direct-v0"
+
+# Which robot the simulation uses: ONE field, nothing else to change anywhere (expo_ft/env/isaaclab/robots.py).
+#   franka            FORGE's own Franka + Franka Hand (what every result so far was obtained with)
+#   robotiq_2f85      Franka arm + Robotiq 2F-85 gripper (NVIDIA RoboLab USD), no taxels
+#   robotiq_2f85_tsf  same + the 7x4 tactile zones of NVIDIA's TSF-85 contact twin on each finger. The server then also
+#                     sends `extra/tactile` (2, 7, 4): net contact force (N) of each zone, [0] left finger, [1] right,
+#                     row 0 = fingertip. The demo / eval / replay videos show it under the cameras.
+# The Robotiq USD is built the first time (assets/robots/<robot>.usda, gitignored) from expo_ft/third_party/robotiq/ and
+# rebuilt when an input changes. For one run only: forge_server.py --config <this file> --set robot=robotiq_2f85_tsf
+# The robots differ in dynamics (grasp, TCP 65 mm lower, other friction): demos recorded with one robot do not replay
+# on another and a checkpoint trained on one is evaluated on the other as a different embodiment.
+robot: "robotiq_2f85_tsf"   # RL needs the robot of the demos / SFT checkpoint (taxels + gripper effort)
+
+# Optional, Robotiq profiles only (None / absent = values of NVIDIA's USD: stiffness 5.7e3, damping ~0, effort 16.5 N.m
+# on the finger joint). Tune them if the grasp is too violent or too weak.
+# finger_stiffness: 5.7e3
+# finger_damping: 50.0
+# finger_effort: 8.0
+# Already built USD to spawn instead of the generated one (Robotiq profiles only):
+# robot_usd: "assets/robots/my_robot.usda"
+# Fallback if PhysX refuses the number of links of robotiq_2f85_tsf (the 56 zones as articulation links): zones as free
+# bodies tied to the fingers by joints, re-positioned by the server after each reset.
+# tactile_exclude_zone_joints: true
+
+# Wall-clock pacing of env.step() on the server. False = run as fast as the
+# GPU allows. This does NOT affect what pi05_droid_jointpos sees or does:
+# FORGE's simulated seconds per env step (1/15s, via decimation=8 @ 120Hz
+# physics) already matches the checkpoint's 15Hz pretraining assumption
+# regardless of this flag. Kept as a flag for later visual debugging /
+# real-deployment latency testing, not because it's needed for policy
+# correctness now.
+realtime_throttle: false
+
+# When false, action[:, 7] (the gripper channel) is ignored every step and
+# the gripper is held at FORGE's own reset-time grasp width for the whole
+# episode — see forge_env_patched.py's __init__ docstring for why this
+# exists (pi05_droid_jointpos's zero-shot gripper output tends to open and
+# drop the held peg early in an episode).
+gripper_can_open: false
+
+# What the server sends as observation/gripper_position (the policy expects 0 = open, 1 = closed):
+#   normalized : 1 - finger_width / 0.04 m, in [0, 1]. Holding the peg reads ~0.9.   (recommended)
+#   closed     : constant 1.0 (only sensible together with gripper_can_open: false)
+#   raw        : finger width in metres, as before -- NOT the model's convention.
+# The server must be restarted after changing this.
+gripper_obs: normalized
+
+# When true, PhysX is not allowed to put the arm to sleep (sleep_threshold = 0). Tested with
+# `collect_waypoint_demos.py --probe`: it changed nothing, the dead zone is not caused by sleeping.
+disable_sleep: false
+
+# Reproducibility of the simulation (measured with scripts/isaaclab/repro_check.py and reset_history.py on an L40S; both
+# need a server restart to change):
+#   enhanced_determinism: PhysX's deterministic GPU solver mode. Without it, two server runs that execute the SAME sequence
+#       of resets and steps give different results (joint angles after reset(seed) differ by up to 4e-4 rad, the peg by up to
+#       5 mm in the hand). With it they are identical bit for bit, contact-rich insertions included: restarting the server
+#       and running the same collection command gives the same demos. Must be the same for ALL the data of an experiment.
+#   reset_passes: the reset (reseed + env.reset()) is done this many times. The start state after reset(seed) depends a
+#       little on the episode that ran just before. With 2 passes: repeats of a hold episode back to back are exact (1 pass:
+#       2 seeds of 4 were not) and after mixed episodes the differences shrink (peg 1.5 -> 0.2 mm on seed 40). 3 passes gave
+#       the same numbers as 2. What is left is a dependence on the previous episode that exists with the Robotiq (with or
+#       without taxel zones) and not with the Franka; its cause is not identified. 1 = FORGE's single reset.
+enhanced_determinism: true
+reset_passes: 2
+
+# PD gains of the arm joints (code defaults: 80 / 40). 400 / 60 chosen after the comparison of the
+# scripted demos: with 80 / 40 the arm follows only ~12% of a target change per control step and ignores
+# changes below ~1.5 mrad (a minimal joint torque); with 400 / 60 it follows ~36% and the threshold falls
+# to ~0.3 mrad. This changes the dynamics every client of the server sees, the policy included.
+# Can be overridden on the command line: forge_server.py --arm-stiffness 80 --arm-damping 40
+arm_stiffness: 400
+arm_damping: 60
+
+# -- Videos (client side: eval, replay) ----------------------------------------
+# Frame of the videos = cameras on top, taxels below (448 x 448, +48 px banner). A robot without taxels gets a
+# placeholder in the panel, so that all videos have the same layout. false = cameras only (448 x 224).
+video_tactile_panel: true
+# Force (N) of the top of the colour scale of the taxel panel, fixed so that videos can be compared.
+tactile_vmax: 5.0
+
+# -- Shared (client + server) -------------------------------------------------
+server_host: "localhost"   # override to the env-server node's hostname if
+                             # client and server end up on separate SLURM jobs
+server_port: 8102
+
+# -- Policy / task -----------------------------------------------------------
+language_instruction: "Insert the peg into the socket."
+model_cls: "EXPOLearner"
+use_cartesian_state: false   # joint-space action, not cartesian — picks the
+                              # "..._joint_state" openpi config (correct norm
+                              # stats: gs://openpi-assets/checkpoints/pi05_droid_jointpos/assets)
+sft_use_lora: true            # only affects which openpi config name is resolved (get_sft_config_name)
+skip_repack_transforms: true
+
+# -- Observation / action shapes (make_dummy_transition, JAX static shapes) --
+camera_height: 224
+camera_width: 224
+state_obs_key: "observation/joint_position"
+state_obs_dim: 7
+output_action_dim: 8   # 7 absolute joint-position targets + gripper command (0 open, 1 closed)
+
+# -- Rollout ------------------------------------------------------------------
+# Episode length, in STEPS, read by BOTH sides — one field, not two:
+#   - forge_server.py converts it to episode_length_s (env_cfg.decimation *
+#     env_cfg.sim.dt) and overrides FORGE's own native value (150 steps/10s
+#     for PegInsert) on the env's cfg before construction — this is what
+#     actually makes Isaac Lab set done=truncated.
+#   - scripts/eval_policy.py's own rollout loop also reads it directly
+#     (`while ... steps < cfg.max_steps_per_episode`), as a redundant safety
+#     cap in case the server's own done signal is ever late/missing.
+# Previously two separate fields (max_episode_length server-side,
+# max_steps_per_episode client-side) that could silently drift apart —
+# raising one alone had no effect while the other, smaller, value kept
+# truncating episodes first.
+max_steps_per_episode: 150
+
+# Success rule of the client (IsaacLabEnvWrapper): an episode is a SUCCESS once FORGE reports "inserted"
+# (xy < 2.5 mm and z below its threshold) for this many steps in a row, and it ends at that moment.
+# 1 = the episode stops and counts as a success the first time FORGE says "inserted" (chosen: no need to
+# wait for the peg to stay in). The demo collector waits for 5 steps (HOLD_AFTER_SUCCESS) before it stops.
+# Needed because FORGE never ends an episode on success and the step that times out has already reset the
+# simulation, so the success flag read at the end of an episode is always False: every evaluation made
+# before this key existed reported 0 % whatever the policy did. 0 = old behaviour (flag of the last step),
+# kept only to reproduce old numbers.
+success_hold_steps: 1
+# Matches ManiSkill's replan_steps:action_horizon ratio (8:16) at pi05's
+# action_horizon=16 for DROID. Not a correctness requirement like
+# max_steps_per_episode — a reactivity/compute tradeoff, worth revisiting
+# once real rollout behavior is visible.
+replan_steps: 8
+
+# pi05_droid_jointpos outputs a chunk of OFFSETS from the joint state at plan time (openpi
+# DeltaActions encoding), not per-step increments. eval_policy.py adds that state back once per
+# chunk (= openpi's AbsoluteActions), so the server receives ABSOLUTE joint targets.
+chunk_action_reference: "chunk_start_state"
+# NOT SUPPORTED BY THE RL LOOP YET: train_pi_robo.py stops at startup while this key is set
+# (expo_ft.utils.config_loader.check_rl_action_space_supported). Evaluation (scripts/eval_policy.py) needs it.
+
+# -- Environment (train_pi_robo.py) -------------------------------------------
+env_type: "sim"
+control_hz: 15
+
+# -- Demonstrations -------------------------------------------------------------
+# Folder of ep_*.npz (collect_waypoint_demos.py / teleop_client.py), read by expo_ft.env.droid_utils.load_demo_dataset.
+# Use the demos of the SFT checkpoint the run starts from. They must hold the arrays that use_tactile / use_force need
+# (tactile, gripper_effort, ft_force: recorded when the server runs robot robotiq_2f85_tsf), otherwise loading stops
+# with an error naming the file.
+demos_dir: "demos/isaaclab/ForgePegInsert_Robotiq_noisy"
+num_data_rl: 50              # first N demonstrations to load, 0 = all
+# Where the demonstrations go (logic unchanged, see BatchProcessor):
+offline_ratio: 0.5           # fraction of each training batch drawn from the offline (demo) buffer. 0.0 = no offline buffer.
+rl_seed_demos_online: false  # true = ALSO put the demos in the online replay buffer (EXPO paper's single-buffer convention).
+
+# -- Tactile / force input of the residual actor AND the critic (EXPOLearner only) --------
+# The frozen pi05 base policy never receives it (it was fine-tuned without touch). Independent switches, for ablations:
+#   use_tactile  the 2x7x4 taxel forces                       extra/tactile                      56 values
+#   use_force    wrist force + gripper effort                 extra/ft_force, extra/gripper_effort 4 values
+# force_mode (only with use_force: true):
+#   measured     the force read from the observation
+#   proxy        estimated instead of read (arXiv 2610.23849): routed, NOT implemented yet -> NotImplementedError
+# Both false = the task alone, exactly the code path without any of this. The demonstrations carry the same signals and go
+# through the same path as online transitions. Read by expo_ft/utils/aux_features.py (AuxSpec).
+use_tactile: true      # <-- differs
+use_force: true        # <-- differs
+force_mode: "measured"  # "proxy" once implemented
+
+# -- Run / Logging -------------------------------------------------------------
+project_name: "expo-ft"
+run_name: "forge_peg_insert_expo_ft_tactile"                                  # <-- differs
+output_dir: "logs/forge_peg_insert"   # a timestamped subdir is created automatically per run
+
+# -- RL Algorithm ----------------------------------------------------------------
+seed: 42
+max_episodes: 500            # x max_steps_per_episode = replay buffer capacity (500 x 150 = 75k rows, ~34 GB per buffer)
+batch_size: 24               # transitions sampled from the replay buffer per gradient update
+utd_ratio: 20                # gradient updates per new transition collected
+update_type: "episode"       # when to trigger updates: "episode", "step", or "batch"
+num_updates: 1
+num_batch: 1                 # episodes to accumulate before updating (only used when update_type="batch")
+fsdp_devices: 1
+rl_resume_dir: null
+actor_success_only: true     # actor batch sampled only from successful transitions
+
+# -- RL Checkpointing ------------------------------------------------------------
+checkpoint_model: true
+checkpoint_interval: 1000    # save a checkpoint every N steps
+checkpoint_buffer: true      # save replay buffer transitions to disk at each step (restored, tactile / force included, on resume)
+keep_period: 20000
+max_to_keep: 1
+
+# -- Monitoring ------------------------------------------------------------------
+success_rate_window: 200     # in-training rolling success rate
+rl_eval_interval: 0          # in-training deterministic eval: 0 = off (it opens a second environment on the server)
+rl_eval_episodes: 200
+rl_eval_seed: 42
+
+# -- RL hyperparameters (EXPOLearner) -- values of configs/task/maniskill/stack_cube_expo_ft.yaml -------
+rl_lr: 3.0e-4
+rl_discount: 0.99
+rl_tau: 0.005
+rl_init_temperature: 1.0
+rl_temp_lr: 3.0e-4
+rl_adjust_target_entropy: true
+rl_hidden_dims: [256, 256, 256]   # critic AND residual actor MLPs
+rl_fixed_temperature: null
+rl_edit_scale: 0.2                # max magnitude of the residual added to the base action chunk
+rl_N: 8                           # base-policy candidates compared per argmax step
+rl_n_edit_samples: 8              # residual-edited candidates compared per argmax step
+rl_use_double_q_selection: false
+rl_critic_weight_decay: null
+rl_critic_grad_clip_norm: null
+rl_freeze_critic_encoder: false
+rl_critic_pretrain_steps: 0       # >0: critic-only warm-up on the offline demos before RL starts

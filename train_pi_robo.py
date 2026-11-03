@@ -21,10 +21,12 @@ from expo_ft.agents import initialize_checkpoint_dir, save_replay_buffer_transit
 from expo_ft.data.replay_buffer import create_replay_buffer
 from expo_ft.data.batch_processor import BatchProcessor
 from expo_ft.agents.alg.batch_utils import prepare_critic_batch
-from expo_ft.env.droid_utils import process_droid_dataset
+from expo_ft.env.droid_utils import load_demo_dataset
 from expo_ft.utils.log_utils import EpisodeState, TrainingStats
 from expo_ft.utils.train_utils import get_batch_info, init_logging, init_wandb
-from expo_ft.utils.config_loader import load_task_config, resolve_run_dir
+from expo_ft.utils.config_loader import (
+    apply_task_overrides, check_rl_action_space_supported, load_task_config, resolve_run_dir,
+)
 
 
 import openpi.training.sharding as openpi_sharding
@@ -179,182 +181,19 @@ def main(_):
 
     # Load task config from YAML
     cfg = load_task_config(FLAGS.task_config)
-    # Override pi05_config_name dynamically from task config
-    from expo_ft.utils.config_loader import get_sft_config_name
-    FLAGS.config.pi05_config_name = get_sft_config_name(cfg)
-    FLAGS.config.skip_repack_transforms = cfg.skip_repack_transforms
+    # Task YAML -> model config (FLAGS.config), all in one place: openpi config name, the RL hyperparameters of the
+    # learner (rl_* for EXPOLearner, ppo_* for PPOLearner, ... so one YAML can hold the tuned values of every algorithm
+    # without collisions), actor_success_only, and the tactile / force input (use_tactile, use_force, force_mode).
+    # Shared with scripts/eval_policy.py and the diagnostic scripts: expo_ft/utils/config_loader.py.
+    aux_spec = apply_task_overrides(FLAGS.config, cfg)
+    logging.info("Tactile / force input of the residual actor and the critic: %s", aux_spec.describe())
 
-    # Read once, early — used both for the hyperparameter overrides below and
-    # for the learner-import dispatch further down. Reading it here (rather
-    # than only later, where it used to be read) does not change any
-    # behavior — FLAGS.config.model_cls is already fully populated at this
-    # point since ml_collections loads --config before main() runs.
+    # Read once, early — used for the learner-import dispatch further down.
     model_cls = FLAGS.config.model_cls
 
-    # Override FLAGS.config RL hyperparameters from the task YAML so everything
-    # is configured in one place (the YAML) rather than split between YAML and
-    # configs/model/*.py. Each learner reads its own, differently-prefixed
-    # fields (rl_* for EXPOLearner, ppo_* for PPOLearner, grpo_* for
-    # GRPOLearner) so a single task YAML can hold tuned overrides for every
-    # algorithm at once without collisions.
-    # NOTE: float() wrapping below is a deliberate defense against a PyYAML quirk —
-    # bare scientific notation without a decimal point (e.g. "3e-4") is parsed as
-    # a STRING, not a float (needs "3.0e-4" to parse correctly). ml_collections
-    # then raises a TypeError trying to assign a str into a float-typed field.
-    # float(x) is a no-op if x is already a float, and fixes it if x is a
-    # not-quite-valid-YAML-float string — belt and suspenders alongside fixing
-    # the YAML values themselves.
-    if model_cls in ("EXPOLearner", "EXPOLearnerCategorical"):
-        # --- unchanged from before this refactor: byte-for-byte identical ---
-        FLAGS.config.actor_lr         = float(getattr(cfg, "rl_lr", FLAGS.config.actor_lr))
-        FLAGS.config.critic_lr        = float(getattr(cfg, "rl_lr", FLAGS.config.critic_lr))
-        # NOTE: previously orphaned -- temp_lr silently stayed at whatever
-        # FLAGS.config.temp_lr (3e-4, from sac_config.py) already was,
-        # decoupled from rl_lr above and with no YAML field to override it
-        # independently. Wired here the same way as the other rl_* fields;
-        # default is unchanged (falls back to FLAGS.config.temp_lr) for any
-        # YAML that doesn't set rl_temp_lr yet.
-        FLAGS.config.temp_lr          = float(getattr(cfg, "rl_temp_lr", FLAGS.config.temp_lr))
-        FLAGS.config.discount         = float(getattr(cfg, "rl_discount", FLAGS.config.discount))
-        FLAGS.config.tau              = float(getattr(cfg, "rl_tau", FLAGS.config.tau))
-        FLAGS.config.init_temperature = float(getattr(cfg, "rl_init_temperature", FLAGS.config.init_temperature))
-        FLAGS.config.adjust_target_entropy = getattr(cfg, "rl_adjust_target_entropy", FLAGS.config.adjust_target_entropy)
-        _rl_fixed_temperature = getattr(cfg, "rl_fixed_temperature", FLAGS.config.fixed_temperature)
-        FLAGS.config.fixed_temperature = float(_rl_fixed_temperature) if _rl_fixed_temperature is not None else None
-        _rl_critic_weight_decay = getattr(cfg, "rl_critic_weight_decay", FLAGS.config.critic_weight_decay)
-        FLAGS.config.critic_weight_decay = float(_rl_critic_weight_decay) if _rl_critic_weight_decay is not None else None
-        _rl_critic_grad_clip_norm = getattr(cfg, "rl_critic_grad_clip_norm", FLAGS.config.critic_grad_clip_norm)
-        FLAGS.config.critic_grad_clip_norm = float(_rl_critic_grad_clip_norm) if _rl_critic_grad_clip_norm is not None else None
-        FLAGS.config.freeze_critic_encoder = getattr(cfg, "rl_freeze_critic_encoder", FLAGS.config.freeze_critic_encoder)
-        if hasattr(cfg, "rl_hidden_dims"):
-            FLAGS.config.hidden_dims  = tuple(cfg.rl_hidden_dims)
-        FLAGS.config.edit_scale       = float(getattr(cfg, "rl_edit_scale", FLAGS.config.edit_scale))
-        FLAGS.config.N = int(getattr(cfg, "rl_N", FLAGS.config.N))
-        FLAGS.config.n_edit_samples = int(getattr(cfg, "rl_n_edit_samples", FLAGS.config.n_edit_samples))
-        # --- end of original ExpoFT block; critic_pretrain_steps added below is
-        # a new, default-off (0) field — behavior for existing configs that
-        # don't set rl_critic_pretrain_steps is unchanged ---
-        FLAGS.config.critic_pretrain_steps = int(getattr(cfg, "rl_critic_pretrain_steps", FLAGS.config.critic_pretrain_steps))
-        FLAGS.config.actor_bc_pretrain_steps = int(getattr(cfg, "rl_actor_bc_pretrain_steps", FLAGS.config.actor_bc_pretrain_steps))
-        FLAGS.config.num_atoms = int(getattr(cfg, "rl_num_atoms", FLAGS.config.num_atoms))
-        FLAGS.config.v_min = float(getattr(cfg, "rl_v_min", FLAGS.config.v_min))
-        FLAGS.config.v_max = float(getattr(cfg, "rl_v_max", FLAGS.config.v_max))
-        FLAGS.config.reward_scale_decay = float(getattr(cfg, "rl_reward_scale_decay", FLAGS.config.reward_scale_decay))
-        FLAGS.config.use_reward_normalization = bool(getattr(cfg, "rl_use_reward_normalization", FLAGS.config.use_reward_normalization))
-        FLAGS.config.kl_coef = float(getattr(cfg, "rl_kl_coef", FLAGS.config.kl_coef))
-        FLAGS.config.entropy_scale = float(getattr(cfg, "rl_entropy_scale", FLAGS.config.entropy_scale))
-        FLAGS.config.kl_ref_std = float(getattr(cfg, "rl_kl_ref_std", FLAGS.config.kl_ref_std))
-        FLAGS.config.use_hetstat_policy = bool(getattr(cfg, "rl_use_hetstat_policy", FLAGS.config.use_hetstat_policy))
-        FLAGS.config.hetstat_num_rff_features = int(getattr(cfg, "rl_hetstat_num_rff_features", FLAGS.config.hetstat_num_rff_features))
-        FLAGS.config.hetstat_var_lr_multiplier = float(getattr(cfg, "rl_hetstat_var_lr_multiplier", FLAGS.config.hetstat_var_lr_multiplier))
-        FLAGS.config.use_double_q_selection = bool(getattr(cfg, "rl_use_double_q_selection", FLAGS.config.use_double_q_selection))
-        FLAGS.config.use_clipped_double_q = bool(getattr(cfg, "rl_use_clipped_double_q", FLAGS.config.use_clipped_double_q))
-    elif model_cls == "PPOLearner":
-        FLAGS.config.actor_lr  = float(getattr(cfg, "ppo_lr", FLAGS.config.actor_lr))
-        FLAGS.config.critic_lr = float(getattr(cfg, "ppo_lr", FLAGS.config.critic_lr))
-        FLAGS.config.discount  = float(getattr(cfg, "ppo_discount", FLAGS.config.discount))
-        FLAGS.config.gae_lambda        = float(getattr(cfg, "ppo_gae_lambda", FLAGS.config.gae_lambda))
-        FLAGS.config.clip_eps          = float(getattr(cfg, "ppo_clip_eps", FLAGS.config.clip_eps))
-        FLAGS.config.value_loss_coef   = float(getattr(cfg, "ppo_value_loss_coef", FLAGS.config.value_loss_coef))
-        FLAGS.config.entropy_coef      = float(getattr(cfg, "ppo_entropy_coef", FLAGS.config.entropy_coef))
-        _ppo_value_clip_eps = getattr(cfg, "ppo_value_clip_eps", FLAGS.config.value_clip_eps)
-        FLAGS.config.value_clip_eps = float(_ppo_value_clip_eps) if _ppo_value_clip_eps is not None else None
-        _ppo_max_grad_norm = getattr(cfg, "ppo_max_grad_norm", FLAGS.config.max_grad_norm)
-        FLAGS.config.max_grad_norm = float(_ppo_max_grad_norm) if _ppo_max_grad_norm is not None else None
-        FLAGS.config.num_minibatches = int(getattr(cfg, "ppo_num_minibatches", FLAGS.config.num_minibatches))
-        if hasattr(cfg, "ppo_hidden_dims"):
-            FLAGS.config.hidden_dims = tuple(cfg.ppo_hidden_dims)
-        FLAGS.config.actor_pretrain_steps = int(getattr(cfg, "ppo_actor_pretrain_steps", FLAGS.config.actor_pretrain_steps))
-        FLAGS.config.rollout_length = int(getattr(cfg, "ppo_rollout_length", FLAGS.config.rollout_length))
-        FLAGS.config.actor_log_std_min = float(getattr(cfg, "ppo_actor_log_std_min", FLAGS.config.actor_log_std_min))
-    elif model_cls == "GRPOLearner":
-        FLAGS.config.actor_lr     = float(getattr(cfg, "grpo_lr", FLAGS.config.actor_lr))
-        FLAGS.config.group_size   = int(getattr(cfg, "grpo_group_size", FLAGS.config.group_size))
-        FLAGS.config.clip_eps     = float(getattr(cfg, "grpo_clip_eps", FLAGS.config.clip_eps))
-        FLAGS.config.kl_coef      = float(getattr(cfg, "grpo_kl_coef", FLAGS.config.kl_coef))
-        FLAGS.config.entropy_coef = float(getattr(cfg, "grpo_entropy_coef", FLAGS.config.entropy_coef))
-        _grpo_max_grad_norm = getattr(cfg, "grpo_max_grad_norm", FLAGS.config.max_grad_norm)
-        FLAGS.config.max_grad_norm = float(_grpo_max_grad_norm) if _grpo_max_grad_norm is not None else None
-        FLAGS.config.num_minibatches = int(getattr(cfg, "grpo_num_minibatches", FLAGS.config.num_minibatches))
-        if hasattr(cfg, "grpo_hidden_dims"):
-            FLAGS.config.hidden_dims = tuple(cfg.grpo_hidden_dims)
-        FLAGS.config.actor_pretrain_steps = int(getattr(cfg, "grpo_actor_pretrain_steps", FLAGS.config.actor_pretrain_steps))
-        FLAGS.config.rollout_length = int(getattr(cfg, "grpo_rollout_length", FLAGS.config.rollout_length))
-        FLAGS.config.actor_log_std_min = float(getattr(cfg, "grpo_actor_log_std_min", FLAGS.config.actor_log_std_min))
-    elif model_cls == "PPOResidualLearner":
-        # Same fields as PPOLearner's own override block above, EXCEPT
-        # actor_pretrain_steps -- there is no pretrain_actor_bc on this
-        # class (no random-init-actor problem to warm-start away, see
-        # ppo_residual_pi_config.py's docstring), so that field does not
-        # exist on this config at all; setting it would error. edit_scale
-        # is new here (unused by plain PPOLearner).
-        FLAGS.config.actor_lr  = float(getattr(cfg, "ppo_lr", FLAGS.config.actor_lr))
-        FLAGS.config.critic_lr = float(getattr(cfg, "ppo_lr", FLAGS.config.critic_lr))
-        FLAGS.config.discount  = float(getattr(cfg, "ppo_discount", FLAGS.config.discount))
-        FLAGS.config.gae_lambda        = float(getattr(cfg, "ppo_gae_lambda", FLAGS.config.gae_lambda))
-        FLAGS.config.clip_eps          = float(getattr(cfg, "ppo_clip_eps", FLAGS.config.clip_eps))
-        FLAGS.config.value_loss_coef   = float(getattr(cfg, "ppo_value_loss_coef", FLAGS.config.value_loss_coef))
-        FLAGS.config.entropy_coef      = float(getattr(cfg, "ppo_entropy_coef", FLAGS.config.entropy_coef))
-        _ppo_value_clip_eps = getattr(cfg, "ppo_value_clip_eps", FLAGS.config.value_clip_eps)
-        FLAGS.config.value_clip_eps = float(_ppo_value_clip_eps) if _ppo_value_clip_eps is not None else None
-        _ppo_max_grad_norm = getattr(cfg, "ppo_max_grad_norm", FLAGS.config.max_grad_norm)
-        FLAGS.config.max_grad_norm = float(_ppo_max_grad_norm) if _ppo_max_grad_norm is not None else None
-        FLAGS.config.num_minibatches = int(getattr(cfg, "ppo_num_minibatches", FLAGS.config.num_minibatches))
-        if hasattr(cfg, "ppo_hidden_dims"):
-            FLAGS.config.hidden_dims = tuple(cfg.ppo_hidden_dims)
-        FLAGS.config.rollout_length = int(getattr(cfg, "ppo_rollout_length", FLAGS.config.rollout_length))
-        FLAGS.config.actor_log_std_min = float(getattr(cfg, "ppo_actor_log_std_min", FLAGS.config.actor_log_std_min))
-        FLAGS.config.edit_scale = float(getattr(cfg, "ppo_edit_scale", FLAGS.config.edit_scale))
-    elif model_cls == "GRPOResidualLearner":
-        # Same fields as GRPOLearner's own override block above, EXCEPT
-        # actor_pretrain_steps (same rationale as PPOResidualLearner's
-        # branch just above), plus edit_scale.
-        FLAGS.config.actor_lr     = float(getattr(cfg, "grpo_lr", FLAGS.config.actor_lr))
-        FLAGS.config.group_size   = int(getattr(cfg, "grpo_group_size", FLAGS.config.group_size))
-        FLAGS.config.clip_eps     = float(getattr(cfg, "grpo_clip_eps", FLAGS.config.clip_eps))
-        FLAGS.config.kl_coef      = float(getattr(cfg, "grpo_kl_coef", FLAGS.config.kl_coef))
-        FLAGS.config.entropy_coef = float(getattr(cfg, "grpo_entropy_coef", FLAGS.config.entropy_coef))
-        _grpo_max_grad_norm = getattr(cfg, "grpo_max_grad_norm", FLAGS.config.max_grad_norm)
-        FLAGS.config.max_grad_norm = float(_grpo_max_grad_norm) if _grpo_max_grad_norm is not None else None
-        FLAGS.config.num_minibatches = int(getattr(cfg, "grpo_num_minibatches", FLAGS.config.num_minibatches))
-        if hasattr(cfg, "grpo_hidden_dims"):
-            FLAGS.config.hidden_dims = tuple(cfg.grpo_hidden_dims)
-        FLAGS.config.rollout_length = int(getattr(cfg, "grpo_rollout_length", FLAGS.config.rollout_length))
-        FLAGS.config.actor_log_std_min = float(getattr(cfg, "grpo_actor_log_std_min", FLAGS.config.actor_log_std_min))
-        FLAGS.config.edit_scale = float(getattr(cfg, "grpo_edit_scale", FLAGS.config.edit_scale))
-    elif model_cls == "SACLearner":
-        FLAGS.config.actor_lr  = float(getattr(cfg, "sac_lr", FLAGS.config.actor_lr))
-        FLAGS.config.critic_lr = float(getattr(cfg, "sac_lr", FLAGS.config.critic_lr))
-        FLAGS.config.discount  = float(getattr(cfg, "sac_discount", FLAGS.config.discount))
-        FLAGS.config.tau       = float(getattr(cfg, "sac_tau", FLAGS.config.tau))
-        FLAGS.config.init_temperature = float(getattr(cfg, "sac_init_temperature", FLAGS.config.init_temperature))
-        _sac_target_entropy = getattr(cfg, "sac_target_entropy", FLAGS.config.target_entropy)
-        FLAGS.config.target_entropy = float(_sac_target_entropy) if _sac_target_entropy is not None else None
-        _sac_critic_weight_decay = getattr(cfg, "sac_critic_weight_decay", FLAGS.config.critic_weight_decay)
-        FLAGS.config.critic_weight_decay = float(_sac_critic_weight_decay) if _sac_critic_weight_decay is not None else None
-        FLAGS.config.num_qs = int(getattr(cfg, "sac_num_qs", FLAGS.config.num_qs))
-        if hasattr(cfg, "sac_hidden_dims"):
-            FLAGS.config.hidden_dims = tuple(cfg.sac_hidden_dims)
-    # BCLearner: no RL hyperparameter overrides needed — imitation-only,
-    # no critic/GAE/advantage machinery to tune here.
+    # FORGE (chunk_action_reference) is not supported by this training loop yet -- see the function's docstring.
+    check_rl_action_space_supported(cfg)
 
-    # Tactile / force / gripper-effort input of the residual actor and the critic (expo_ft/utils/aux_features.py).
-    # Read by the replay buffer (create_replay_buffer), the agent (EXPOLearner.create) and the evaluation scripts, all
-    # from the same config entry. Implemented for EXPOLearner only: another learner would train without it while the
-    # buffer stored it, so refuse instead.
-    if bool(getattr(cfg, "use_tactile_aux", False)):
-        if model_cls != "EXPOLearner":
-            raise ValueError(f"use_tactile_aux is only implemented for model_cls=EXPOLearner, got {model_cls}")
-        FLAGS.config.use_tactile_aux = True
-
-    # Sync actor_success_only from the task YAML into the model config too —
-    # BatchProcessor already reads it from cfg (line below, via train_pi_robo's
-    # own actor_success_only variable), but the EXPOLearner agent itself reads
-    # its own copy from FLAGS.config, which defaults to True in
-    # expo_ft_pi_config.py. Without this sync, BatchProcessor (correctly seeing
-    # the YAML's actor_success_only=False) never builds an actor_batch, while
-    # the agent (still seeing FLAGS.config's default True) expects one — crash.
-    FLAGS.config.actor_success_only = getattr(cfg, "actor_success_only", False)
     # AssetsConfig DROID officielle deja bakee dans la config openpi nommee ci-dessus —
     # ne pas l'ecraser ici (meme bug corrige dans eval_policy.py : le SFT a ete
     # entraine avec ces stats officielles, pas des stats locales par repo_id).
@@ -417,8 +256,9 @@ def main(_):
     wandb.config.update(vars(cfg), allow_val_change=resuming)
 
     if cfg.env_type in ('droid', 'sim'):
-        dataset = process_droid_dataset(
-            cfg.droid_format_dir,
+        # Demonstrations of the task YAML, in the format it points to (demos_dir: FORGE .npz, droid_format_dir:
+        # DROID format). offline_ratio and rl_seed_demos_online decide where they go (BatchProcessor), unchanged.
+        dataset = load_demo_dataset(
             cfg,
             num_data=cfg.num_data_rl if cfg.num_data_rl > 0 else None,
         )

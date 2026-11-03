@@ -19,8 +19,8 @@ def prepare_critic_batch(batch, padded_dim, action_dim, state_dim, action_horizo
     batch['states'] = batch["state"].reshape(batch_size, padded_dim)[..., :state_dim].reshape(batch_size, state_dim)
     batch['next_states'] = batch["next_state"].reshape(batch_size, padded_dim)[..., :state_dim].reshape(batch_size, state_dim)
     # What the residual actor and the critic see. The pi0.5 base policy keeps using `states` / `next_states` only.
-    # The replay buffer has an "aux" field (tactile / force / gripper effort, see utils/aux_features.py) only when
-    # use_tactile_aux is enabled; without it critic_states IS states, exactly as before.
+    # The replay buffer has an "aux" field (tactile / force, see utils/aux_features.py) only when
+    # tactile / force input is enabled (use_tactile / use_force); without it critic_states IS states, exactly as before.
     batch['critic_states'] = batch['states']
     batch['next_critic_states'] = batch['next_states']
     if "aux" in batch:
@@ -69,7 +69,7 @@ def prepare_actor_sampling_batch_current(batch):
 def extract_critic_fields(processed_inputs, padded_dim, state_dim, aux=None):
     """Add critic_obs and critic_states keys to a processed inputs dict.
 
-    aux: optional (aux_dim,) tactile / force / gripper-effort vector of the same observation (see
+    aux: optional (aux_dim,) tactile / force vector of the same observation (see
     utils/aux_features.py). When given it is appended to critic_states only; processed_inputs["state"], which the base
     policy reads, is left as it is.
     """

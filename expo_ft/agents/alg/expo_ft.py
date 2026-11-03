@@ -35,7 +35,7 @@ from expo_ft.networks import (
 from expo_ft.networks.encoders import ResNetV2Encoder
 
 from expo_ft.utils.augmentation import make_data_augmentation_fn
-from expo_ft.utils.aux_features import AUX_DIM, build_aux_features
+from expo_ft.utils.aux_features import AuxSpec
 
 import openpi.shared.array_typing as at
 import openpi.training.sharding as _sharding
@@ -209,10 +209,10 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
     actor_success_only: bool = struct.field(pytree_node=False)
     fixed_temperature: Optional[float] = struct.field(pytree_node=False, default=None)
     critic_grad_clip_norm: Optional[float] = struct.field(pytree_node=False, default=None)
-    # True: the residual actor and the critic also see tactile / force / gripper effort (utils/aux_features.py), as
-    # AUX_DIM extra columns of their state input. The base policy never does. `state_dim` stays the dimension of the
-    # base policy's state in both cases.
-    use_tactile_aux: bool = struct.field(pytree_node=False, default=False)
+    # Tactile / force input (utils/aux_features.py): when aux_spec.enabled, the residual actor and the critic also see
+    # aux_spec.dim extra columns in their state input. The base policy never does. `state_dim` stays the dimension of
+    # the base policy's state in all cases. Default = AuxSpec() = the task alone.
+    aux_spec: AuxSpec = struct.field(pytree_node=False, default=AuxSpec())
     _infer_cache: Optional[dict] = struct.field(pytree_node=False, default=None)
 
     @classmethod
@@ -290,7 +290,9 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         resize_size: Optional[int] = None,
         actor_success_only: bool = False,
         use_full_augmentation: bool = True,
-        use_tactile_aux: bool = False,
+        use_tactile: bool = False,
+        use_force: bool = False,
+        force_mode: str = "measured",
         **kwargs,
     ):
         action_dim = action_space.shape[-1]
@@ -361,9 +363,13 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         critic_observations = jnp.ones((1, latent_dim_image))
         critic_actions = jnp.expand_dims(actions, axis = 0)
         critic_states = jnp.expand_dims(states, axis = 0)
-        if use_tactile_aux:
+        # Same three fields as the task YAML / model config; they reach this function through agent_kwargs. Created
+        # here, once, so that the agent and everything it was initialised with agree.
+        aux_spec = AuxSpec(use_tactile=use_tactile, use_force=use_force, force_mode=force_mode)
+        print("tactile / force input of the residual actor and the critic: ", aux_spec.describe())
+        if aux_spec.enabled:
             # Shape-only example for initialising the actor and critic projections of their state input.
-            critic_states = jnp.concatenate([critic_states, jnp.zeros((1, AUX_DIM), dtype=critic_states.dtype)], axis=-1)
+            critic_states = jnp.concatenate([critic_states, jnp.zeros((1, aux_spec.dim), dtype=critic_states.dtype)], axis=-1)
         critic_states_ext = critic_states
         print("critic actions shape: ", critic_actions.shape)
         print("critic states shape: ", critic_states.shape)
@@ -513,7 +519,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             freeze_encoder=freeze_encoder,
             freeze_critic_encoder=freeze_critic_encoder,
             actor_success_only=actor_success_only,
-            use_tactile_aux=use_tactile_aux,
+            aux_spec=aux_spec,
         )
         if not resume:
             agent = agent.cache_infer_params()
@@ -591,7 +597,9 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         _target_critic_params = c.get("target_critic_params") or jax.device_put(self.target_critic.params, infer_sharding)
 
         # Built from the raw observation before process_raw_inputs, which converts that dict in place.
-        aux = build_aux_features(observations) if self.use_tactile_aux else None
+        # Not needed (and not required in the observation) when only the base policy acts: the SFT baseline can be
+        # evaluated with the very same task YAML on a robot without taxels.
+        aux = self.aux_spec.build(observations) if (self.aux_spec.enabled and not only_base_actions) else None
         transformed_inputs = self.actor.process_raw_inputs(observations, self.action_dim, self.resize_size)
         transformed_inputs = extract_critic_fields(transformed_inputs, self.actor.model_config.action_dim, self.state_dim, aux=aux)
 
@@ -666,7 +674,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         critic_obs = jax.device_put(critic_obs)
         batch_size = critic_obs.shape[0]
         # State input of the residual actor and the critic (base state, plus tactile / force / gripper effort when
-        # use_tactile_aux). The base policy below is fed `next_states` through prepare_actor_sampling_batch instead.
+        # aux_spec). The base policy below is fed `next_states` through prepare_actor_sampling_batch instead.
         states = jnp.squeeze(batch["next_critic_states"])
         states = jax.device_put(states, self.data_sharding)
         rng = self.rng

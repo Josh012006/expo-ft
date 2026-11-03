@@ -15,7 +15,7 @@ from expo_ft.data.dataset import Dataset, DatasetDict
 import openpi.training.config as _config
 import openpi.transforms as _transforms
 
-from expo_ft.utils.aux_features import AUX_DIM, build_aux_features
+from expo_ft.utils.aux_features import AuxSpec
 
 
 def _insert_recursively(
@@ -46,8 +46,8 @@ def create_replay_buffer(config, example_action, capacity, task_description, rep
         discount=config.discount,
         skip_repack_transforms=getattr(config, 'skip_repack_transforms', False),
         store_base_actions=store_base_actions,
-        # Only the EXPOLearner config defines it; any other config has no tactile input.
-        use_tactile_aux=bool(getattr(config, 'use_tactile_aux', False)),
+        # use_tactile / use_force / force_mode of the model config (only the EXPOLearner config defines them; absent = none).
+        aux_spec=AuxSpec.from_config(config),
     )
     buf.seed(seed)
     return buf
@@ -97,7 +97,7 @@ class PiReplayBuffer(Dataset):
         discount: float = 0.99,
         skip_repack_transforms: bool = False,
         store_base_actions: bool = False,
-        use_tactile_aux: bool = False,
+        aux_spec: AuxSpec = AuxSpec(),
     ):
         data_config = pi_train_config.data.create(pi_train_config.assets_dirs, pi_train_config.model)
         model_config = pi_train_config.model
@@ -140,12 +140,12 @@ class PiReplayBuffer(Dataset):
         self._store_base_actions = store_base_actions
         if store_base_actions:
             dataset_dict["base_actions"] = np.empty((capacity, *action_chunk_shape), dtype=np.float32)
-        # EXPOLearner only: tactile / force / gripper effort at the time of each step (see utils/aux_features.py).
-        # Derived from the raw observation in insert(); read by the residual actor and the critic, never by the
-        # base policy. Absent from the buffer (and from every batch) unless use_tactile_aux is on.
-        self._use_tactile_aux = use_tactile_aux
-        if use_tactile_aux:
-            dataset_dict["aux"] = np.empty((capacity, AUX_DIM), dtype=np.float32)
+        # EXPOLearner only: tactile / force at the time of each step (see utils/aux_features.py), as selected by
+        # use_tactile / use_force / force_mode. Derived from the raw observation in insert(); read by the residual
+        # actor and the critic, never by the base policy. Absent from the buffer (and from every batch) unless enabled.
+        self._aux_spec = aux_spec
+        if aux_spec.enabled:
+            dataset_dict["aux"] = np.empty((capacity, aux_spec.dim), dtype=np.float32)
         super().__init__(dataset_dict)
 
         self._size = 0
@@ -272,8 +272,8 @@ class PiReplayBuffer(Dataset):
         if self._store_base_actions:
             obs_data_dict["base_actions"] = np.tile(data_dict["base_actions"][None, :], (self._action_horizon, 1))
         preprocessed_dict = self._preprocess_single_transition(obs_data_dict)
-        if self._use_tactile_aux:
-            preprocessed_dict["aux"] = build_aux_features(data_dict["observations"])
+        if self._aux_spec.enabled:
+            preprocessed_dict["aux"] = self._aux_spec.build(data_dict["observations"])
 
         # Drop any keys not in buffer storage (e.g. stray fields) so _insert_recursively matches.
         row = {k: preprocessed_dict[k] for k in self.dataset_dict.keys()}
@@ -456,7 +456,7 @@ class PiReplayBuffer(Dataset):
                 "valids": np.ones((batch_size,), dtype=np.float32),
             }
         )
-        if self._use_tactile_aux:
+        if self._aux_spec.enabled:
             jax_dataset_dict["next_aux"] = self.dataset_dict["aux"][next_indices]
         _prev_masks = jax_dataset_dict["masks"].copy()
         for i in range(1, self._replan_steps):

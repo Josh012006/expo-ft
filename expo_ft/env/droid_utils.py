@@ -4,6 +4,10 @@ import h5py
 import numpy as np
 from tqdm import tqdm
 
+from expo_ft.utils.aux_features import (
+    FT_FORCE_KEY, GRIPPER_EFFORT_KEY, TACTILE_KEY, AuxSpec,
+)
+
 def _flatten_dict(d, prefix=''):
     """Flatten nested dict with '/' separator."""
     result = {}
@@ -44,10 +48,10 @@ def make_dummy_transition(task_config):
         "observation/gripper_position": np.zeros((1,), dtype=np.float32),
         "prompt": task_config.language_instruction,
     }
-    if getattr(task_config, "use_tactile_aux", False):
-        # The replay buffer derives the tactile / force / gripper-effort input from these entries (shapes only).
-        from expo_ft.utils.aux_features import dummy_aux_observations
-        observations.update(dummy_aux_observations())
+    aux_spec = AuxSpec.from_config(task_config)
+    if aux_spec.enabled:
+        # The replay buffer derives the tactile / force input from these entries (shapes only).
+        observations.update(aux_spec.dummy_observations())
     return [{
         "observations": observations,
         "actions": np.zeros((task_config.output_action_dim,), dtype=np.float32),
@@ -116,3 +120,118 @@ def process_droid_dataset(
                 })
 
     return data
+
+
+# .npz array -> observation key, for the signals the replay buffer can be asked to build the tactile / force input from
+# (the inverse of RECORDED / RECORDED_OPTIONAL in scripts/isaaclab/collect_waypoint_demos.py).
+_NPZ_AUX_ARRAYS = {
+    FT_FORCE_KEY: "ft_force",
+    GRIPPER_EFFORT_KEY: "gripper_effort",
+    TACTILE_KEY: "tactile",
+}
+_NPZ_REQUIRED = ("exterior_image", "wrist_image", "joint_position", "gripper_position", "actions")
+
+
+def process_forge_npz_dataset(demos_dir, task_config, num_data=None):
+    """FORGE demonstrations (ep_*.npz of scripts/isaaclab/collect_waypoint_demos.py or teleop_client.py) -> the list of
+    one-step transitions that PiReplayBuffer.insert_dataset consumes. Same output convention as process_droid_dataset:
+
+        observations  the dict the environment server sends at that step (same keys as a live observation), plus
+                      "prompt"; `extra/*` only for the signals AuxSpec.from_config(task_config) asks for
+        actions       (8,) the recorded action: 7 ABSOLUTE joint targets + gripper command
+        rewards       0 everywhere but 1.0 on the last step of the episode, dones 1.0 there, masks = 1 - dones
+
+    num_data: first N episodes in file order (ep_0000_..., ep_0001_...), None = all (the YAML key num_data_rl).
+    Each frame holds the observation BEFORE its action. Collected episodes continue a few steps after the first
+    "inserted" step (HOLD_AFTER_SUCCESS), so the reward 1.0 sits at the end of that hold, not at the first success.
+
+    Raises if a signal that use_tactile / use_force needs was not recorded in a file (demos of a robot without taxels,
+    or recorded before the arrays existed): the tactile / force input must exist for every demonstration step.
+    """
+    from pathlib import Path
+
+    demos_dir = Path(demos_dir)
+    files = sorted(demos_dir.glob("ep_*.npz"))
+    if not files:
+        raise FileNotFoundError(f"no ep_*.npz in {demos_dir}")
+    total = len(files)
+    if num_data is not None and num_data > 0:
+        files = files[:num_data]
+    print(f"Find {total} episodes; using {len(files)}")
+
+    aux_spec = AuxSpec.from_config(task_config)
+    state_key = task_config.state_obs_key
+    action_dim = task_config.output_action_dim
+
+    data = []
+    for path in tqdm(files):
+        d = np.load(path)
+        missing = [k for k in _NPZ_REQUIRED if k not in d.files]
+        if missing:
+            raise ValueError(f"{path.name}: missing arrays {missing}")
+        needed = {key: _NPZ_AUX_ARRAYS[key] for key in aux_spec.keys}
+        absent = [name for name in needed.values() if name not in d.files]
+        if absent:
+            raise ValueError(
+                f"{path.name}: use_tactile / use_force ({aux_spec.describe()}) need the arrays {absent}, which this "
+                f"demonstration does not contain (it holds {d.files}). They are recorded only when the server sends "
+                f"them: robot 'robotiq_2f85_tsf' for tactile and gripper_effort. Re-collect with that robot, or set "
+                f"use_tactile / use_force to false."
+            )
+
+        ext, wrist = d["exterior_image"], d["wrist_image"]
+        q = d["joint_position"].astype(np.float32)
+        grip = d["gripper_position"].astype(np.float32).reshape(-1, 1)
+        actions = d["actions"].astype(np.float32)
+        aux = {key: np.asarray(d[name]) for key, name in needed.items()}
+        T = len(actions)
+        if not (len(ext) == len(wrist) == len(q) == len(grip) == T) or any(len(v) != T for v in aux.values()):
+            raise ValueError(f"{path.name}: arrays of different lengths (actions {T})")
+        if actions.shape != (T, action_dim) or q.shape[1:] != (task_config.state_obs_dim,):
+            raise ValueError(
+                f"{path.name}: actions {actions.shape} / joint_position {q.shape}, expected (T, {action_dim}) / "
+                f"(T, {task_config.state_obs_dim}) (output_action_dim, state_obs_dim of the YAML)"
+            )
+        prompt = str(d["prompt"]) if "prompt" in d.files else task_config.language_instruction
+
+        ep_dones = np.zeros(T, dtype=np.float32)
+        ep_dones[-1] = 1.0
+        ep_rewards = ep_dones.copy()
+        for t in range(T):
+            observations = {
+                "observation/exterior_image_1_left": ext[t],
+                "observation/wrist_image_left": wrist[t],
+                state_key: q[t],
+                "observation/gripper_position": grip[t],
+                "prompt": prompt,
+            }
+            observations.update({key: value[t] for key, value in aux.items()})
+            data.append({
+                "observations": observations,
+                "actions": actions[t],
+                "rewards": ep_rewards[t],
+                "masks": 1 - ep_dones[t],
+                "dones": ep_dones[t],
+            })
+    return data
+
+
+def load_demo_dataset(task_config, num_data=None):
+    """The demonstrations of a task YAML, whichever format it points to (exactly one of the two keys):
+
+        demos_dir          folder of FORGE ep_*.npz files        -> process_forge_npz_dataset
+        droid_format_dir   DROID-format folder (ManiSkill demos) -> process_droid_dataset
+
+    One entry point for train_pi_robo.py and every diagnostic script, so that none of them reads a format the others
+    do not. num_data: first N episodes, None = all.
+    """
+    demos_dir = getattr(task_config, "demos_dir", None)
+    droid_dir = getattr(task_config, "droid_format_dir", None)
+    if (demos_dir is None) == (droid_dir is None):
+        raise ValueError(
+            f"the task YAML must define exactly one of demos_dir (FORGE .npz demos) and droid_format_dir "
+            f"(DROID-format demos), got demos_dir={demos_dir!r}, droid_format_dir={droid_dir!r}"
+        )
+    if demos_dir is not None:
+        return process_forge_npz_dataset(demos_dir, task_config, num_data=num_data)
+    return process_droid_dataset(droid_dir, task_config, num_data=num_data)

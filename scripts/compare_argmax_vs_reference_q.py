@@ -61,10 +61,10 @@ def main():
     import jax
     import jax.numpy as jnp
     import openpi.training.sharding as openpi_sharding
-    from expo_ft.utils.config_loader import load_task_config, get_sft_config_name
+    from expo_ft.utils.config_loader import load_task_config, get_sft_config_name, apply_task_overrides
     from expo_ft.agents.vla.pi05 import build_pi05
     from expo_ft.data.replay_buffer import create_replay_buffer
-    from expo_ft.env.droid_utils import process_droid_dataset
+    from expo_ft.env.droid_utils import load_demo_dataset
     from expo_ft.agents.alg.batch_utils import prepare_critic_batch, prepare_actor_sampling_batch_current
     from expo_ft.networks.ensemble import subsample_image_ensemble
 
@@ -98,15 +98,17 @@ def main():
     spec.loader.exec_module(mod)
 
     model_config = mod.get_config()
-    model_config.pi05_config_name = get_sft_config_name(cfg)
-    model_config.skip_repack_transforms = cfg.skip_repack_transforms
+    # Same YAML -> model config step as train_pi_robo.py: the architecture of the RL checkpoints (rl_hidden_dims, rl_N,
+    # use_tactile / use_force / force_mode, ...) must be the one they were trained with.
+    aux_spec = apply_task_overrides(model_config, cfg)
+    print(f"Tactile / force input of the residual actor and the critic: {aux_spec.describe()}")
     model_config.pi05_weight_loader_path = None
 
     # ── Real demo data (not the synthetic shapes-only dataset eval_policy.py
     # uses -- we need genuine states here, not just an env to roll out in).
     # Loaded ONCE, reused for every RL checkpoint below. ──
-    print(f"Loading demo data from {cfg.droid_format_dir} ...")
-    dataset = process_droid_dataset(cfg.droid_format_dir, cfg, num_data=None)
+    print(f"Loading demo data from {getattr(cfg, 'demos_dir', None) or getattr(cfg, 'droid_format_dir', None)} ...")
+    dataset = load_demo_dataset(cfg, num_data=None)
     example_action = dataset[0]['actions'][np.newaxis]
 
     replay_buffer = create_replay_buffer(

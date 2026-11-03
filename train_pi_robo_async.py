@@ -149,10 +149,16 @@ def main(_):
     logging.info(f"Created training environment {env.env_id}")
 
     model_cls = FLAGS.config.model_cls
-    # This trainer never builds the tactile / force / gripper-effort input (expo_ft/utils/aux_features.py): refuse
-    # instead of silently training without what the task YAML asks for.
-    if getattr(FLAGS.config_task, "use_tactile_aux", False):
-        raise NotImplementedError("use_tactile_aux is not supported by train_pi_robo_async.py; use train_pi_robo.py")
+    # This trainer is driven by absl flags (--config_task is a python config, not a task YAML) and never goes through
+    # apply_task_overrides: the tactile / force input (use_tactile, use_force, force_mode; expo_ft/utils/aux_features.py)
+    # is not wired into it. Refuse instead of silently training without what a config asks for.
+    from expo_ft.utils.aux_features import AuxSpec
+    for _name, _c in (("config_task", FLAGS.config_task), ("config", FLAGS.config)):
+        if AuxSpec.from_config(_c).enabled:
+            raise NotImplementedError(
+                f"use_tactile / use_force are set in --{_name} but train_pi_robo_async.py does not support them; "
+                f"use train_pi_robo.py"
+            )
     # BCLearner uses human-intervention chunks for the actor batch only (no critic).
     use_dagger_hil_sampling = model_cls == "BCLearner"
     if model_cls == "BCLearner":

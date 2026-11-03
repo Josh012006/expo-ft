@@ -101,6 +101,12 @@ def main(_):
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     model_cls = config.model_cls
+    # Real-robot evaluation driven by python configs (no task YAML, no apply_task_overrides): the tactile / force input
+    # (use_tactile, use_force; expo_ft/utils/aux_features.py) is not wired into it. Refuse instead of ignoring it.
+    from expo_ft.utils.aux_features import AuxSpec
+    for _name, _c in (("config_task", config_task), ("config", config)):
+        if AuxSpec.from_config(_c).enabled:
+            raise NotImplementedError(f"use_tactile / use_force are set in {_name} but eval_droid_policy.py does not support them")
     if model_cls == "BCLearner":
         from expo_ft.agents.alg.bc import load_agent, restore_checkpoint
     elif model_cls == "EXPOLearner":

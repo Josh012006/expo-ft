@@ -21,7 +21,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import numpy as np
 from tqdm import tqdm
 
-from expo_ft.utils.config_loader import load_task_config, get_sft_config_name
+from expo_ft.utils.config_loader import load_task_config, apply_task_overrides
 from expo_ft.env.env_factory import make_env_wrapper
 
 def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_action_stats=False,
@@ -131,17 +131,14 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
     spec.loader.exec_module(mod)
     model_config = mod.get_config()
 
-    # Override config dynamically from task YAML — no hardcoded values
-    sft_config_name = get_sft_config_name(cfg)
-    model_config.pi05_config_name  = sft_config_name
-    model_config.skip_repack_transforms = cfg.skip_repack_transforms
-    # Tactile / force / gripper-effort input of the residual actor and critic: the architecture of an RL checkpoint
-    # trained with it only restores with it (expo_ft/utils/aux_features.py). model_cls other than EXPOLearner has no
-    # such key, hence the check.
-    if bool(getattr(cfg, "use_tactile_aux", False)):
-        if getattr(cfg, "model_cls", "EXPOLearner") != "EXPOLearner":
-            raise ValueError("use_tactile_aux is only implemented for model_cls=EXPOLearner")
-        model_config.use_tactile_aux = True
+    # Override config dynamically from task YAML — no hardcoded values. The SAME function as train_pi_robo.py: openpi
+    # config name, skip_repack_transforms, the RL hyperparameters (rl_hidden_dims, rl_edit_scale, rl_N, ... decide
+    # whether an RL checkpoint restores at all) and the tactile / force input (use_tactile, use_force, force_mode: the
+    # architecture of an RL checkpoint trained with them only restores with them).
+    aux_spec = apply_task_overrides(model_config, cfg)
+    if aux_spec.enabled and getattr(cfg, "model_cls", "EXPOLearner") != "EXPOLearner":
+        raise ValueError("use_tactile / use_force are only implemented for model_cls=EXPOLearner")
+    print(f"Tactile / force input of the residual actor and the critic: {aux_spec.describe()}")
 
     # IMPORTANT : ne PAS fixer pi05_assets_dir / pi05_asset_id ici.
     # La config openpi "expo_pi05_droid_lora_finetune_sft_joint_state" porte déjà
