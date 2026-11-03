@@ -24,9 +24,8 @@ from expo_ft.agents.alg.batch_utils import prepare_critic_batch
 from expo_ft.env.droid_utils import load_demo_dataset
 from expo_ft.utils.log_utils import EpisodeState, TrainingStats
 from expo_ft.utils.train_utils import get_batch_info, init_logging, init_wandb
-from expo_ft.utils.config_loader import (
-    apply_task_overrides, check_rl_action_space_supported, load_task_config, resolve_run_dir,
-)
+from expo_ft.utils.action_space import chunk_to_env_actions
+from expo_ft.utils.config_loader import apply_task_overrides, load_task_config, resolve_run_dir
 
 
 import openpi.training.sharding as openpi_sharding
@@ -85,6 +84,14 @@ def get_or_create_episode_seeds(output_dir, n_episodes, master_seed):
     return seeds
 
 
+def as_env_chunk(action_chunk, observation, cfg):
+    """Chunk of the model -> chunk the environment executes (expo_ft/utils/action_space.py). `observation` is the one the
+    chunk was planned from. Identity unless the task YAML sets chunk_action_reference."""
+    return chunk_to_env_actions(
+        action_chunk, observation, getattr(cfg, "chunk_action_reference", None), getattr(cfg, "state_obs_key", None)
+    )
+
+
 def run_rigorous_eval(agent, eval_env, episode_seeds, cfg, only_base_actions=False):
     """Deterministic, fixed-seed evaluation -- Jesse's proposed protocol.
     Runs episode_seeds' episodes with agent.sample_actions(..., deterministic=True)
@@ -128,6 +135,7 @@ def run_rigorous_eval(agent, eval_env, episode_seeds, cfg, only_base_actions=Fal
         while not done and steps < cfg.max_steps_per_episode:
             if not action_plan:
                 action_chunk, eval_agent, _ = eval_agent.sample_actions(obs, only_base_actions=only_base_actions, deterministic=True)
+                action_chunk = as_env_chunk(action_chunk, obs, cfg)
                 action_plan.extend(action_chunk[:cfg.replan_steps])
             action = action_plan.popleft()
             eval_env.step(action.tolist())
@@ -191,8 +199,12 @@ def main(_):
     # Read once, early — used for the learner-import dispatch further down.
     model_cls = FLAGS.config.model_cls
 
-    # FORGE (chunk_action_reference) is not supported by this training loop yet -- see the function's docstring.
-    check_rl_action_space_supported(cfg)
+    # Action frame (chunk_action_reference, validated by apply_task_overrides): with "chunk_start_state" the model's chunk
+    # is made of offsets from the joint state at plan time, and every chunk is turned into absolute joint targets right
+    # after agent.sample_actions (as_env_chunk below); the replay buffer converts back, row by row, when it stores
+    # the executed actions. None = one shared frame (ManiSkill), as_env_chunk is then the identity.
+    logging.info("Action frame: chunk_action_reference=%s (state_obs_key=%s)",
+                 FLAGS.config.chunk_action_reference, FLAGS.config.state_obs_key)
 
     # AssetsConfig DROID officielle deja bakee dans la config openpi nommee ci-dessus —
     # ne pas l'ecraser ici (meme bug corrige dans eval_policy.py : le SFT a ete
@@ -1056,6 +1068,7 @@ def main(_):
                 # for why -- the clean frozen-SFT baseline, not SFT plus an
                 # arbitrary untrained-residual perturbation.
                 action_chunk, agent, new_si = agent.sample_actions(observation, only_base_actions=True)
+                action_chunk = as_env_chunk(action_chunk, observation, cfg)
                 episode_log.sample_info_history.append(new_si)
                 action_plan.extend(action_chunk[:cfg.replan_steps])
             else:
@@ -1173,6 +1186,7 @@ def main(_):
         if not action_plan and action_type != "human":
             sample_start = time.time()
             action_chunk, agent, new_si = agent.sample_actions(observation)
+            action_chunk = as_env_chunk(action_chunk, observation, cfg)
             episode_log.sample_info_history.append(new_si)
             training_log.record_sample_time(time.time() - sample_start, step_metrics)
             action_plan.extend(action_chunk[:cfg.replan_steps])

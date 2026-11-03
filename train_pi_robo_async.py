@@ -159,6 +159,11 @@ def main(_):
                 f"use_tactile / use_force are set in --{_name} but train_pi_robo_async.py does not support them; "
                 f"use train_pi_robo.py"
             )
+        if getattr(_c, "chunk_action_reference", None):
+            raise NotImplementedError(
+                f"chunk_action_reference is set in --{_name} but train_pi_robo_async.py does not convert between the model's "
+                f"offsets and the environment's absolute targets; use train_pi_robo.py"
+            )
     # BCLearner uses human-intervention chunks for the actor batch only (no critic).
     use_dagger_hil_sampling = model_cls == "BCLearner"
     if model_cls == "BCLearner":

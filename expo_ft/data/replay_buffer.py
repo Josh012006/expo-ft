@@ -15,6 +15,9 @@ from expo_ft.data.dataset import Dataset, DatasetDict
 import openpi.training.config as _config
 import openpi.transforms as _transforms
 
+from expo_ft.utils.action_space import (
+    N_ANCHORED_DIMS, anchor_from_observation, validate_reference,
+)
 from expo_ft.utils.aux_features import AuxSpec
 
 
@@ -48,6 +51,10 @@ def create_replay_buffer(config, example_action, capacity, task_description, rep
         store_base_actions=store_base_actions,
         # use_tactile / use_force / force_mode of the model config (only the EXPOLearner config defines them; absent = none).
         aux_spec=AuxSpec.from_config(config),
+        # chunk_action_reference / state_obs_key of the task YAML, copied into the model config by apply_task_overrides.
+        # Absent / None = the model and the environment share one action frame (ManiSkill): nothing is converted.
+        action_reference=getattr(config, 'chunk_action_reference', None),
+        state_obs_key=getattr(config, 'state_obs_key', None),
     )
     buf.seed(seed)
     return buf
@@ -98,6 +105,8 @@ class PiReplayBuffer(Dataset):
         skip_repack_transforms: bool = False,
         store_base_actions: bool = False,
         aux_spec: AuxSpec = AuxSpec(),
+        action_reference: Optional[str] = None,
+        state_obs_key: Optional[str] = None,
     ):
         data_config = pi_train_config.data.create(pi_train_config.assets_dirs, pi_train_config.model)
         model_config = pi_train_config.model
@@ -162,7 +171,31 @@ class PiReplayBuffer(Dataset):
         self._skip_repack_transforms = skip_repack_transforms
         self._skip_norm_stats = skip_norm_stats
         self._prompt = task_description
+
+        # Action frame (see utils/action_space.py). insert() receives the actions the ENVIRONMENT executed (for FORGE: 7
+        # absolute joint targets + gripper). With action_reference "chunk_start_state" the buffer stores them in the frame
+        # of the model: the chunk of a row holds (action - joint state of THAT row) for the 7 joints, normalized, i.e. what
+        # openpi's DeltaActions + Normalize give the SFT demonstrations. The joint state of every row is kept in
+        # self._anchors (not part of dataset_dict: never sampled, never sent to the networks).
+        self._action_reference = validate_reference(action_reference)
+        self._state_obs_key = state_obs_key
+        self._anchors = None
+        if self._action_reference is not None:
+            if state_obs_key is None:
+                raise ValueError("action_reference needs state_obs_key (the observation key of the joint state)")
+            if self._raw_action_dim < N_ANCHORED_DIMS or self._raw_action_dim > padded_action_dim:
+                raise ValueError(f"raw action dim {self._raw_action_dim} incompatible with {N_ANCHORED_DIMS} anchored joints "
+                                 f"and padded dim {padded_action_dim}")
+            if any(isinstance(t, _transforms.DeltaActions) for t in self._data_config.data_transforms.inputs):
+                raise ValueError(
+                    "chunk_action_reference is set but the openpi data config already applies DeltaActions to its inputs: "
+                    "the actions would be made relative twice. The RL config must be the plain '..._joint_state' one."
+                )
+            self._anchors = np.zeros((capacity, N_ANCHORED_DIMS), dtype=np.float32)
+
+        self._norm_stats = self._resolve_norm_stats()
         self._transform = self._build_transform_pipeline()
+        self._action_normalizer = self._build_action_normalizer()
         self._buffer_keys = dataset_dict.keys()
 
     def __len__(self) -> int:
@@ -258,7 +291,14 @@ class PiReplayBuffer(Dataset):
 
     def insert(self, data_dict: DatasetDict):
         # Create action chunk for current transition by padding with itself
-        action_chunk_raw = np.tile(data_dict["actions"][None, :], (self._action_horizon, 1))  # Shape: [action_horizon, action_dim]
+        env_action = np.asarray(data_dict["actions"])
+        if self._action_reference is not None:
+            anchor = anchor_from_observation(data_dict["observations"], self._state_obs_key)
+            model_action = env_action.astype(np.float32)          # copy; the executed action is never modified
+            model_action[:N_ANCHORED_DIMS] -= anchor
+        else:
+            model_action = env_action
+        action_chunk_raw = np.tile(model_action[None, :], (self._action_horizon, 1))  # Shape: [action_horizon, action_dim]
     
         obs_data_dict = data_dict["observations"].copy()
         obs_data_dict["actions"] = action_chunk_raw
@@ -278,9 +318,13 @@ class PiReplayBuffer(Dataset):
         # Drop any keys not in buffer storage (e.g. stray fields) so _insert_recursively matches.
         row = {k: preprocessed_dict[k] for k in self.dataset_dict.keys()}
         _insert_recursively(self.dataset_dict, row, self._insert_index)
-        
+        if self._anchors is not None:
+            self._anchors[self._insert_index] = anchor
+
         preprocessed_action = row["actions"][0]
         preprocessed_base_action = row["base_actions"][0] if self._store_base_actions else None
+        # Previous rows of the same episode that this action completes (same stopping rules as ever).
+        prev_rows = []
         for action_idx in range(1, self._action_horizon):
             if self._insert_index < action_idx and self._size < self._capacity:
                 # Buffer hasn't wrapped yet and we don't have enough history
@@ -288,7 +332,13 @@ class PiReplayBuffer(Dataset):
             prev_idx = (self._insert_index - action_idx) % self._capacity
             if self.dataset_dict["dones"][prev_idx]:
                 break
-            self.dataset_dict["actions"][prev_idx, action_idx:] = np.tile(preprocessed_action[None, :], (self._action_horizon - action_idx, 1))
+            prev_rows.append((action_idx, prev_idx))
+        # Frame of the model: every previous row sees this action relative to ITS OWN joint state.
+        if self._anchors is not None and prev_rows:
+            prev_actions = self._normalize_actions_for_anchors(env_action, self._anchors[[p for _, p in prev_rows]])
+        for n, (action_idx, prev_idx) in enumerate(prev_rows):
+            action_to_copy = prev_actions[n] if self._anchors is not None else preprocessed_action
+            self.dataset_dict["actions"][prev_idx, action_idx:] = np.tile(action_to_copy[None, :], (self._action_horizon - action_idx, 1))
             if self._store_base_actions:
                 self.dataset_dict["base_actions"][prev_idx, action_idx:] = np.tile(preprocessed_base_action[None, :], (self._action_horizon - action_idx, 1))
             if is_hil:
@@ -307,32 +357,50 @@ class PiReplayBuffer(Dataset):
             transition_dict.setdefault("is_success", True)
             self.insert(transition_dict)
 
+    def _resolve_norm_stats(self):
+        """Normalization statistics of the openpi data config ({} when skip_norm_stats)."""
+        if self._skip_norm_stats:
+            return {}
+        if self._data_config.norm_stats is None:
+            raise ValueError(
+                "Normalization stats not found. "
+                "Make sure your OpenPI config has AssetsConfig set up correctly "
+                "so that norm_stats are loaded into data_config.norm_stats. "
+                "The norm stats file should be located at: "
+                "assets_dir / asset_id / norm_stats.json"
+            )
+        return self._data_config.norm_stats
+
     def _build_transform_pipeline(self):
         """Build the transform pipeline similar to OpenPI's transform_iterable_dataset."""
-        norm_stats = {}
-        if not self._skip_norm_stats:
-            if self._data_config.norm_stats is not None:
-                norm_stats = self._data_config.norm_stats
-            else:
-                raise ValueError(
-                    "Normalization stats not found. "
-                    "Make sure your OpenPI config has AssetsConfig set up correctly "
-                    "so that norm_stats are loaded into data_config.norm_stats. "
-                    "The norm stats file should be located at: "
-                    "assets_dir / asset_id / norm_stats.json"
-                )
-        
         transforms = [
             *([] if self._skip_repack_transforms else self._data_config.repack_transforms.inputs),
             *self._data_config.data_transforms.inputs,
             _transforms.Normalize(
-                norm_stats, use_quantiles=self._data_config.use_quantile_norm
+                self._norm_stats, use_quantiles=self._data_config.use_quantile_norm
             ),
             *self._data_config.model_transforms.inputs,
         ]
-        
+
         return _transforms.compose(transforms)
-    
+
+    def _build_action_normalizer(self):
+        """The Normalize step of the pipeline above, restricted to the actions (the backfill of insert() needs it alone)."""
+        if "actions" not in self._norm_stats:
+            return _transforms.Normalize({}, use_quantiles=self._data_config.use_quantile_norm)
+        return _transforms.Normalize(
+            {"actions": self._norm_stats["actions"]}, use_quantiles=self._data_config.use_quantile_norm
+        )
+
+    def _normalize_actions_for_anchors(self, env_action, anchors) -> np.ndarray:
+        """(n, padded_action_dim): one executed action seen from n different joint states (anchors, (n, 7)): the entry
+        the pipeline of insert() would give a row anchored there (offsets, Normalize, zero padding of the model transforms)."""
+        rel = np.tile(np.asarray(env_action, dtype=np.float32)[None, :], (len(anchors), 1))
+        rel[:, :N_ANCHORED_DIMS] -= anchors
+        rel = np.asarray(self._action_normalizer({"actions": rel})["actions"], dtype=np.float32)
+        out = np.zeros((len(anchors), self._action_dim), dtype=np.float32)
+        out[:, : rel.shape[-1]] = rel
+        return out
 
     def _clear_batch(self, batch):
         """Recursively clear a batch dictionary to free memory."""

@@ -15,8 +15,9 @@
 # Tactile / force: see "Tactile / force input" below. The server must run the SAME robot as the demonstrations and the
 # SFT checkpoint: robot "robotiq_2f85_tsf" (the only robot with taxels and a gripper effort).
 #
-# KNOWN LIMIT, read before launching: the RL loop does not handle chunk_action_reference yet (see that key at the end of
-# this file), so train_pi_robo.py refuses this file with an explicit NotImplementedError until it does.
+# Action frame (chunk_action_reference, see that key below): the model works with chunks of OFFSETS from the joint state,
+# the server wants ABSOLUTE joint targets. train_pi_robo.py converts every chunk before it is executed, and the replay buffer
+# (demonstrations included) converts the executed actions back, row by row (expo_ft/utils/action_space.py).
 #
 # The RL hyperparameters are those of the ManiSkill tasks (configs/task/maniskill/*_expo_ft.yaml), NOT tuned for FORGE.
 
@@ -157,11 +158,12 @@ success_hold_steps: 1
 replan_steps: 8
 
 # pi05_droid_jointpos outputs a chunk of OFFSETS from the joint state at plan time (openpi
-# DeltaActions encoding), not per-step increments. eval_policy.py adds that state back once per
-# chunk (= openpi's AbsoluteActions), so the server receives ABSOLUTE joint targets.
+# DeltaActions encoding), not per-step increments. train_pi_robo.py and eval_policy.py add that state back once per
+# chunk (= openpi's AbsoluteActions), so the server receives ABSOLUTE joint targets; the replay buffer stores each
+# executed action as an offset from the joint state of ITS OWN row, normalized with the SFT norm_stats, which is how the
+# SFT demonstrations were encoded. Needs state_obs_key / state_obs_dim (joint state) below; remove the key only for a
+# policy whose output is already what the environment executes (ManiSkill).
 chunk_action_reference: "chunk_start_state"
-# NOT SUPPORTED BY THE RL LOOP YET: train_pi_robo.py stops at startup while this key is set
-# (expo_ft.utils.config_loader.check_rl_action_space_supported). Evaluation (scripts/eval_policy.py) needs it.
 
 # -- Environment (train_pi_robo.py) -------------------------------------------
 env_type: "sim"

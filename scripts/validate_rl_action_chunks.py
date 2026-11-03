@@ -43,6 +43,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 
+from expo_ft.utils.action_space import chunk_to_env_actions
 from expo_ft.utils.config_loader import load_task_config, apply_task_overrides
 from expo_ft.env.droid_utils import load_demo_dataset
 from expo_ft.data.replay_buffer import create_replay_buffer
@@ -126,6 +127,10 @@ def main(config_path, n_episodes, seed):
     replay_buffer.insert_dataset(dataset)
 
     raw_action_dim = replay_buffer._raw_action_dim
+    action_reference = getattr(cfg, "chunk_action_reference", None)
+    if action_reference is not None:
+        print(f"chunk_action_reference={action_reference}: stored chunks are offsets from each row's joint state; "
+              f"checking them after adding that state back.")
     per_position_max_err = np.zeros(action_horizon)
     per_position_count = np.zeros(action_horizon, dtype=int)
     worst = {"err": -1.0, "ep": None, "i": None, "k": None}
@@ -140,6 +145,10 @@ def main(config_path, n_episodes, seed):
         for i in range(start, last_valid_i):
             stored_chunk = np.asarray(replay_buffer.dataset_dict["actions"][i])  # (action_horizon, padded_action_dim), normalized
             recon = np.asarray(unnormalize({"actions": stored_chunk, **state_kwarg})["actions"])[:, :raw_action_dim]
+            if action_reference is not None:
+                # The stored chunk is in the frame of the model: offsets from the joint state OF ROW i (not of the step
+                # the chunk was planned at). Adding it back must give the absolute targets the demo recorded.
+                recon = chunk_to_env_actions(recon, dataset[i]["observations"], action_reference, cfg.state_obs_key)
 
             for k in range(action_horizon):
                 original = raw_actions_all[i + k]

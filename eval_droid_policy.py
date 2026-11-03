@@ -107,6 +107,11 @@ def main(_):
     for _name, _c in (("config_task", config_task), ("config", config)):
         if AuxSpec.from_config(_c).enabled:
             raise NotImplementedError(f"use_tactile / use_force are set in {_name} but eval_droid_policy.py does not support them")
+        if getattr(_c, "chunk_action_reference", None):
+            raise NotImplementedError(
+                f"chunk_action_reference is set in {_name} but eval_droid_policy.py does not convert the model's offsets "
+                f"to absolute targets; use scripts/eval_policy.py"
+            )
     if model_cls == "BCLearner":
         from expo_ft.agents.alg.bc import load_agent, restore_checkpoint
     elif model_cls == "EXPOLearner":

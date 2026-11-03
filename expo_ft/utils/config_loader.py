@@ -8,6 +8,8 @@ import yaml
 from datetime import datetime
 from types import SimpleNamespace
 
+from expo_ft.utils.action_space import validate_task
+
 
 def load_task_config(yaml_path: str) -> SimpleNamespace:
     """
@@ -40,11 +42,15 @@ def apply_task_overrides(config, cfg: SimpleNamespace):
     checkpoint even restores). It was the body of train_pi_robo.py's main(), moved here unchanged except for the last
     two steps (actor_success_only, tactile / force).
 
-    Order: openpi config name -> hyperparameters of the learner `config.model_cls` -> actor_success_only -> tactile / force.
-    Returns the AuxSpec in force (see expo_ft/utils/aux_features.py).
+    Order: openpi config name -> action frame -> hyperparameters of the learner `config.model_cls` -> actor_success_only
+    -> tactile / force. Returns the AuxSpec in force (see expo_ft/utils/aux_features.py).
     """
     config.pi05_config_name = get_sft_config_name(cfg)
     config.skip_repack_transforms = cfg.skip_repack_transforms
+    # Action frame of the model vs the environment (expo_ft/utils/action_space.py). Read by the replay buffer
+    # (create_replay_buffer); the rollout loop applies the same cfg fields to every chunk. None / None = one shared frame.
+    config.chunk_action_reference = validate_task(cfg)
+    config.state_obs_key = getattr(cfg, "state_obs_key", None) if config.chunk_action_reference else None
     model_cls = config.model_cls
 
     # Override config RL hyperparameters from the task YAML so everything
@@ -224,26 +230,6 @@ def apply_aux_overrides(config, cfg: SimpleNamespace):
         for name, value in spec.to_config_kwargs().items():
             setattr(config, name, value)
     return spec
-
-
-def check_rl_action_space_supported(cfg: SimpleNamespace) -> None:
-    """Refuse a task whose model output is not directly the action sent to the environment.
-
-    `chunk_action_reference: chunk_start_state` (FORGE, pi05_droid_jointpos): the model outputs a chunk of OFFSETS from
-    the joint state at plan time and the client adds that state back (scripts/eval_policy.py). The RL loop
-    (train_pi_robo.py) has no such step, and its replay buffer stores the executed actions in the frame the model does not
-    use: a run would send offsets to the robot as absolute joint targets and train the residual actor and the critic on
-    actions of two different frames. Nothing in this repository converts them yet, so stop here, before any GPU time is
-    spent, rather than train on garbage. Evaluation (scripts/eval_policy.py) handles the offsets and is not affected.
-    """
-    reference = getattr(cfg, "chunk_action_reference", None)
-    if reference:
-        raise NotImplementedError(
-            f"chunk_action_reference: {reference!r} is set in the task YAML, and RL training does not handle it yet "
-            f"(the model's chunk is made of offsets from the plan-time joint state, the environment expects absolute "
-            f"joint targets, and the replay buffer would mix both frames). Remove it only once train_pi_robo.py and "
-            f"PiReplayBuffer convert between the two."
-        )
 
 
 def resolve_run_dir(cfg: SimpleNamespace, resume_dir: str | None = None, suffix: str | None = None) -> tuple[str, bool]:
