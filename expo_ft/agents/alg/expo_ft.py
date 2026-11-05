@@ -895,6 +895,13 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         target_score_params = optax.incremental_update(
             new_train_state_params, self.target_actor_params, self.actor_tau
         )
+        # Keep each target leaf in its own dtype. After a checkpoint restore `actor_tau` comes back as a strongly-typed
+        # float32 array (a fresh run has a weak Python float), so `tau * bf16` is promoted to float32: the bf16 LLM
+        # target (~5.5 GiB) would then come out as float32, can not be donated/aliased, and the first update after a
+        # resume needs ~5.5 GiB more than a fresh run (OOM next to the Isaac Lab server on one L40S).
+        target_score_params = jax.tree_util.tree_map(
+            lambda new, old: new.astype(old.dtype), target_score_params, self.target_actor_params
+        )
 
         new_agent = self.replace(actor_train_state=new_train_state, target_actor_params=target_score_params, rng=rng)
         
