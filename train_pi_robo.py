@@ -356,6 +356,48 @@ def _reshard_restored_actor_state(agent):
     return agent
 
 
+def _donation_report(agent, replay_buffer, cfg, data_sharding):
+    """Diagnostic (EXPO_FT_MEM_REPORT=donation): lower the update programs on the restored agent WITHOUT running the update, and
+    say which donated inputs have no output to be aliased with (the "donated buffers were not usable" warning)."""
+    import collections
+    import traceback
+    try:
+        gib = 1024 ** 3
+        total_bs = cfg.batch_size * cfg.utd_ratio
+        raw = replay_buffer.sample_jax(total_bs, indices=np.arange(total_bs))
+        batch = replay_buffer.apply_data_sharding(replay_buffer._convert_to_openpi_format(raw), data_sharding)
+        araw = replay_buffer.sample_jax(cfg.batch_size, indices=np.arange(cfg.batch_size))
+        abatch = replay_buffer.apply_data_sharding(replay_buffer._convert_to_openpi_format(araw), data_sharding)
+        ag = agent.replace(_infer_cache=None)
+        ag, minibatches = type(ag)._prepare_minibatches_jit(ag, ag, batch, cfg.utd_ratio)
+        last_mb = jax.tree_util.tree_map(lambda x: x[-1] if x is not None and hasattr(x, "shape") else x, minibatches)
+        for use_success in (True, False):
+            lowered = type(ag)._update_finalize_jit.lower(ag, ag, last_mb, abatch, use_success_batch=use_success)
+            flat_in, _ = jax.tree_util.tree_flatten_with_path(lowered.args_info)
+            outs = jax.tree_util.tree_leaves(lowered.out_info)
+            def key(a):
+                return (tuple(a.shape), str(a.dtype))
+            don = [(jax.tree_util.keystr(pth), info) for pth, info in flat_in if info.donated]
+            nodon = [(jax.tree_util.keystr(pth), info) for pth, info in flat_in if not info.donated]
+            need = collections.Counter(key(i._aval if hasattr(i, "_aval") else i.aval) for _, i in don)
+            have = collections.Counter(key(o) for o in outs)
+            logging.info("[donation:%s] inputs: %d donated, %d not donated (%.2f GiB not donated: it is `self`, passed as an argument too) | outputs: %d",
+                         use_success, len(don), len(nodon),
+                         sum(float(np.prod(i._aval.shape)) * i._aval.dtype.itemsize for _, i in nodon) / gib,
+                         len(outs))
+            surplus = {k: need[k] - have.get(k, 0) for k in need if need[k] > have.get(k, 0)}
+            logging.info("[donation:%s] donated input avals with no output to alias with: %d kinds", use_success, len(surplus))
+            for k, n in list(surplus.items())[:12]:
+                paths = [pth for pth, i in don if key(i._aval if hasattr(i, "_aval") else i.aval) == k][:3]
+                logging.info("[donation:%s]   %s x%d too many; e.g. %s", use_success, k[:2], n, paths)
+            ma = lowered.compile().memory_analysis()
+            logging.info("[donation:%s] compiled: arguments %.2f GiB, outputs %.2f GiB, aliased %.2f GiB, temp %.2f GiB",
+                         use_success, ma.argument_size_in_bytes / gib, ma.output_size_in_bytes / gib,
+                         ma.alias_size_in_bytes / gib, ma.temp_size_in_bytes / gib)
+    except Exception:
+        logging.warning("[donation] failed:\n%s", traceback.format_exc())
+
+
 def main(_):
     init_logging()
 
@@ -702,8 +744,9 @@ def main(_):
         gc.collect()
         if os.environ.get("EXPO_FT_MEM_REPORT"):
             _gpu_mem_report("after_restore", agent)
-            logging.info("[memreport] EXPO_FT_MEM_REPORT is set: report done, stopping before the training starts.")
-            raise SystemExit(0)
+            if os.environ.get("EXPO_FT_MEM_REPORT") != "donation":
+                logging.info("[memreport] EXPO_FT_MEM_REPORT is set: report done, stopping before the training starts.")
+                raise SystemExit(0)
         steps = tuple(checkpoint_manager.all_steps())
         latest_step = max(steps) if steps else None
         if latest_step is not None:
@@ -785,6 +828,9 @@ def main(_):
     # original behavior (compilation deferred to the ep_count gate as
     # before) rather than failing a run that might not even have hit the
     # crash this exists for.
+    if resuming and os.environ.get("EXPO_FT_MEM_REPORT") == "donation":
+        _donation_report(agent, replay_buffer, cfg, data_sharding)
+        raise SystemExit(0)
     _warmup_agent = _discard_agent = _discard_agent2 = _warmup_batch = _actor_warmup_batch = None
     if resuming and getattr(cfg, "resume_warmup", True):
         try:
