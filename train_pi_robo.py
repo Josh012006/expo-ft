@@ -287,6 +287,37 @@ def _gpu_mem_report(tag, agent):
                      sum(uniq.values()) / gib, len(uniq), sum(a.nbytes for a in others) / gib, len(others))
         for (shape, dtype), nbytes in sizes.most_common(8):
             logging.info("[memreport:%s]   not in agent: %s %s x%d = %.2f GiB", tag, shape, dtype, counts[(shape, dtype)], nbytes / gib)
+        # Real device memory: arrays can be several Python objects on ONE buffer (device_put to an equivalent sharding does
+        # not copy), so count buffers, and say how much of what is outside the agent is NOT a view of an agent buffer.
+        agent_ptrs = set(uniq)
+        def _ptr(a):
+            try:
+                return a.unsafe_buffer_pointer()
+            except Exception:
+                return None
+        all_ptrs = {}
+        for a in live:
+            q = _ptr(a)
+            if q is not None:
+                all_ptrs[q] = a.nbytes
+        extra = {q: n for q, n in all_ptrs.items() if q not in agent_ptrs}
+        logging.info("[memreport:%s] DISTINCT device buffers of all live arrays: %.2f GiB | of which not an agent buffer (real extra memory): %.2f GiB (%d buffers)",
+                     tag, sum(all_ptrs.values()) / gib, sum(extra.values()) / gib, len(extra))
+        by_shape = collections.Counter()
+        cnt_shape = collections.Counter()
+        for a in live:
+            q = _ptr(a)
+            if q in extra:
+                by_shape[(tuple(a.shape), str(a.dtype))] += extra.pop(q)
+                cnt_shape[(tuple(a.shape), str(a.dtype))] += 1
+        for (shape, dtype), nbytes in by_shape.most_common(6):
+            logging.info("[memreport:%s]   real extra: %s %s x%d = %.2f GiB", tag, shape, dtype, cnt_shape[(shape, dtype)], nbytes / gib)
+        cache = getattr(agent, "_infer_cache", None) or {}
+        for name, tree in cache.items():
+            ls = [x for x in jax.tree_util.tree_leaves(tree) if isinstance(x, jax.Array)]
+            alias = sum(x.nbytes for x in ls if _ptr(x) in agent_ptrs)
+            copy = sum(x.nbytes for x in ls if _ptr(x) not in agent_ptrs)
+            logging.info("[memreport:%s] _infer_cache[%s]: %.2f GiB view of agent buffers, %.2f GiB real copy", tag, name, alias / gib, copy / gib)
         stats = jax.devices()[0].memory_stats()
         if stats:
             logging.info("[memreport:%s] device bytes_in_use %.2f GiB, peak %.2f GiB", tag,
