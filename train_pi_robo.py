@@ -601,6 +601,11 @@ def main(_):
     if resuming:
         agent = restore_checkpoint(checkpoint_manager, agent)
         agent = agent.cache_infer_params()
+        # The restored agent has its own arrays. These three locals (only used by load_agent above) still point to the
+        # arrays the agent had BEFORE the restore (SFT weights): on a fresh run they are the agent's own, on a resume they
+        # would stay on the GPU as a useless second copy for the whole run.
+        actor_train_state = target_actor_params = agent_kwargs = None
+        gc.collect()
         steps = tuple(checkpoint_manager.all_steps())
         latest_step = max(steps) if steps else None
         if latest_step is not None:
