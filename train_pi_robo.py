@@ -682,7 +682,8 @@ def main(_):
     # original behavior (compilation deferred to the ep_count gate as
     # before) rather than failing a run that might not even have hit the
     # crash this exists for.
-    if resuming:
+    _warmup_agent = _discard_agent = _discard_agent2 = _warmup_batch = _actor_warmup_batch = None
+    if resuming and getattr(cfg, "resume_warmup", True):
         try:
             logging.info("[warmup] Triggering discarded warm-up compilation of agent.update() "
                          "right after restore (both use_success_batch branches), before rollout "
@@ -786,6 +787,12 @@ def main(_):
         except Exception as e:
             logging.warning("[warmup] Warm-up compilation attempt failed (%s) -- continuing "
                            "with the original deferred-compilation behavior instead.", e)
+            # The copy of the agent made for the warm-up (and its descendants) stays referenced by these locals when the
+            # warm-up fails halfway: release it, otherwise it stays on the GPU for the whole run.
+            _warmup_agent = _discard_agent = _discard_agent2 = _warmup_batch = _actor_warmup_batch = None
+            gc.collect()
+    elif resuming:
+        logging.info("[warmup] resume_warmup=false: no warm-up compilation, agent.update() compiles at its first real call.")
 
     # ── Actor BC warm-start (XQCfD-style "policy pretraining") ──────────────
     # Only on a fresh run, same rationale as critic pretraining below. Runs

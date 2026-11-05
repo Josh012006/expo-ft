@@ -208,6 +208,8 @@ num_updates: 1
 num_batch: 1                 # episodes to accumulate before updating (only used when update_type="batch")
 fsdp_devices: 1
 rl_resume_dir: null
+resume_warmup: true         # resumed runs only: discarded compile-only warm-up of agent.update() right after the restore. It copies the whole agent on the GPU
+                             # (~18 GB), which does not fit next to the Isaac Lab server on one L40S: use false there (--set resume_warmup=false)
 actor_success_only: true     # actor batch sampled only from successful transitions
 
 # -- RL Checkpointing ------------------------------------------------------------
