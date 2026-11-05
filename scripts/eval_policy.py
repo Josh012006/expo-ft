@@ -191,16 +191,22 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
                 print(f"Normalization statistics: config default (no single norm_stats.json under {assets}, found {ids})")
 
     # Build π₀.₅ (unnormalize est à True par défaut ici, ce qui est correct pour le SFT)
+    # RL checkpoint: build the agent the way train_pi_robo.py does on a resume (resume=True: shapes only, almost nothing on the
+    # GPU) because restore_checkpoint() replaces EVERYTHING anyway. With resume=False a full placeholder agent (~18 GiB of
+    # weights, critics, target, optimizer) sat on the GPU while the restore loaded a second one (~18 GiB): with the Isaac Lab
+    # server on the same card, that RESOURCE_EXHAUSTED at the restore.
+    resume_rl = rl_checkpoint_path is not None
     actor, actor_train_state, target_actor_params, agent_kwargs, vla_metadata = build_pi05(
         model_config, seed, mesh, data_sharding, replicated_sharding,
-        resume=False,
+        resume=resume_rl,
         default_prompt=cfg.language_instruction,
     )
 
-    # Print first param sum to verify checkpoint loading
-    params = actor.get_params(actor_train_state)
-    leaf = jax.tree_util.tree_leaves(params)[0]
-    print(f"First param sum: {float(jax.numpy.sum(leaf)):.6f}")
+    # Print first param sum to verify checkpoint loading (an RL checkpoint has no weights yet: printed after the restore)
+    if not resume_rl:
+        params = actor.get_params(actor_train_state)
+        leaf = jax.tree_util.tree_leaves(params)[0]
+        print(f"First param sum: {float(jax.numpy.sum(leaf)):.6f}")
 
     # Create replay buffer for agent init
     replay_buffer = create_replay_buffer(
@@ -241,7 +247,8 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
         default_prompt=cfg.language_instruction,
         residual_action_xyzg=getattr(cfg, 'residual_action_xyzg', False),
     )
-    agent = agent.cache_infer_params()
+    if not resume_rl:   # (load_agent already did it for a fresh agent; a resume=True template has no weights to cache)
+        agent = agent.cache_infer_params()
 
     only_base_actions = True
     if rl_checkpoint_path is not None:
@@ -266,6 +273,9 @@ def evaluate(cfg, checkpoint_path, n_episodes, seed, video_dir=None, collect_act
         )
         agent = restore_checkpoint(rl_mngr, agent, rl_step)
         agent = agent.cache_infer_params()
+        actor_train_state = target_actor_params = agent_kwargs = None   # shapes of the template: not needed any more
+        leaf = jax.tree_util.tree_leaves(agent.actor.get_params(agent.actor_train_state))[0]
+        print(f"First param sum: {float(jax.numpy.sum(leaf)):.6f}")
         only_base_actions = False  # let the trained residual policy + critic actually run
         print("RL checkpoint restored — evaluating full agent (VLA + residual policy + critic).")
         if critic_only:
