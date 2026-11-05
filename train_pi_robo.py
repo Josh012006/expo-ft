@@ -265,6 +265,36 @@ def reconstruct_success_window(replay_buffer, success_rate_window):
     return is_success[kept].astype(float).tolist()
 
 
+def _gpu_mem_report(tag, agent):
+    """Diagnostic (only called when EXPO_FT_MEM_REPORT is set): what is on the GPU, and what part of it is the agent."""
+    import collections
+    try:
+        live = jax.live_arrays()
+        leaves = [x for x in jax.tree_util.tree_leaves(agent) if isinstance(x, jax.Array)]
+        gib = 1024 ** 3
+        agent_ids = {id(x) for x in leaves}
+        uniq = {}
+        for x in leaves:
+            uniq[x.unsafe_buffer_pointer()] = x.nbytes
+        others = [a for a in live if id(a) not in agent_ids]
+        sizes = collections.Counter()
+        counts = collections.Counter()
+        for a in others:
+            sizes[(tuple(a.shape), str(a.dtype))] += a.nbytes
+            counts[(tuple(a.shape), str(a.dtype))] += 1
+        logging.info("[memreport:%s] live arrays: %.2f GiB (%d) | agent leaves: %.2f GiB (%d) | agent distinct buffers: %.2f GiB (%d) | NOT in agent: %.2f GiB (%d)",
+                     tag, sum(a.nbytes for a in live) / gib, len(live), sum(x.nbytes for x in leaves) / gib, len(leaves),
+                     sum(uniq.values()) / gib, len(uniq), sum(a.nbytes for a in others) / gib, len(others))
+        for (shape, dtype), nbytes in sizes.most_common(8):
+            logging.info("[memreport:%s]   not in agent: %s %s x%d = %.2f GiB", tag, shape, dtype, counts[(shape, dtype)], nbytes / gib)
+        stats = jax.devices()[0].memory_stats()
+        if stats:
+            logging.info("[memreport:%s] device bytes_in_use %.2f GiB, peak %.2f GiB", tag,
+                         stats.get("bytes_in_use", 0) / gib, stats.get("peak_bytes_in_use", 0) / gib)
+    except Exception as e:  # diagnostic only
+        logging.warning("[memreport:%s] failed: %s", tag, e)
+
+
 def main(_):
     init_logging()
 
@@ -599,6 +629,8 @@ def main(_):
     
     start_step = 0
     if resuming:
+        if os.environ.get("EXPO_FT_MEM_REPORT"):
+            _gpu_mem_report("before_restore", agent)
         agent = restore_checkpoint(checkpoint_manager, agent)
         agent = agent.cache_infer_params()
         # The restored agent has its own arrays. These three locals (only used by load_agent above) still point to the
@@ -606,6 +638,10 @@ def main(_):
         # would stay on the GPU as a useless second copy for the whole run.
         actor_train_state = target_actor_params = agent_kwargs = None
         gc.collect()
+        if os.environ.get("EXPO_FT_MEM_REPORT"):
+            _gpu_mem_report("after_restore", agent)
+            logging.info("[memreport] EXPO_FT_MEM_REPORT is set: report done, stopping before the training starts.")
+            raise SystemExit(0)
         steps = tuple(checkpoint_manager.all_steps())
         latest_step = max(steps) if steps else None
         if latest_step is not None:
