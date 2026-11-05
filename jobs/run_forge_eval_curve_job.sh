@@ -6,6 +6,7 @@
 # Usage:
 #   sbatch jobs/run_forge_eval_curve_job.sh --checkpoints-dir DIR [--n-episodes N] [--steps "S1 S2"] [--seed N]
 #        [--robot NAME] [--max-steps N] [--server-port P] [--save-videos] [--video-dir NAME|PATH] [--skip-base] [--output-dir DIR]
+#        [--rl-curve --start-checkpoint DIR [--deterministic] --config YAML]
 #     --checkpoints-dir  (required) folder that contains the numeric step folders, e.g.
 #                        logs/forge_peg_insert/<run>/sft/expo_pi05_droid_lora_finetune_sft_joint_state_delta/<exp_name>
 #     --n-episodes       episodes per checkpoint, same seeds for all (default 200)
@@ -28,6 +29,13 @@
 #     --output-dir       where results/, logs/, episode_seeds.json, curve.json and curve.png/.pdf go (default: --checkpoints-dir).
 #                        Give a folder of its own whenever --seed, --max-steps or --steps differ from an earlier run,
 #                        otherwise its episode_seeds.json / results/ would be reused or mixed up
+#     --rl-curve         switch: the checkpoints are those of an RL run (--checkpoints-dir <run>/checkpoints, steps 20000, 40000, ...)
+#     --start-checkpoint SFT step folder the RL run started from (e.g. .../<exp_name>/1400, the one that has params/). With --rl-curve it
+#                        is evaluated once as the step "base" = the starting point of the curve (same seeds as the RL points)
+#     --deterministic    switch (RL checkpoints only): residual actor's mode instead of a sample
+#     --config           task YAML (default configs/task/isaaclab/peg_insert_forge_pi05.yaml, the SFT one). An RL curve needs the
+#                        YAML of the RL run (configs/task/isaaclab/peg_insert_forge_expo_ft.yaml): its rl_* keys and use_tactile /
+#                        use_force must be those of the training, otherwise the agent does not restore
 #   (sbatch's own options, e.g. --time, go BEFORE the script name; everything after it is read by this script)
 #
 # Duration: an episode takes ~35 s on the L40S, so 200 episodes ~ 2 h per checkpoint (+ ~5 min start-up).
@@ -75,6 +83,10 @@ Usage: sbatch jobs/run_forge_eval_curve_job.sh --checkpoints-dir DIR [--n-episod
   --server-port      port of the Isaac Lab server (default: the YAML's, 8102)
   --output-dir       where results/, logs/, episode_seeds.json, curve.* go (default: --checkpoints-dir;
                      give a folder of its own when --seed / --max-steps / --steps differ from an earlier run)
+  --rl-curve         switch: --checkpoints-dir is <run>/checkpoints of an RL run
+  --start-checkpoint SFT step folder the RL run started from (evaluated as the curve's first point, "base")
+  --deterministic    switch (RL checkpoints only): residual actor's mode
+  --config           task YAML (default: the SFT one; for an RL curve: configs/task/isaaclab/peg_insert_forge_expo_ft.yaml)
 EOF
 }
 need_value() {   # need_value <flag> <number of remaining args> <next arg>
@@ -92,6 +104,10 @@ MASTER_SEED=""
 MAX_STEPS=""
 PORT_OVERRIDE=""
 ROBOT=""
+RL_CURVE=0
+START_CKPT=""
+DETERMINISTIC=0
+CONFIG="configs/task/isaaclab/peg_insert_forge_pi05.yaml"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --checkpoints-dir) need_value "$1" "$#" "${2-}"; CHECKPOINTS_DIR="$2"; shift 2 ;;
@@ -105,6 +121,10 @@ while [[ $# -gt 0 ]]; do
         --robot) need_value "$1" "$#" "${2-}"; ROBOT="$2"; shift 2 ;;
         --max-steps) need_value "$1" "$#" "${2-}"; MAX_STEPS="$2"; shift 2 ;;
         --server-port) need_value "$1" "$#" "${2-}"; PORT_OVERRIDE="$2"; shift 2 ;;
+        --rl-curve) RL_CURVE=1; shift ;;
+        --start-checkpoint) need_value "$1" "$#" "${2-}"; START_CKPT="$2"; shift 2 ;;
+        --deterministic) DETERMINISTIC=1; shift ;;
+        --config) need_value "$1" "$#" "${2-}"; CONFIG="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -113,12 +133,18 @@ if [[ -z "$CHECKPOINTS_DIR" ]]; then echo "ERROR: --checkpoints-dir is required"
 if [[ -n "$VIDEO_DIR" ]]; then SAVE_VIDEOS=1; fi    # a video folder means videos
 
 REPO_ROOT="$HOME/projects/expo-ft"
-CONFIG="configs/task/isaaclab/peg_insert_forge_pi05.yaml"
 SERVER_LOG="logs/slurm/${SLURM_JOB_NAME}_${SLURM_JOB_ID}_server.log"
 
 cd "$REPO_ROOT" || { echo "FATAL: cannot cd to $REPO_ROOT"; exit 1; }
 mkdir -p logs/slurm || { echo "FATAL: cannot create logs/slurm"; exit 1; }
 
+[ -f "$CONFIG" ] || { echo "FATAL: --config $CONFIG not found"; exit 1; }
+if [ "$RL_CURVE" -eq 0 ] && { [ -n "$START_CKPT" ] || [ "$DETERMINISTIC" -eq 1 ]; }; then
+    echo "FATAL: --start-checkpoint / --deterministic only make sense with --rl-curve"; exit 1
+fi
+if [ -n "$START_CKPT" ] && [ ! -d "$START_CKPT/params" ]; then
+    echo "FATAL: --start-checkpoint $START_CKPT has no params/ folder (give the SFT step folder, e.g. .../1400)"; exit 1
+fi
 # Checked BEFORE starting the server (no 5 min of Isaac Sim start-up for a typo in the path).
 if [ ! -d "$CHECKPOINTS_DIR" ]; then
     echo "FATAL: --checkpoints-dir $CHECKPOINTS_DIR not found"
@@ -221,6 +247,9 @@ if [ -n "$VIDEO_DIR" ]; then CURVE_ARGS+=(--video-dir "$VIDEO_DIR"); fi
 if [ "$SKIP_BASE" -eq 1 ]; then CURVE_ARGS+=(--skip-base); fi
 if [ -n "$OUTPUT_DIR" ]; then CURVE_ARGS+=(--output-dir "$OUTPUT_DIR"); fi
 if [ -n "$MASTER_SEED" ]; then CURVE_ARGS+=(--seed "$MASTER_SEED"); fi
+if [ "$RL_CURVE" -eq 1 ]; then CURVE_ARGS+=(--rl-curve); fi
+if [ -n "$START_CKPT" ]; then CURVE_ARGS+=(--start-checkpoint "$START_CKPT"); fi
+if [ "$DETERMINISTIC" -eq 1 ]; then CURVE_ARGS+=(--deterministic); fi
 if [ -n "$STEPS" ]; then CURVE_ARGS+=(--steps $STEPS); fi    # unquoted on purpose: "1000 1600" -> two values
 python scripts/eval_curve.py \
     --config "$CONFIG" \
