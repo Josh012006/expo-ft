@@ -371,10 +371,14 @@ def _donation_report(agent, replay_buffer, cfg, data_sharding):
         ag = agent.replace(_infer_cache=None)
         ag, minibatches = type(ag)._prepare_minibatches_jit(ag, ag, batch, cfg.utd_ratio)
         last_mb = jax.tree_util.tree_map(lambda x: x[-1] if x is not None and hasattr(x, "shape") else x, minibatches)
+        import openpi.shared.array_typing as _at
         for use_success in (True, False):
-            lowered = type(ag)._update_finalize_jit.lower(ag, ag, last_mb, abatch, use_success_batch=use_success)
-            flat_in, _ = jax.tree_util.tree_flatten_with_path(lowered.args_info)
-            outs = jax.tree_util.tree_leaves(lowered.out_info)
+            # args_info / out_info rebuild the agent's pytree with ArgInfo / ShapeDtypeStruct leaves: openpi's TrainState
+            # type-checks its fields on construction, which must be off for that.
+            with _at.disable_typechecking():
+                lowered = type(ag)._update_finalize_jit.lower(ag, ag, last_mb, abatch, use_success_batch=use_success)
+                flat_in, _ = jax.tree_util.tree_flatten_with_path(lowered.args_info)
+                outs = jax.tree_util.tree_leaves(lowered.out_info)
             def key(a):
                 return (tuple(a.shape), str(a.dtype))
             don = [(jax.tree_util.keystr(pth), info) for pth, info in flat_in if info.donated]
