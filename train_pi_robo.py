@@ -326,6 +326,36 @@ def _gpu_mem_report(tag, agent):
         logging.warning("[memreport:%s] failed: %s", tag, e)
 
 
+def _reshard_restored_actor_state(agent):
+    """After a checkpoint restore: put the actor's train state on the sharding a freshly built agent has.
+
+    Orbax restores each array with the sharding read from the checkpoint's sharding file. If it is not equivalent to
+    actor.train_state_sharding (the one the update programs are compiled for), the first update re-shards the weights into
+    copies and cannot donate the originals ("Some donated buffers were not usable"): ~5 GiB more at its peak, which does not
+    fit next to the Isaac Lab server on one L40S. device_put is a no-op for an array that is already well placed."""
+    try:
+        target = agent.actor.train_state_sharding
+        leaves, treedef = jax.tree_util.tree_flatten(agent.actor_train_state)
+        targets = jax.tree_util.tree_leaves(target, is_leaf=lambda x: isinstance(x, jax.sharding.Sharding))
+        if len(leaves) != len(targets):
+            logging.warning("[reshard] %d weights but %d target shardings: left as restored", len(leaves), len(targets))
+            return agent
+        bad = [i for i, (x, t) in enumerate(zip(leaves, targets))
+               if isinstance(x, jax.Array) and not x.sharding.is_equivalent_to(t, x.ndim)]
+        logging.info("[reshard] actor_train_state: %d of %d arrays (%.2f GiB) not on the sharding of a fresh agent",
+                     len(bad), len(leaves), sum(leaves[i].nbytes for i in bad) / 1024 ** 3)
+        if bad:
+            for i in bad:
+                try:
+                    leaves[i] = jax.device_put(leaves[i], targets[i], donate=True)
+                except TypeError:
+                    leaves[i] = jax.device_put(leaves[i], targets[i])
+            agent = agent.replace(actor_train_state=jax.tree_util.tree_unflatten(treedef, leaves))
+    except Exception as e:
+        logging.warning("[reshard] skipped (%s)", e)
+    return agent
+
+
 def main(_):
     init_logging()
 
@@ -663,6 +693,7 @@ def main(_):
         if os.environ.get("EXPO_FT_MEM_REPORT"):
             _gpu_mem_report("before_restore", agent)
         agent = restore_checkpoint(checkpoint_manager, agent)
+        agent = _reshard_restored_actor_state(agent)
         agent = agent.cache_infer_params()
         # The restored agent has its own arrays. These three locals (only used by load_agent above) still point to the
         # arrays the agent had BEFORE the restore (SFT weights): on a fresh run they are the agent's own, on a resume they
