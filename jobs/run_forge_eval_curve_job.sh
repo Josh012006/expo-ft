@@ -6,7 +6,7 @@
 # Usage:
 #   sbatch jobs/run_forge_eval_curve_job.sh --checkpoints-dir DIR [--n-episodes N] [--steps "S1 S2"] [--seed N]
 #        [--robot NAME] [--max-steps N] [--server-port P] [--save-videos] [--video-dir NAME|PATH] [--skip-base] [--output-dir DIR]
-#        [--rl-curve --start-checkpoint DIR [--deterministic] --config YAML]
+#        [--rl-curve --start-checkpoint DIR [--deterministic] --config YAML] [--title "TEXT"]
 #     --checkpoints-dir  (required) folder that contains the numeric step folders, e.g.
 #                        logs/forge_peg_insert/<run>/sft/expo_pi05_droid_lora_finetune_sft_joint_state_delta/<exp_name>
 #     --n-episodes       episodes per checkpoint, same seeds for all (default 200)
@@ -33,6 +33,8 @@
 #     --start-checkpoint SFT step folder the RL run started from (e.g. .../<exp_name>/1400, the one that has params/). With --rl-curve it
 #                        is evaluated once as the step "base" = the starting point of the curve (same seeds as the RL points)
 #     --deterministic    switch (RL checkpoints only): residual actor's mode instead of a sample
+#     --title            full title of the plot (curve.png / curve.pdf), between quotes. Default: "Eval success rate vs. checkpoint — <YAML name>".
+#                        To change it afterwards without re-evaluating: scripts/plot_eval_curve.py
 #     --config           task YAML (default configs/task/isaaclab/peg_insert_forge_pi05.yaml, the SFT one). An RL curve needs the
 #                        YAML of the RL run (configs/task/isaaclab/peg_insert_forge_expo_ft.yaml): its rl_* keys and use_tactile /
 #                        use_force must be those of the training, otherwise the agent does not restore
@@ -86,6 +88,7 @@ Usage: sbatch jobs/run_forge_eval_curve_job.sh --checkpoints-dir DIR [--n-episod
   --rl-curve         switch: --checkpoints-dir is <run>/checkpoints of an RL run
   --start-checkpoint SFT step folder the RL run started from (evaluated as the curve's first point, "base")
   --deterministic    switch (RL checkpoints only): residual actor's mode
+  --title            full title of the plot (curve.png / curve.pdf), between quotes (default: from the YAML name)
   --config           task YAML (default: the SFT one; for an RL curve: configs/task/isaaclab/peg_insert_forge_expo_ft.yaml)
 EOF
 }
@@ -107,6 +110,7 @@ ROBOT=""
 RL_CURVE=0
 START_CKPT=""
 DETERMINISTIC=0
+TITLE=""
 CONFIG="configs/task/isaaclab/peg_insert_forge_pi05.yaml"
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -124,6 +128,7 @@ while [[ $# -gt 0 ]]; do
         --rl-curve) RL_CURVE=1; shift ;;
         --start-checkpoint) need_value "$1" "$#" "${2-}"; START_CKPT="$2"; shift 2 ;;
         --deterministic) DETERMINISTIC=1; shift ;;
+        --title) need_value "$1" "$#" "${2-}"; TITLE="$2"; shift 2 ;;
         --config) need_value "$1" "$#" "${2-}"; CONFIG="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 1 ;;
@@ -250,6 +255,7 @@ if [ -n "$MASTER_SEED" ]; then CURVE_ARGS+=(--seed "$MASTER_SEED"); fi
 if [ "$RL_CURVE" -eq 1 ]; then CURVE_ARGS+=(--rl-curve); fi
 if [ -n "$START_CKPT" ]; then CURVE_ARGS+=(--start-checkpoint "$START_CKPT"); fi
 if [ "$DETERMINISTIC" -eq 1 ]; then CURVE_ARGS+=(--deterministic); fi
+if [ -n "$TITLE" ]; then CURVE_ARGS+=(--title "$TITLE"); fi
 if [ -n "$STEPS" ]; then CURVE_ARGS+=(--steps $STEPS); fi    # unquoted on purpose: "1000 1600" -> two values
 python scripts/eval_curve.py \
     --config "$CONFIG" \

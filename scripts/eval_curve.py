@@ -113,8 +113,10 @@ def run_one_eval(config_path, checkpoint_path, seeds_path, output_json, log_path
     return True
 
 
-def rebuild_curve(results_dir: Path, curve_json_path: Path, curve_png_path: Path, task_label: str, rl_curve: bool = False):
-    """rl_curve only picks the x-axis label: RL checkpoints (--rl-curve) or SFT checkpoints (default)."""
+def rebuild_curve(results_dir: Path, curve_json_path: Path, curve_png_path: Path, task_label: str, rl_curve: bool = False,
+                  title: str | None = None):
+    """rl_curve only picks the x-axis label: RL checkpoints (--rl-curve) or SFT checkpoints (default).
+    title: full title of the plot (default: "Eval success rate vs. checkpoint — <task_label>")."""
     entries = []
     for result_path in results_dir.glob("*.json"):
         with open(result_path) as f:
@@ -180,7 +182,7 @@ def rebuild_curve(results_dir: Path, curve_json_path: Path, curve_png_path: Path
         ax.set_xlabel("SFT training iteration (0 = base model)", labelpad=10)
         
     ax.set_ylabel("Success rate (%)  \u00b1 1 SE", labelpad=10)
-    ax.set_title(f"Eval success rate vs. checkpoint — {task_label}", pad=15, weight='bold')
+    ax.set_title(title or f"Eval success rate vs. checkpoint — {task_label}", pad=15, weight='bold')
     ax.set_ylim(-5, 105)
     ax.grid(True, alpha=0.4, linestyle='--')
     
@@ -271,6 +273,11 @@ def main():
              "<label>.prev1 (never overwritten or mixed).",
     )
     parser.add_argument(
+        "--title", default=None,
+        help="Full title of the plot (curve.png / curve.pdf), e.g. --title \"Teleop demos, offline ratio 0.5\". "
+             "Default: \"Eval success rate vs. checkpoint — <name of the task YAML>\".",
+    )
+    parser.add_argument(
         "--plot-only", action="store_true",
         help="Do not evaluate anything: only rebuild curve.json / curve.png / curve.pdf from the existing "
              "results/*.json (e.g. after changing the plot). Needs no server and no GPU.",
@@ -290,7 +297,7 @@ def main():
     task_label = Path(args.config).stem
 
     if args.plot_only:
-        entries = rebuild_curve(results_dir, curve_json_path, curve_png_path, task_label, rl_curve=args.rl_curve)
+        entries = rebuild_curve(results_dir, curve_json_path, curve_png_path, task_label, rl_curve=args.rl_curve, title=args.title)
         print(f"Plot only: {len(entries)} points on the curve. See {curve_png_path}")
         return
 
@@ -335,7 +342,7 @@ def main():
         # file's own docstring: "a sweep that gets killed partway still
         # leaves an up-to-date plot on disk."
         if ok:
-            rebuild_curve(results_dir, curve_json_path, curve_png_path, task_label, rl_curve=args.rl_curve)
+            rebuild_curve(results_dir, curve_json_path, curve_png_path, task_label, rl_curve=args.rl_curve, title=args.title)
 
     if args.rl_curve:
         if args.start_checkpoint is not None and not args.skip_base:
@@ -348,7 +355,7 @@ def main():
         for step in select_steps(discover_checkpoints(checkpoints_dir), args.steps):
             maybe_run(str(step), checkpoints_dir / str(step), is_rl_checkpoint=False, deterministic=False)
 
-    entries = rebuild_curve(results_dir, curve_json_path, curve_png_path, task_label, rl_curve=args.rl_curve)
+    entries = rebuild_curve(results_dir, curve_json_path, curve_png_path, task_label, rl_curve=args.rl_curve, title=args.title)
     print(f"\nDone: {len(entries)} points on the curve. See {curve_png_path}")
 
 
